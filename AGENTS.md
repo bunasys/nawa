@@ -65,6 +65,9 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   CLI commands Waku calls, so Nawa can stand in for Kimi Code inside Waku.
   In `acp` mode stdout carries the protocol: never `print` there.
 - `Tests/` — Swift Testing suites, one per module.
+- `proposals/` — design proposals for larger changes (`NNNN-title.md`; format
+  and index in `proposals/README.md`). Read the relevant one before building
+  a proposed feature, and update its status when it lands.
 
 ## Build & test
 
