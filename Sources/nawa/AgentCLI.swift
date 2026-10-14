@@ -165,14 +165,27 @@ struct AgentCLI {
 
     /// Token-saving defaults for interactive sessions. `NAWA_HELPER_MODEL`
     /// names a cheaper model for sub-agents and summaries; it must be served
-    /// by the same provider as the main model.
+    /// by the same provider as the main model. `NAWA_PRICE` and
+    /// `NAWA_HELPER_PRICE` (`"input,output"` USD per million tokens) turn on
+    /// cost estimates.
     static func defaultLoopOptions(env: [String: String] = ProcessInfo.processInfo.environment) -> LoopOptions {
         LoopOptions(
+            pricing: pricing(env, "NAWA_PRICE"),
             keepToolResults: 20,
             compaction: Compaction(atContextTokens: 120_000, keepRecentMessages: 20),
             subAgents: true,
-            helperModel: env["NAWA_HELPER_MODEL"]
+            helperModel: env["NAWA_HELPER_MODEL"],
+            helperPricing: pricing(env, "NAWA_HELPER_PRICE")
         )
+    }
+
+    private static func pricing(_ env: [String: String], _ name: String) -> Pricing? {
+        guard let text = env[name] else { return nil }
+        guard let pricing = Pricing(perMillionTokens: text) else {
+            FileHandle.standardError.write(Data("nawa: ignoring \(name)=\(text); expected \"input,output\" USD per million tokens\n".utf8))
+            return nil
+        }
+        return pricing
     }
 
     /// Build the gateway for this run. Precedence:
@@ -252,11 +265,41 @@ struct AgentCLI {
                     if !result.isSuccess {
                         print("⚠️ \(result.errorMessage ?? result.kind.rawValue)")
                     }
+                case .subAgent(let update):
+                    printSubAgent(update)
                 default:
                     break
                 }
             }
             print()
+        }
+    }
+
+    /// A sub-agent's steps, indented under the `task` call that started it.
+    static func printSubAgent(_ update: SubAgentUpdate) {
+        let indent = "    ↳ "
+        switch update.event {
+        case .initEvent:
+            print("\(indent)sub-agent started on \(update.model ?? "the session model")")
+        case .assistant(let turn):
+            if !turn.text.isEmpty {
+                let text = turn.text.prefix(200).replacingOccurrences(of: "\n", with: "\n      ")
+                print("\(indent)🤖 \(text)")
+            }
+            for call in turn.toolCalls {
+                print("\(indent)🔧 \(call.name)(\(call.arguments.description.prefix(120)))")
+            }
+            print("\(indent)   \(usageLine(turn))")
+        case .toolResults(let results):
+            for result in results {
+                print("\(indent)← \(result.name): \(result.content.prefix(120).replacingOccurrences(of: "\n", with: " "))")
+            }
+        case .result(let result):
+            var line = "\(indent)sub-agent \(result.isSuccess ? "done" : "stopped") after \(result.numTurns) tool turns, \(result.usage.total) tokens"
+            if let cost = result.costEstimate { line += String(format: ", $%.4f", cost) }
+            print(line)
+        default:
+            break
         }
     }
 

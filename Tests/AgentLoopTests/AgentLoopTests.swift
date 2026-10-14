@@ -81,6 +81,76 @@ struct AgentLoopTests {
     }
 
     @Test
+    func subAgentEventsAreForwardedLiveBeforeTheTaskResult() async throws {
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "task", arguments: .object(["prompt": .string("echo hi")]))),
+            toolCallResponse(ToolCall(id: "k1", name: "echo", arguments: .object(["text": .string("hi")]))),
+            ModelResponse(message: Message(role: .assistant, text: "child says hi")),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: LoopOptions(subAgents: true, helperModel: "small"))
+        var events: [AgentEvent] = []
+        for try await event in loop.run(prompt: "go") { events.append(event) }
+
+        let child = events.compactMap { event -> SubAgentUpdate? in
+            if case .subAgent(let update) = event { return update }
+            return nil
+        }
+        #expect(child.allSatisfy { $0.callID == "c1" && $0.model == "small" })
+        #expect(child.map { kind($0.event) } == ["init", "assistant", "toolResults", "assistant", "result"])
+        // The sub-agent's events all come before the parent's task result.
+        let lastChild = try #require(events.lastIndex { if case .subAgent = $0 { return true }; return false })
+        let taskResult = try #require(events.firstIndex { if case .toolResults = $0 { return true }; return false })
+        #expect(lastChild < taskResult)
+    }
+
+    @Test
+    func helperUsageIsPricedWithHelperPricing() async throws {
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "task", arguments: .object(["prompt": .string("find X")])), usage: Usage(inputTokens: 1000)),
+            ModelResponse(message: Message(role: .assistant, text: "X"), usage: Usage(inputTokens: 1000)),
+            ModelResponse(message: Message(role: .assistant, text: "done"), usage: Usage(inputTokens: 1000)),
+        ])
+        let options = LoopOptions(
+            pricing: Pricing(inputPer1K: 1),
+            subAgents: true,
+            helperModel: "small",
+            helperPricing: Pricing(inputPer1K: 0.1)
+        )
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: options)
+        let result = try await finalResult(loop.run(prompt: "where is X?"))
+
+        // Two main calls at $1/1K plus one helper call at $0.10/1K.
+        let cost = try #require(result.costEstimate)
+        #expect(abs(cost - 2.1) < 1e-9)
+    }
+
+    @Test
+    func subAgentOnlyGetsWhatIsLeftOfTheBudget() async throws {
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "task", arguments: .object(["prompt": .string("look around")])), usage: Usage(inputTokens: 600)),
+            // The child spends the remaining $0.40 and more on its first call.
+            toolCallResponse(ToolCall(id: "k1", name: "echo", arguments: .object(["text": .string("x")])), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, text: "never reached")),
+        ])
+        let options = LoopOptions(maxBudgetUSD: 1, pricing: Pricing(inputPer1K: 1), subAgents: true)
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+        _ = try await finalResult(loop.run(prompt: "go"))
+
+        let taskResult = try #require(loop.session.messages.last { $0.role == .tool }?.content.first)
+        guard case .toolResult(let result) = taskResult else { Issue.record("expected a tool result"); return }
+        #expect(result.isError)
+        #expect(result.content.contains(AgentResultKind.errorMaxBudgetUSD.rawValue))
+    }
+
+    @Test
+    func pricingParsesUSDPerMillionTokens() {
+        #expect(Pricing(perMillionTokens: "3, 15") == Pricing(inputPer1K: 0.003, outputPer1K: 0.015))
+        #expect(Pricing(perMillionTokens: "3") == nil)
+        #expect(Pricing(perMillionTokens: "a,b") == nil)
+    }
+
+    @Test
     func longConversationIsCompactedAndNotesSurvive() async throws {
         let model = ScriptedModel(responses: [
             toolCallResponse(ToolCall(id: "c1", name: "remember", arguments: .object(["note": .string("tests live in Tests/")])), usage: Usage(inputTokens: 50)),
@@ -129,6 +199,20 @@ struct AgentLoopTests {
 
 func toolCallResponse(_ call: ToolCall, usage: Usage = .zero) -> ModelResponse {
     ModelResponse(message: Message(role: .assistant, content: [.toolCall(call)]), finishReason: .toolUse, usage: usage)
+}
+
+/// The event's case name, for comparing event sequences.
+func kind(_ event: AgentEvent) -> String {
+    switch event {
+    case .initEvent: "init"
+    case .assistant: "assistant"
+    case .toolResult: "toolResult"
+    case .toolResults: "toolResults"
+    case .stream: "stream"
+    case .informational: "informational"
+    case .result: "result"
+    case .subAgent: "subAgent"
+    }
 }
 
 func finalResult(_ stream: AsyncThrowingStream<AgentEvent, any Error>) async throws -> AgentResult {

@@ -56,6 +56,9 @@ public final class AgentLoop: @unchecked Sendable {
     /// Facts saved with the `remember` tool. They are restated verbatim after
     /// every compaction so a summary cannot lose them.
     private var _notes: [String] = []
+    /// The part of `_usage` spent on `options.helperModel` (sub-agents and
+    /// summaries), priced with `options.helperPricing`.
+    private var _helperUsage: Usage = .zero
 
     /// The model id sent with each request; `nil` lets the gateway pick its
     /// configured or discovered default. Clients may switch it between turns
@@ -115,7 +118,9 @@ public final class AgentLoop: @unchecked Sendable {
                 do {
                     // Emit the init event once per *conversation*, not per run.
                     if !continuing {
-                        self.emit(.initEvent(self.session))
+                        let initEvent = AgentEvent.initEvent(self.session)
+                        self.emit(initEvent)
+                        continuation.yield(initEvent)
                     }
 
                     // Append the user's message to the live session.
@@ -172,7 +177,12 @@ public final class AgentLoop: @unchecked Sendable {
 
                         // 4. Execute the requested tools.
                         self._turnCounter += 1
-                        let results = await self.runTools(response.message.toolCalls)
+                        let results = await self.runTools(response.message.toolCalls) { event in
+                            self.emit(event)
+                            continuation.yield(event)
+                        }
+                        // A cancelled run stops here rather than asking the model again.
+                        try Task.checkCancellation()
                         for result in results {
                             self.emit(.toolResult(result))
                         }
@@ -231,19 +241,20 @@ public final class AgentLoop: @unchecked Sendable {
 
     /// Run each requested tool, collecting results. Tools run sequentially for
     /// predictability; results are gathered in call order.
-    private func runTools(_ toolCalls: [ToolCall]) async -> [ToolCallResult] {
+    /// `progress` receives events produced while a tool runs (sub-agents).
+    private func runTools(_ toolCalls: [ToolCall], progress: (AgentEvent) -> Void) async -> [ToolCallResult] {
         var results: [ToolCallResult] = []
         for call in toolCalls {
-            results.append(await runTool(call))
+            results.append(await runTool(call, progress: progress))
         }
         return results
     }
 
-    private func runTool(_ call: ToolCall) async -> ToolCallResult {
+    private func runTool(_ call: ToolCall, progress: (AgentEvent) -> Void) async -> ToolCallResult {
         let isTask = options.subAgents && call.name == Self.taskDefinition.name
         let isRemember = options.compaction != nil && call.name == Self.rememberDefinition.name
         if isTask {
-            return await runSubAgent(call)
+            return await runSubAgent(call, progress: progress)
         }
         if isRemember {
             let note = call.arguments.objectValue?["note"]?.stringValue ?? ""
@@ -296,36 +307,63 @@ public final class AgentLoop: @unchecked Sendable {
     )
 
     /// Run a `task` call in a fresh loop. Its tool output never enters this
-    /// conversation; only the final answer does. Its spend counts here, so
-    /// the budget cap and totals include it.
-    private func runSubAgent(_ call: ToolCall) async -> ToolCallResult {
+    /// conversation; only the final answer does. Its events are forwarded to
+    /// `progress` as they happen, tagged with the call id. Its spend counts
+    /// here, so the budget cap and totals include it, and it may only spend
+    /// what is left of the budget.
+    private func runSubAgent(_ call: ToolCall, progress: (AgentEvent) -> Void) async -> ToolCallResult {
         let prompt = call.arguments.objectValue?["prompt"]?.stringValue ?? ""
         if prompt.isEmpty {
             return ToolCallResult(callID: call.id, name: call.name, content: "missing string argument 'prompt'", isError: true)
         }
-        var childOptions = options
-        childOptions.subAgents = false
         let child = AgentLoop(gateway: gateway, tools: tools, systemPrompt: systemPrompt, options: childOptions, cwd: cwd)
-        child.model = options.helperModel ?? model
-        emit(.informational("Sub-agent started: \(prompt.prefix(80))"))
+        let childModel = options.helperModel ?? model
+        child.model = childModel
 
         var childResult: AgentResult?
         do {
             for try await event in child.run(prompt: prompt) {
                 if case .result(let result) = event { childResult = result }
+                progress(.subAgent(SubAgentUpdate(callID: call.id, model: childModel, event: event)))
             }
         } catch {
             return ToolCallResult(callID: call.id, name: call.name, content: "sub-agent failed: \(error)", isError: true)
         }
+        if Task.isCancelled {
+            return ToolCallResult(callID: call.id, name: call.name, content: "sub-agent cancelled", isError: true)
+        }
         guard let childResult else {
             return ToolCallResult(callID: call.id, name: call.name, content: "sub-agent ended without a result", isError: true)
         }
-        _usage.accumulate(childResult.usage)
+        recordUsage(childResult.usage, helper: true)
         guard childResult.isSuccess else {
             let reason = childResult.errorMessage ?? childResult.kind.rawValue
             return ToolCallResult(callID: call.id, name: call.name, content: "sub-agent stopped: \(reason)", isError: true)
         }
         return ToolCallResult(callID: call.id, name: call.name, content: childResult.text ?? "")
+    }
+
+    /// A sub-agent's options: no further sub-agents, the helper's pricing
+    /// when it runs on the helper model, and what is left of the budget.
+    private var childOptions: LoopOptions {
+        var child = options
+        child.subAgents = false
+        if options.helperModel != nil {
+            child.pricing = options.helperPricing ?? options.pricing
+        }
+        if let maxBudget = options.maxBudgetUSD {
+            child.maxBudgetUSD = max(0, maxBudget - (totalCost ?? 0))
+        }
+        return child
+    }
+
+    /// Add a model call's (or a sub-agent's) usage to the session totals.
+    /// `helper` usage was spent on the helper model, if one is set.
+    private func recordUsage(_ usage: Usage, helper: Bool) {
+        _usage.accumulate(usage)
+        if helper, options.helperModel != nil {
+            _helperUsage.accumulate(usage)
+        }
     }
 
     // MARK: Context size
@@ -356,7 +394,7 @@ public final class AgentLoop: @unchecked Sendable {
             temperature: options.temperature
         )
         let response = try await gateway.complete(request)
-        _usage.accumulate(response.usage)
+        recordUsage(response.usage, helper: true)
 
         var summary = "Summary of the conversation so far (older messages were compacted):\n\n\(response.message.text)"
         if !_notes.isEmpty {
@@ -371,10 +409,14 @@ public final class AgentLoop: @unchecked Sendable {
     // MARK: Cost
 
     /// Approximate US-dollar cost of the conversation so far, from per-token
-    /// pricing if configured (nil otherwise).
+    /// pricing if configured (nil otherwise). Helper-model usage is priced
+    /// with `helperPricing` when that is set.
     public var totalCost: Double? {
-        guard let pricing = self.options.pricing else { return nil }
-        return pricing.cost(of: usage)
+        guard let pricing = options.pricing else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        let helperPricing = options.helperPricing ?? pricing
+        // Pricing is linear, so the main model's share is all minus the helper's.
+        return pricing.cost(of: _usage) - pricing.cost(of: _helperUsage) + helperPricing.cost(of: _helperUsage)
     }
 
     private func emit(_ event: AgentEvent) {
@@ -400,6 +442,14 @@ public struct Pricing: Sendable, Codable, Equatable {
         self.outputPer1K = outputPer1K
         self.cacheReadPer1K = cacheReadPer1K ?? inputPer1K * 0.1
         self.cacheWritePer1K = cacheWritePer1K ?? inputPer1K * 1.25
+    }
+
+    /// Pricing from `"input,output"` in USD per million tokens, the way
+    /// providers publish prices, e.g. `"3,15"`. Nil if it doesn't parse.
+    public init?(perMillionTokens text: String) {
+        let parts = text.split(separator: ",").map { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard parts.count == 2, let input = parts[0], let output = parts[1], input >= 0, output >= 0 else { return nil }
+        self.init(inputPer1K: input / 1000, outputPer1K: output / 1000)
     }
 
     public func cost(of usage: Usage) -> Double {
@@ -449,6 +499,8 @@ public struct LoopOptions: Sendable {
     public var subAgents: Bool
     /// A cheaper model for sub-agents and summaries. Nil = the session's model.
     public var helperModel: String?
+    /// Pricing for `helperModel`. Nil = priced like the main model.
+    public var helperPricing: Pricing?
 
     public init(
         maxTurns: Int? = nil,
@@ -460,7 +512,8 @@ public struct LoopOptions: Sendable {
         keepToolResults: Int? = nil,
         compaction: Compaction? = nil,
         subAgents: Bool = false,
-        helperModel: String? = nil
+        helperModel: String? = nil,
+        helperPricing: Pricing? = nil
     ) {
         self.maxTurns = maxTurns
         self.maxBudgetUSD = maxBudgetUSD
@@ -472,5 +525,6 @@ public struct LoopOptions: Sendable {
         self.compaction = compaction
         self.subAgents = subAgents
         self.helperModel = helperModel
+        self.helperPricing = helperPricing
     }
 }

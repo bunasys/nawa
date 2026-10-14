@@ -165,6 +165,28 @@ public actor ACPSession {
         case .result:
             // Usage was already reported with each assistant update.
             break
+        case .subAgent(let update):
+            if let payload = Self.subAgentProgress(update) { await emitUpdate(payload) }
+        }
+    }
+
+    /// A sub-agent's progress as a `tool_call_update` of the parent's `task`
+    /// call: running once it starts, then its latest step as the content
+    /// (ACP replaces a tool call's content on each update). The final answer
+    /// arrives with the tool result, like any other tool.
+    static func subAgentProgress(_ update: SubAgentUpdate) -> JSON? {
+        switch update.event {
+        case .initEvent:
+            let title = update.model.map { "Sub-agent (\($0))" } ?? "Sub-agent"
+            return ACPSessionUpdate.toolCallUpdate(callID: update.callID, status: .running, title: title)
+        case .assistant(let turn):
+            var lines: [String] = []
+            if !turn.text.isEmpty { lines.append(turn.text) }
+            lines += turn.toolCalls.map { "→ \($0.name)" }
+            guard !lines.isEmpty else { return nil }
+            return ACPSessionUpdate.toolCallUpdate(callID: update.callID, status: .running, content: .text(lines.joined(separator: "\n")))
+        default:
+            return nil
         }
     }
 

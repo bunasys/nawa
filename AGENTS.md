@@ -46,7 +46,11 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   the token savers: `keepToolResults` (clear old tool output in batches),
   `compaction` (summarize older messages; adds a `remember` tool whose notes
   survive), `subAgents` (a `task` tool running a fresh child loop), and
-  `helperModel` (cheaper model for both). See `ContextShrinking.swift`.
+  `helperModel` (cheaper model for both, priced with `helperPricing`). See
+  `ContextShrinking.swift`. A sub-agent's events are forwarded live as
+  `AgentEvent.subAgent(SubAgentUpdate)`, tagged with the parent's `task`
+  call id; ACP shows them as `tool_call_update`s of that call. A sub-agent
+  may only spend what is left of `maxBudgetUSD`.
 - `Sources/AgentMCP` — `MCPClient`: spawns MCP servers, speaks JSON-RPC 2.0,
   exposes their tools.
 - `Sources/AgentACP` — `ACPServer`: ACP over streamable HTTP and WebSocket on
@@ -109,7 +113,9 @@ prompt and the newest message; OpenAI caches stable prefixes on its own.
 Don't put changing values (dates, file lists) in the system prompt, keep the
 tool order fixed, and rewrite old messages only in large batches. `Usage`
 keeps cache reads/writes apart from fresh input; `Pricing` prices them.
-`NAWA_HELPER_MODEL` sets the helper model for `serve` / `acp` / `repl`.
+`NAWA_HELPER_MODEL` sets the helper model for `serve` / `acp` / `repl`;
+`NAWA_PRICE` and `NAWA_HELPER_PRICE` (`"input,output"` USD per million
+tokens) turn on cost estimates for the main and helper models.
 
 ## Working with this repo (guidance for agents)
 

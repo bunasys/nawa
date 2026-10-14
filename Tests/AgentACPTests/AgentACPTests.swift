@@ -241,3 +241,29 @@ struct ACPParseFailureTests {
         #expect(error?["error"]?.objectValue?["code"]?.intValue == JSONRPCErrorCode.invalidRequest.rawValue)
     }
 }
+
+struct ACPSubAgentProgressTests {
+    @Test
+    func subAgentStartMarksTheTaskCallRunning() {
+        let update = SubAgentUpdate(callID: "c1", model: "small", event: .initEvent(Session(id: "s", cwd: "/")))
+        let payload = ACPSession.subAgentProgress(update)?.objectValue
+        #expect(payload?["sessionUpdate"]?.stringValue == "tool_call_update")
+        #expect(payload?["toolCallId"]?.stringValue == "c1")
+        #expect(payload?["status"]?.stringValue == "in_progress")
+        #expect(payload?["title"]?.stringValue == "Sub-agent (small)")
+    }
+
+    @Test
+    func subAgentStepBecomesTheTaskCallContent() {
+        let turn = AssistantUpdate(text: "Looking.", toolCalls: [ToolCall(id: "k1", name: "list_files")])
+        let payload = ACPSession.subAgentProgress(SubAgentUpdate(callID: "c1", model: nil, event: .assistant(turn)))?.objectValue
+        let content = payload?["content"]?.arrayValue?.first?.objectValue?["content"]?.objectValue
+        #expect(content?["text"]?.stringValue == "Looking.\n→ list_files")
+    }
+
+    @Test
+    func subAgentResultIsLeftToTheToolResult() {
+        let result = AgentResult(kind: .success, text: "x", usage: .zero, numTurns: 0, sessionID: "s")
+        #expect(ACPSession.subAgentProgress(SubAgentUpdate(callID: "c1", model: nil, event: .result(result))) == nil)
+    }
+}

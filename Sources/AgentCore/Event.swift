@@ -22,6 +22,26 @@ public enum AgentEvent: Sendable {
     case informational(String)
     /// Marks the end of the agent loop.
     case result(AgentResult)
+    /// An event from a sub-agent running one of this loop's `task` calls,
+    /// forwarded live so clients can show its progress under that call.
+    indirect case subAgent(SubAgentUpdate)
+}
+
+/// Payload for ``AgentEvent/subAgent(_:)``: one event of a sub-agent's own
+/// run, tagged with the parent tool call it is working on.
+public struct SubAgentUpdate: Sendable {
+    /// The id of the parent's `task` tool call.
+    public var callID: String
+    /// The model the sub-agent runs on; nil when the gateway picks.
+    public var model: String?
+    /// The sub-agent's event. Its usage and cost cover the sub-agent only.
+    public var event: AgentEvent
+
+    public init(callID: String, model: String?, event: AgentEvent) {
+        self.callID = callID
+        self.model = model
+        self.event = event
+    }
 }
 
 /// Payload for ``AgentEvent/assistant(_:)``.
