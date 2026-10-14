@@ -42,6 +42,13 @@ struct AgentConfigStoreTests {
     }
 
     @Test
+    func loadOfNewerVersionThrows() throws {
+        let file = try temporaryDirectory().appendingPathComponent("config.json")
+        try Data(#"{"version": 99, "directories": {}}"#.utf8).write(to: file)
+        #expect(throws: AgentConfigStoreError.self) { try AgentConfigStore.load(from: file) }
+    }
+
+    @Test
     func addProviderScopesByDirectoryAndActivates() throws {
         let dirA = try temporaryDirectory()
         let dirB = try temporaryDirectory()

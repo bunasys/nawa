@@ -66,15 +66,23 @@ public struct AgentConfigStore: Codable, Sendable, Equatable {
     // MARK: Load / save
 
     /// Load the store from `url`. A missing file yields an empty store; a
-    /// malformed one throws `AgentConfigStoreError.malformed`.
+    /// malformed one throws `AgentConfigStoreError.malformed`, and one from a
+    /// newer version `.unsupportedVersion`.
     public static func load(from url: URL = defaultLocation()) throws -> AgentConfigStore {
         guard FileManager.default.fileExists(atPath: url.path) else { return AgentConfigStore() }
         let data = try Data(contentsOf: url)
+        let store: AgentConfigStore
         do {
-            return try JSONDecoder().decode(AgentConfigStore.self, from: data)
+            store = try JSONDecoder().decode(AgentConfigStore.self, from: data)
         } catch {
             throw AgentConfigStoreError.malformed(path: url.path, underlying: error)
         }
+        // A newer format may mean fields this build would silently drop on
+        // the next save, so refuse it rather than lose the user's settings.
+        guard store.version <= currentVersion else {
+            throw AgentConfigStoreError.unsupportedVersion(path: url.path, version: store.version)
+        }
+        return store
     }
 
     /// Write the store to `url`, creating parent directories as needed. The
@@ -143,6 +151,7 @@ public struct AgentConfigStore: Codable, Sendable, Equatable {
 public enum AgentConfigStoreError: Error, LocalizedError, Sendable {
     case malformed(path: String, underlying: any Error)
     case providerNotFound(name: String, directory: String)
+    case unsupportedVersion(path: String, version: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -150,6 +159,8 @@ public enum AgentConfigStoreError: Error, LocalizedError, Sendable {
             return "config file at \(path) is not valid: \(underlying)"
         case .providerNotFound(let name, let directory):
             return "no provider named \"\(name)\" is configured for \(directory)"
+        case .unsupportedVersion(let path, let version):
+            return "config file at \(path) is version \(version); this nawa reads up to \(AgentConfigStore.currentVersion). Upgrade nawa."
         }
     }
 }
