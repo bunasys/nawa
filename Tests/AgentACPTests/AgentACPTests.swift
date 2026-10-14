@@ -199,3 +199,13 @@ struct JSONRPCIDTests {
         #expect(reply?.json.objectValue?["id"] == .string("6f1c-uuid"))
     }
 }
+
+struct JSONRPCResponseIDTests {
+    /// A response that names no request must not be matched to request `0`.
+    @Test
+    func successResponseWithoutIDIsRejected() {
+        #expect(throws: JSONRPCParseError.self) {
+            try parseJSONRPCLine(#"{"jsonrpc":"2.0","result":{}}"#)
+        }
+    }
+}

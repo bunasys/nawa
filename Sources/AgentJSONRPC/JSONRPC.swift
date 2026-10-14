@@ -59,14 +59,16 @@ public enum JSONRPCMessage: Sendable, Hashable {
     }
 }
 
-/// A JSON-RPC request or notification (without `result`/`error`).
+/// A JSON-RPC request: a call that expects a response correlated by `id`.
+/// Calls without an id are notifications (`JSONRPCMethod`), so the id here
+/// is never absent.
 public struct JSONRPCRequest: Sendable, Hashable {
     public var jsonrpc: String
-    public var id: JSONRPCID?
+    public var id: JSONRPCID
     public var method: String
     public var params: JSON?
 
-    public init(method: String, id: JSONRPCID?, params: JSON? = nil, jsonrpc: String = "2.0") {
+    public init(method: String, id: JSONRPCID, params: JSON? = nil, jsonrpc: String = "2.0") {
         self.method = method
         self.id = id
         self.params = params
@@ -163,7 +165,7 @@ public extension JSONRPCMessage {
                 "jsonrpc": .string("2.0"),
                 "method": .string(r.method),
             ]
-            if let id = r.id { obj["id"] = id.json }
+            obj["id"] = r.id.json
             if let params = r.params { obj["params"] = params }
             return .object(obj)
         case .notification(let n):
@@ -214,10 +216,15 @@ public func parseJSONRPCLine(_ line: String) throws -> JSONRPCMessage {
         let message = object["error"]?.objectValue?["message"]?.stringValue ?? "unknown error"
         return .errorResponse(JSONRPCError(id: JSONRPCID(json: object["id"]), error: .init(code: code, message: message, data: object["error"]?.objectValue?["data"])))
     } else {
-        return .successResponse(JSONRPCSuccess(id: JSONRPCID(json: object["id"]) ?? 0, result: object["result"]))
+        // A success response that names no request cannot be correlated;
+        // inventing an id would resolve the wrong pending call.
+        guard let id = JSONRPCID(json: object["id"]) else { throw JSONRPCParseError.missingID }
+        return .successResponse(JSONRPCSuccess(id: id, result: object["result"]))
     }
 }
 
 public enum JSONRPCParseError: Error, Sendable {
     case notAnObject
+    /// A response without a usable `id`.
+    case missingID
 }

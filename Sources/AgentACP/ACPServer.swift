@@ -137,7 +137,7 @@ public struct ACPServer: Sendable {
                 capabilities: configuration.capabilities
             )
             let result = await connection.initializeResult()
-            let responseMessage = JSONRPCMessage.makeSuccess(id: req.id ?? 0, result: result)
+            let responseMessage = JSONRPCMessage.makeSuccess(id: req.id, result: result)
             let data = Data(responseMessage.json.description.utf8)
             return Response(
                 status: .ok,
@@ -219,7 +219,7 @@ public struct ACPServer: Sendable {
                 guard let parsed = try? parseJSONRPCLine(text) else { continue }
                 if case .request(let req) = parsed, req.method == "initialize" {
                     let result = await connection.initializeResult()
-                    let response = JSONRPCMessage.makeSuccess(id: req.id ?? 0, result: result)
+                    let response = JSONRPCMessage.makeSuccess(id: req.id, result: result)
                     try? await outbound.write(.text(response.json.description))
                 } else {
                     await connection.handle(parsed)

@@ -93,7 +93,7 @@ public actor ACPConnection {
         case "initialize":
             // Streamable HTTP answers `initialize` inline before a connection
             // exists; stdio and WebSocket route it here like any other request.
-            connectionStream.publish(.makeSuccess(id: request.id ?? 0, result: initializeResult()))
+            connectionStream.publish(.makeSuccess(id: request.id, result: initializeResult()))
         case "session/new":
             await newSession(request: request)
         case "session/load":
@@ -140,7 +140,7 @@ public actor ACPConnection {
             // Ensure the session stream exists.
             _ = sessionOutbound(for: sessionID)
             connectionStream.publish(
-                .makeSuccess(id: request.id!, result: .object(["sessionId": .string(sessionID)]))
+                .makeSuccess(id: request.id, result: .object(["sessionId": .string(sessionID)]))
             )
         } catch {
             connectionStream.publish(
@@ -159,7 +159,7 @@ public actor ACPConnection {
             )
             return
         }
-        connectionStream.publish(.makeSuccess(id: request.id!, result: .object(["sessionId": .string(sessionID)])))
+        connectionStream.publish(.makeSuccess(id: request.id, result: .object(["sessionId": .string(sessionID)])))
     }
 
     private func prompt(request: JSONRPCRequest) async {
@@ -173,7 +173,7 @@ public actor ACPConnection {
             return
         }
         let content = (params["prompt"]?.arrayValue ?? []).compactMap { ACPContentBlock(json: $0) }
-        await session.prompt(requestID: request.id!, content: content)
+        await session.prompt(requestID: request.id, content: content)
     }
 
     private func setModel(request: JSONRPCRequest) async {
@@ -188,7 +188,7 @@ public actor ACPConnection {
             return
         }
         await session.setModel(modelID)
-        connectionStream.publish(.makeSuccess(id: request.id ?? 0, result: .object([:])))
+        connectionStream.publish(.makeSuccess(id: request.id, result: .object([:])))
     }
 
     // MARK: - Helpers
