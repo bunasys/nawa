@@ -13,28 +13,32 @@ import Foundation
 /// MCP servers requested by the client, and the project's AGENTS.md
 /// instructions into a ready-to-run `AgentLoop`.
 ///
-/// The gateway is resolved per session from the session's working directory,
-/// because `nawa config` stores providers per directory and one ACP process
-/// may serve sessions in several projects.
+/// The gateway and the built-in tools are made per session from the
+/// session's working directory, because `nawa config` stores providers per
+/// directory and one ACP process may serve sessions in several projects.
 public struct HarnessSessionFactory: ACPSessionFactory {
     public let gatewayForDirectory: @Sendable (URL) throws -> any LanguageModel
-    public let baseTools: ToolRegistry
     public let loopOptions: LoopOptions
+
+    /// Past this many MCP tools, they are offered through `tool_search` and
+    /// `call_tool` instead of one definition each (see DeferredTools.swift).
+    static let maxDirectMCPTools = 10
 
     public init(
         gatewayForDirectory: @escaping @Sendable (URL) throws -> any LanguageModel,
-        baseTools: ToolRegistry,
         loopOptions: LoopOptions = .init()
     ) {
         self.gatewayForDirectory = gatewayForDirectory
-        self.baseTools = baseTools
         self.loopOptions = loopOptions
     }
 
     public func makeLoop(sessionID: String, cwd: String, mcpServers: [MCPServerConfig]) async throws -> AgentLoop {
-        let gateway = try gatewayForDirectory(URL(fileURLWithPath: cwd))
-        var tools = baseTools
+        let directory = URL(fileURLWithPath: cwd)
+        let gateway = try gatewayForDirectory(directory)
+        var tools = ToolRegistry(AgentCLI.builtInTools(workingDirectory: directory))
+
         // Connect any MCP servers the client requested for this session.
+        var mcpTools: [any Tool] = []
         for config in mcpServers {
             let client = MCPClient(config: config)
             do {
@@ -45,13 +49,18 @@ public struct HarnessSessionFactory: ACPSessionFactory {
             }
             // Expose the MCP server's tools under prefixed names to avoid clashes.
             for tool in await client.tools {
-                let prefixed = PrefixedTool(prefix: "\(config.name)__", wrapped: client, remote: tool)
-                tools.register(prefixed)
+                mcpTools.append(PrefixedTool(prefix: "\(config.name)__", wrapped: client, remote: tool))
             }
+        }
+        if mcpTools.count > Self.maxDirectMCPTools {
+            tools.register(ToolSearchTool(tools: mcpTools))
+            tools.register(CallToolTool(tools: mcpTools))
+        } else {
+            tools.register(contentsOf: mcpTools)
         }
 
         // Load AGENTS.md from the session's working directory.
-        let instructions = try? ProjectInstructions.load(from: URL(fileURLWithPath: cwd))
+        let instructions = try? ProjectInstructions.load(from: directory)
         let systemPrompt = instructions?.text
 
         return AgentLoop(
@@ -102,11 +111,10 @@ struct AgentCLI {
         let args = Array(CommandLine.arguments.dropFirst())
         let command = args.first ?? "serve"
 
-        // Built-in tools.
-        let tools = ToolRegistry([CurrentTimeTool(), EchoTool(), ShellTool()])
+        let loopOptions = defaultLoopOptions()
         let sessionFactory = HarnessSessionFactory(
             gatewayForDirectory: { directory in try resolveGateway(directory: directory) },
-            baseTools: tools
+            loopOptions: loopOptions
         )
 
         // Waku launches the agent as a Kimi Code CLI and generates commit
@@ -131,7 +139,7 @@ struct AgentCLI {
             try await WakuCompatibility.providerCommand(arguments: Array(args.dropFirst()))
         case "repl":
             let gateway = try resolveGateway()
-            try await repl(gateway: gateway, tools: tools)
+            try await repl(gateway: gateway, options: loopOptions)
         case "config":
             try await ConfigCommand.run(arguments: Array(args.dropFirst()))
         default:
@@ -142,6 +150,29 @@ struct AgentCLI {
             print("  config — configure a provider (OpenAI-compatible or Anthropic) for the current directory")
             print("  provider list [--json] — list the active provider's models")
         }
+    }
+
+    static func builtInTools(workingDirectory: URL) -> [any Tool] {
+        [
+            CurrentTimeTool(),
+            ShellTool(workingDirectory: workingDirectory),
+            ReadFileTool(workingDirectory: workingDirectory),
+            EditFileTool(workingDirectory: workingDirectory),
+            SearchTool(workingDirectory: workingDirectory),
+            ListFilesTool(workingDirectory: workingDirectory),
+        ]
+    }
+
+    /// Token-saving defaults for interactive sessions. `NAWA_HELPER_MODEL`
+    /// names a cheaper model for sub-agents and summaries; it must be served
+    /// by the same provider as the main model.
+    static func defaultLoopOptions(env: [String: String] = ProcessInfo.processInfo.environment) -> LoopOptions {
+        LoopOptions(
+            keepToolResults: 20,
+            compaction: Compaction(atContextTokens: 120_000, keepRecentMessages: 20),
+            subAgents: true,
+            helperModel: env["NAWA_HELPER_MODEL"]
+        )
     }
 
     /// Build the gateway for this run. Precedence:
@@ -194,13 +225,15 @@ struct AgentCLI {
         return Gateway(providers: [provider], activeProviderName: "default")
     }
 
-    static func repl(gateway: any LanguageModel, tools: ToolRegistry) async throws {
+    static func repl(gateway: any LanguageModel, options: LoopOptions) async throws {
         let instructions = try? ProjectInstructions.loadForCurrentWorkingDirectory()
+        var replOptions = options
+        replOptions.maxTurns = 20
         let loop = AgentLoop(
             gateway: gateway,
-            tools: tools,
+            tools: ToolRegistry(builtInTools(workingDirectory: WorkingDirectory.defaultURL)),
             systemPrompt: instructions?.text,
-            options: LoopOptions(maxTurns: 20)
+            options: replOptions
         )
         print("Nawa REPL (type a prompt, Ctrl-D to quit)")
         while let line = readLine() {
@@ -212,6 +245,7 @@ struct AgentCLI {
                     for call in update.toolCalls {
                         print("🔧 \(call.name)(\(call.arguments.description))")
                     }
+                    print("   \(usageLine(update))")
                 case .toolResult(let result):
                     print("← \(result.name): \(result.content.prefix(200))")
                 case .result(let result):
@@ -224,6 +258,17 @@ struct AgentCLI {
             }
             print()
         }
+    }
+
+    /// One line of spend per turn, so an expensive session shows early.
+    static func usageLine(_ update: AssistantUpdate) -> String {
+        let turn = update.usage
+        var line = "turn: \(turn.promptTokens) in (\(turn.cacheReadTokens) cached), \(turn.outputTokens) out"
+        line += " · session: \(update.sessionUsage.total) tokens"
+        if let cost = update.sessionCost {
+            line += String(format: ", $%.4f", cost)
+        }
+        return line
     }
 }
 

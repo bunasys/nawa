@@ -112,10 +112,21 @@ struct OpenAIUsage: Decodable {
     let promptTokens: Int?
     let completionTokens: Int?
     let totalTokens: Int?
+    let promptTokensDetails: OpenAIPromptTokensDetails?
     private enum CodingKeys: String, CodingKey {
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
         case totalTokens = "total_tokens"
+        case promptTokensDetails = "prompt_tokens_details"
+    }
+}
+
+/// OpenAI caches long prompt prefixes automatically and reports the cached
+/// share of `prompt_tokens` here.
+struct OpenAIPromptTokensDetails: Decodable {
+    let cachedTokens: Int?
+    private enum CodingKeys: String, CodingKey {
+        case cachedTokens = "cached_tokens"
     }
 }
 

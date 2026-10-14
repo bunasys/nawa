@@ -1,18 +1,27 @@
 import AgentCore
 import Foundation
 
-/// Runs a shell command and captures its stdout/stderr.
+/// Runs a shell command and captures its output.
 ///
 /// The classic agent workhorse — lets the agent inspect, build, and test a
-/// system the way a human shell user would.
+/// system the way a human shell user would. Long output is cut to its first
+/// and last lines (see `CapturedOutput`), with the full text left in a file.
 public struct ShellTool: Tool {
-    public init() {}
+    /// Where commands run unless the call names another directory.
+    public let workingDirectory: URL
+
+    public init(workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) {
+        self.workingDirectory = workingDirectory
+    }
+
     public var definition: ToolDefinition {
         ToolDefinition(
             name: "shell",
             description: """
-            Run a shell command in the agent's working directory and return stdout and stderr. \
-            Use for inspecting files, running builds/tests, and interacting with the environment.
+            Run a bash command in the agent's working directory and return its exit code and \
+            combined stdout/stderr. Use for builds, tests, git and other commands. Long output \
+            is cut to its first and last lines and saved in full to a file you can search. \
+            Prefer read_file, search, list_files and edit_file for working with files.
             """,
             parameters: .object([
                 "type": .string("object"),
@@ -35,35 +44,18 @@ public struct ShellTool: Tool {
         guard let command = arguments.objectValue?["command"]?.stringValue else {
             throw ToolError.argumentError("missing string argument 'command'")
         }
-        let workingDirectory = arguments.objectValue?["workingDirectory"]?.stringValue
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", command]
-        if let workingDirectory {
-            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
+        var directory = workingDirectory
+        if let requested = arguments.objectValue?["workingDirectory"]?.stringValue {
+            directory = resolvedPath(requested, in: workingDirectory)
         }
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
-        try process.run()
-        process.waitUntilExit()
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        let stdout = String(data: outData, encoding: .utf8) ?? ""
-        let stderr = String(data: errData, encoding: .utf8) ?? ""
-        let status = process.terminationStatus
 
-        var output = ""
-        if !stdout.isEmpty { output += "stdout:\n\(stdout)" }
-        if !stderr.isEmpty { output += (output.isEmpty ? "" : "\n") + "stderr:\n\(stderr)" }
-        if output.isEmpty { output = "(no output)" }
-        output += "\nexit code: \(status)"
-
-        if status != 0 {
-            throw ToolError.runtimeError(output)
+        let run = try CapturedOutput.run(["bash", "-c", command], in: directory)
+        let capped = CapturedOutput.capped(run)
+        let output = capped.isEmpty ? "(no output)" : capped
+        let result = "exit code: \(run.status)\n\(output)"
+        if run.status != 0 {
+            throw ToolError.runtimeError(result)
         }
-        return output
+        return result
     }
 }

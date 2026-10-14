@@ -121,6 +121,15 @@ public actor ACPSession {
                 )
                 await emitUpdate(payload)
             }
+            // Usage after every model call, not only at the end, so a client
+            // sees an expensive turn while it is still running. `used` is
+            // what this call read and wrote: how full the context is now.
+            let usagePayload = ACPSessionUpdate.usageUpdate(
+                used: update.usage.total,
+                size: update.usage.total,
+                costUSDCenticents: update.sessionCost
+            )
+            await emitUpdate(usagePayload)
         case .toolResult(let result):
             let status: ACPToolCallStatus = result.isError ? .failed : .completed
             let payload = ACPSessionUpdate.toolCallUpdate(
@@ -153,14 +162,9 @@ public actor ACPSession {
             }
         case .informational:
             break
-        case .result(let result):
-            // Surface a usage_update at the end of the turn.
-            let usagePayload = ACPSessionUpdate.usageUpdate(
-                used: result.usage.total,
-                size: result.usage.total,
-                costUSDCenticents: result.costEstimate
-            )
-            await emitUpdate(usagePayload)
+        case .result:
+            // Usage was already reported with each assistant update.
+            break
         }
     }
 

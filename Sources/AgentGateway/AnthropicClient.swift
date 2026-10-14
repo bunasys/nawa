@@ -93,27 +93,36 @@ public struct AnthropicClient: LanguageModel, Sendable {
 
     // MARK: Domain -> wire
 
+    /// The request carries three prompt-cache breakpoints: the last tool, the
+    /// system prompt, and the last block of the newest message. Anthropic
+    /// caches the whole prefix up to each breakpoint, so a turn pays full
+    /// price only for what changed since the previous one; cache reads cost
+    /// about a tenth of fresh input. (The API allows four breakpoints.)
     static func requestBody(_ request: ModelRequest) throws -> JSON {
         var body: [String: JSON] = [
             "model": .string(try request.requiredModel()),
             "max_tokens": .int(request.maxOutputTokens ?? defaultMaxTokens),
-            "messages": .array(anthropicMessages(request.messages)),
+            "messages": .array(markLastBlockCacheable(anthropicMessages(request.messages))),
         ]
         let systemText = request.messages
             .filter { $0.role == .system }
             .map(\.text)
             .joined(separator: "\n\n")
         if !systemText.isEmpty {
-            body["system"] = .string(systemText)
+            body["system"] = .array([
+                .object(["type": .string("text"), "text": .string(systemText), "cache_control": cacheControl]),
+            ])
         }
         if let tools = request.tools, !tools.isEmpty {
-            body["tools"] = .array(tools.map { tool in
+            var wireTools: [JSON] = tools.map { tool in
                 .object([
                     "name": .string(tool.name),
                     "description": .string(tool.description),
                     "input_schema": inputSchema(tool.parameters),
                 ])
-            })
+            }
+            wireTools[wireTools.count - 1] = withCacheControl(wireTools[wireTools.count - 1])
+            body["tools"] = .array(wireTools)
         }
         // Current Claude models reject sampling parameters, so only send one
         // when the caller explicitly asked for it.
@@ -121,6 +130,35 @@ public struct AnthropicClient: LanguageModel, Sendable {
             body["temperature"] = .double(temperature)
         }
         return .object(body)
+    }
+
+    static let cacheControl: JSON = .object(["type": .string("ephemeral")])
+
+    static func withCacheControl(_ block: JSON) -> JSON {
+        var fields = block.objectValue ?? [:]
+        fields["cache_control"] = cacheControl
+        return .object(fields)
+    }
+
+    /// Put the moving cache breakpoint on the newest message, so the next
+    /// turn reads everything before it from the cache. Thinking blocks
+    /// refuse `cache_control`, so the breakpoint goes on the last block that
+    /// accepts one.
+    static func markLastBlockCacheable(_ turns: [JSON]) -> [JSON] {
+        guard var lastTurn = turns.last?.objectValue,
+              var blocks = lastTurn["content"]?.arrayValue
+        else { return turns }
+        let cacheableTypes: Set<String> = ["text", "tool_use", "tool_result"]
+        let cacheableIndex = blocks.lastIndex { block in
+            let type = block.objectValue?["type"]?.stringValue ?? ""
+            return cacheableTypes.contains(type)
+        }
+        guard let cacheableIndex else { return turns }
+        blocks[cacheableIndex] = withCacheControl(blocks[cacheableIndex])
+        lastTurn["content"] = .array(blocks)
+        var marked = turns
+        marked[marked.count - 1] = .object(lastTurn)
+        return marked
     }
 
     /// Anthropic rejects a schema without `"type"` (OpenAI-compatible
@@ -216,15 +254,16 @@ public struct AnthropicClient: LanguageModel, Sendable {
         )
     }
 
-    /// Anthropic's `input_tokens` excludes prompt-cache reads and writes,
-    /// which are reported separately. `Usage` has no cache fields, so they are
-    /// counted as input: they are input the model processed, and dropping
-    /// them under-reports usage on every cached turn.
+    /// Anthropic reports prompt-cache reads and writes apart from
+    /// `input_tokens`, which matches how `Usage` keeps them.
     static func usage(from wire: JSON?) -> Usage {
         let fields = wire?.objectValue ?? [:]
-        let input = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-            .reduce(0) { $0 + (fields[$1]?.intValue ?? 0) }
-        return Usage(inputTokens: input, outputTokens: fields["output_tokens"]?.intValue ?? 0)
+        return Usage(
+            inputTokens: fields["input_tokens"]?.intValue ?? 0,
+            outputTokens: fields["output_tokens"]?.intValue ?? 0,
+            cacheReadTokens: fields["cache_read_input_tokens"]?.intValue ?? 0,
+            cacheWriteTokens: fields["cache_creation_input_tokens"]?.intValue ?? 0
+        )
     }
 
     static func stopReason(from wire: String?) -> StopReason? {

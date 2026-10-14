@@ -225,8 +225,15 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         }
     }
 
+    /// `prompt_tokens` includes the cached tokens; `Usage` counts them apart.
     static func usage(_ usage: OpenAIUsage?) -> Usage {
-        Usage(inputTokens: usage?.promptTokens ?? 0, outputTokens: usage?.completionTokens ?? 0)
+        let prompt = usage?.promptTokens ?? 0
+        let cached = usage?.promptTokensDetails?.cachedTokens ?? 0
+        return Usage(
+            inputTokens: prompt - cached,
+            outputTokens: usage?.completionTokens ?? 0,
+            cacheReadTokens: cached
+        )
     }
 
     static func argumentsString(_ arguments: JSON) -> String {

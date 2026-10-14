@@ -34,12 +34,26 @@ public struct AssistantUpdate: Sendable {
     public var usage: Usage
     /// Why the model stopped.
     public var stopReason: StopReason?
+    /// Usage across the whole conversation so far, this turn included, so
+    /// clients can show spend as it grows rather than only at the end.
+    public var sessionUsage: Usage
+    /// Estimated cost of the conversation so far, if pricing is configured.
+    public var sessionCost: Double?
 
-    public init(text: String, toolCalls: [ToolCall], usage: Usage = .zero, stopReason: StopReason? = nil) {
+    public init(
+        text: String,
+        toolCalls: [ToolCall],
+        usage: Usage = .zero,
+        stopReason: StopReason? = nil,
+        sessionUsage: Usage = .zero,
+        sessionCost: Double? = nil
+    ) {
         self.text = text
         self.toolCalls = toolCalls
         self.usage = usage
         self.stopReason = stopReason
+        self.sessionUsage = sessionUsage
+        self.sessionCost = sessionCost
     }
 
     /// Content blocks for this turn: text first, then tool calls.

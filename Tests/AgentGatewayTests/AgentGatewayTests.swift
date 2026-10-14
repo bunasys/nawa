@@ -37,4 +37,11 @@ struct AgentGatewayTests {
         #expect(OpenAICompatibleClient.stopReason(from: "content_filter") == .refusal)
         #expect(OpenAICompatibleClient.stopReason(from: "unknown") == nil)
     }
+
+    @Test
+    func cachedPromptTokensAreCountedApart() throws {
+        let data = Data(#"{"prompt_tokens":1000,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":800}}"#.utf8)
+        let usage = OpenAICompatibleClient.usage(try JSONDecoder().decode(OpenAIUsage.self, from: data))
+        #expect(usage == Usage(inputTokens: 200, outputTokens: 7, cacheReadTokens: 800))
+    }
 }

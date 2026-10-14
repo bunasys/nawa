@@ -31,13 +31,22 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   providers (each `ProviderConfig.api` is `openai` or `anthropic`) and auto model discovery (`GET /v1/models`), `ProviderConfig`,
   `AgentConfigStore` (the per-directory config file written by `nawa config`).
 - `Sources/AgentJSONRPC` — JSON-RPC 2.0 envelope shared by MCP and ACP.
-- `Sources/AgentTools` — built-in tools (`CurrentTimeTool`,
-  `ShellTool`, `EchoTool`).
+- `Sources/AgentTools` — built-in tools: `ShellTool`, `ReadFileTool`,
+  `EditFileTool`, `SearchTool` / `ListFilesTool` (ripgrep; without it,
+  `FileWalk` gives the same results, .gitignore included), `CurrentTimeTool`,
+  `EchoTool` (tests/demos), and `ToolSearchTool` / `CallToolTool`, which put
+  large MCP tool sets behind two tools. Tools that touch files take the
+  session's `workingDirectory`. Long output is cut to head + tail with the
+  full text saved to a temp file (`CapturedOutput`).
 - `Sources/AgentInstructions` — `ProjectInstructions`: loads AGENTS.md from a
   directory, root-first / nearest-last so the closest file wins.
 - `Sources/AgentLoop` — `AgentLoop`: the Runner/Event loop. Drives a session
   (init event → turns → tool execution → result), with maxTurns/maxBudget
-  caps, usage accounting, and cost estimates.
+  caps, usage accounting, and cost estimates. `LoopOptions` also turns on
+  the token savers: `keepToolResults` (clear old tool output in batches),
+  `compaction` (summarize older messages; adds a `remember` tool whose notes
+  survive), `subAgents` (a `task` tool running a fresh child loop), and
+  `helperModel` (cheaper model for both). See `ContextShrinking.swift`.
 - `Sources/AgentMCP` — `MCPClient`: spawns MCP servers, speaks JSON-RPC 2.0,
   exposes their tools.
 - `Sources/AgentACP` — `ACPServer`: ACP over streamable HTTP and WebSocket on
@@ -92,6 +101,16 @@ may be literals or `env:NAME` references. `Gateway` only routes: environment
 fallbacks (`ANTHROPIC_WORKSPACE_ID`, the federation variables) are applied
 once at load time with `GatewayConfig.withEnvironmentDefaults()`.
 
+## Token costs
+
+Every turn resends the whole conversation, so keep its prefix stable:
+`AnthropicClient` sets prompt-cache breakpoints on the last tool, the system
+prompt and the newest message; OpenAI caches stable prefixes on its own.
+Don't put changing values (dates, file lists) in the system prompt, keep the
+tool order fixed, and rewrite old messages only in large batches. `Usage`
+keeps cache reads/writes apart from fresh input; `Pricing` prices them.
+`NAWA_HELPER_MODEL` sets the helper model for `serve` / `acp` / `repl`.
+
 ## Working with this repo (guidance for agents)
 
 - Keep modules focused: each target in `Sources/` does one thing well.
@@ -101,4 +120,4 @@ once at load time with `GatewayConfig.withEnvironmentDefaults()`.
   adjacent to the data they operate on.
 - When adding a tool, add its test in the matching test suite.
 - Commands: build with `swift build`, test with `swift test`. Both must stay
-  green before pushing.
+  green before committing. Never push to a remote.

@@ -29,7 +29,8 @@ struct AnthropicClientTests {
         let body = try AnthropicClient.requestBody(ModelRequest(model: "claude-opus-5-5", messages: messages)).objectValue!
         let turns = body["messages"]!.arrayValue!
 
-        #expect(body["system"]?.stringValue == "Be brief.")
+        let system = body["system"]?.arrayValue?.first?.objectValue
+        #expect(system?["text"]?.stringValue == "Be brief.")
         #expect(body["max_tokens"]?.intValue == AnthropicClient.defaultMaxTokens)
         #expect(body["temperature"] == nil)
         #expect(turns.count == 3)
@@ -38,6 +39,34 @@ struct AnthropicClientTests {
         let toolTurn = turns[2].objectValue!
         #expect(toolTurn["role"]?.stringValue == "user")
         #expect(toolTurn["content"]?.arrayValue?.count == 2)
+    }
+
+    @Test
+    func requestMarksToolsSystemAndNewestMessageCacheable() throws {
+        let thinking = JSON.object(["type": .string("thinking"), "thinking": .string(""), "signature": .string("sig")])
+        let messages = [
+            Message(role: .system, text: "Be brief."),
+            Message(role: .user, text: "Echo?"),
+            Message(role: .assistant, content: [.toolCall(ToolCall(id: "t1", name: "echo")), .opaque(provider: "anthropic", payload: thinking)]),
+        ]
+        let tools = [
+            ToolDefinition(name: "a", description: ""),
+            ToolDefinition(name: "b", description: ""),
+        ]
+        let body = try AnthropicClient.requestBody(ModelRequest(model: "m", messages: messages, tools: tools)).objectValue!
+        let wireTools = body["tools"]!.arrayValue!
+        let system = body["system"]!.arrayValue!
+        let turns = body["messages"]!.arrayValue!
+        let firstTurnBlock = turns[0].objectValue!["content"]!.arrayValue![0].objectValue!
+        let lastTurnBlocks = turns[1].objectValue!["content"]!.arrayValue!
+
+        #expect(wireTools[0].objectValue?["cache_control"] == nil)
+        #expect(wireTools[1].objectValue?["cache_control"] == AnthropicClient.cacheControl)
+        #expect(system[0].objectValue?["cache_control"] == AnthropicClient.cacheControl)
+        #expect(firstTurnBlock["cache_control"] == nil)
+        // The trailing thinking block refuses cache_control; the tool_use before it takes it.
+        #expect(lastTurnBlocks[0].objectValue?["cache_control"] == AnthropicClient.cacheControl)
+        #expect(lastTurnBlocks[1] == thinking)
     }
 
     @Test
@@ -109,14 +138,15 @@ struct AnthropicClientTests {
 
 struct AnthropicUsageAndModelTests {
     @Test
-    func cacheTokensCountAsInput() {
+    func cacheTokensAreKeptApartFromInput() {
         let usage = AnthropicClient.usage(from: .object([
             "input_tokens": .int(10),
             "cache_read_input_tokens": .int(1000),
             "cache_creation_input_tokens": .int(200),
             "output_tokens": .int(5),
         ]))
-        #expect(usage == Usage(inputTokens: 1210, outputTokens: 5))
+        #expect(usage == Usage(inputTokens: 10, outputTokens: 5, cacheReadTokens: 1000, cacheWriteTokens: 200))
+        #expect(usage.promptTokens == 1210)
     }
 
     @Test

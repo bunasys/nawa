@@ -18,9 +18,16 @@ public struct ToolDefinition: Sendable, Hashable, Codable {
 }
 
 /// Errors a tool can throw while running.
-public enum ToolError: Error, Sendable {
+public enum ToolError: Error, Sendable, CustomStringConvertible {
     case argumentError(String)
     case runtimeError(String)
+
+    /// The bare message: this text is what the model reads as the tool result.
+    public var description: String {
+        switch self {
+        case .argumentError(let message), .runtimeError(let message): return message
+        }
+    }
 }
 
 /// A capability an agent can invoke.
