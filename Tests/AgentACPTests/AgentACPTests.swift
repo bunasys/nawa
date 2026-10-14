@@ -5,6 +5,7 @@ import AgentMCP
 import AgentTools
 import AgentCore
 import AgentJSONRPC
+import Synchronization
 import Testing
 
 struct AgentACPTests {
@@ -72,12 +73,14 @@ struct AgentACPTests {
 }
 
 /// Remembers the model id each request asked for and always answers "ok".
-final class ModelRecorder: LanguageModel, @unchecked Sendable {
-    var requestedModels: [String?] = []
+final class ModelRecorder: LanguageModel, Sendable {
+    private let recorded = Mutex<[String?]>([])
     let providerName = "recorder"
 
+    var requestedModels: [String?] { recorded.withLock { $0 } }
+
     func complete(_ request: ModelRequest) async throws -> ModelResponse {
-        requestedModels.append(request.model)
+        recorded.withLock { $0.append(request.model) }
         return ModelResponse(message: Message(role: .assistant, text: "ok"), finishReason: .endTurn)
     }
 
@@ -96,6 +99,8 @@ struct RecorderFactory: ACPSessionFactory {
     }
 }
 
+// Waits on the outbound stream; a missing reply must fail, not hang.
+@Suite(.timeLimit(.minutes(1)))
 struct ACPSingleChannelTests {
     /// The stdio flow Waku drives: initialize → session/new → session/set_model
     /// → session/prompt, with every reply arriving on the one outbound stream.
@@ -152,6 +157,8 @@ struct UnauthorizedFactory: ACPSessionFactory {
     }
 }
 
+// Waits on the outbound stream; a missing reply must fail, not hang.
+@Suite(.timeLimit(.minutes(1)))
 struct ACPErrorReportingTests {
     /// Clients show a JSON-RPC error's message to the user, so a failed turn
     /// must arrive as one, carrying the provider's own explanation.
@@ -179,6 +186,8 @@ struct ACPErrorReportingTests {
     }
 }
 
+// Waits on the outbound stream; a missing reply must fail, not hang.
+@Suite(.timeLimit(.minutes(1)))
 struct JSONRPCIDTests {
     /// Waku's ACP library sends UUID string ids; a request with one must be
     /// parsed as a request (not a notification) and answered with the same id.
@@ -210,6 +219,8 @@ struct JSONRPCResponseIDTests {
     }
 }
 
+// Waits on the outbound stream; a missing reply must fail, not hang.
+@Suite(.timeLimit(.minutes(1)))
 struct ACPParseFailureTests {
     @Test
     func malformedFrameGetsAParseErrorReply() async {
