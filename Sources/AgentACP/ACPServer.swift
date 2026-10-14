@@ -216,8 +216,7 @@ public struct ACPServer: Sendable {
         do {
             for try await wsMessage in inbound.messages(maxSize: 1_000_000) {
                 guard case .text(let text) = wsMessage else { continue }
-                guard let parsed = try? parseJSONRPCLine(text) else { continue }
-                await connection.handle(parsed)
+                await connection.handle(text: text)
             }
         } catch {
             // socket closed

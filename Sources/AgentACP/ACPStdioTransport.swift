@@ -44,14 +44,10 @@ public struct ACPStdioTransport: Sendable {
 
         for try await line in FileHandle.standardInput.bytes.lines {
             if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
-            guard let message = try? parseJSONRPCLine(line) else {
-                FileHandle.standardError.write(Data("nawa acp: ignoring unparseable line\n".utf8))
-                continue
-            }
             // Handled in arrival order: `session/new` must finish before the
             // `session/prompt` that names its session. A prompt only starts
             // its turn, so a later `session/cancel` is not blocked behind it.
-            await connection.handle(message)
+            await connection.handle(text: line)
         }
     }
 }

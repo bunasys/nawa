@@ -209,3 +209,24 @@ struct JSONRPCResponseIDTests {
         }
     }
 }
+
+struct ACPParseFailureTests {
+    @Test
+    func malformedFrameGetsAParseErrorReply() async {
+        let connection = ACPConnection(connectionID: "test", factory: RecorderFactory(model: ModelRecorder()), routing: .singleStream)
+        var outbound = await connection.outbound.makeAsyncIterator()
+        await connection.handle(text: "{not json")
+        let error = await outbound.next()?.json.objectValue
+        #expect(error?["id"] == .null)
+        #expect(error?["error"]?.objectValue?["code"]?.intValue == JSONRPCErrorCode.parseError.rawValue)
+    }
+
+    @Test
+    func nonObjectFrameIsAnInvalidRequest() async {
+        let connection = ACPConnection(connectionID: "test", factory: RecorderFactory(model: ModelRecorder()), routing: .singleStream)
+        var outbound = await connection.outbound.makeAsyncIterator()
+        await connection.handle(text: "[1, 2]")
+        let error = await outbound.next()?.json.objectValue
+        #expect(error?["error"]?.objectValue?["code"]?.intValue == JSONRPCErrorCode.invalidRequest.rawValue)
+    }
+}

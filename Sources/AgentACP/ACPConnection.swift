@@ -74,7 +74,21 @@ public actor ACPConnection {
         return sessionStreams[sessionID]!.stream
     }
 
-    /// Handle an inbound JSON-RPC message (from POST or WebSocket).
+    /// Handle one raw inbound frame (a stdio line or a WebSocket text
+    /// message). A frame that is not a JSON-RPC message gets the spec's
+    /// parse-error reply, so the client is not left waiting.
+    public func handle(text: String) async {
+        let message: JSONRPCMessage
+        do {
+            message = try parseJSONRPCLine(text)
+        } catch {
+            connectionStream.publish(.parseFailure(error))
+            return
+        }
+        await handle(message)
+    }
+
+    /// Handle an inbound JSON-RPC message.
     public func handle(_ message: JSONRPCMessage) async {
         switch message {
         case .request(let request):

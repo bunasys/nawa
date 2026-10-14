@@ -223,6 +223,18 @@ public func parseJSONRPCLine(_ line: String) throws -> JSONRPCMessage {
     }
 }
 
+public extension JSONRPCMessage {
+    /// The error response to send for a line `parseJSONRPCLine` rejected:
+    /// `-32700` for malformed JSON, `-32600` for JSON that is not a valid
+    /// message. Its id is `null`, since no id could be read.
+    static func parseFailure(_ error: any Error) -> JSONRPCMessage {
+        if error is JSONRPCParseError {
+            return .makeError(id: nil, code: .invalidRequest, message: "invalid JSON-RPC message: \(error)")
+        }
+        return .makeError(id: nil, code: .parseError, message: "parse error: \(error)")
+    }
+}
+
 public enum JSONRPCParseError: Error, Sendable {
     case notAnObject
     /// A response without a usable `id`.
