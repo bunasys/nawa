@@ -46,6 +46,16 @@ public struct ModelRequest: Sendable {
         self.maxOutputTokens = maxOutputTokens
         self.temperature = temperature
     }
+
+    /// The model id a wire client must send. `Gateway` fills in the default
+    /// before calling a client, so a missing id here is a caller bug; the
+    /// clients refuse it rather than send a made-up model name.
+    func requiredModel() throws -> String {
+        guard let model else {
+            throw GatewayError.modelNotFound("the request names no model (call the client through Gateway to use its default)")
+        }
+        return model
+    }
 }
 
 /// The truncated (non-streaming) reply from a language model.

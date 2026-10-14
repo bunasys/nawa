@@ -13,7 +13,7 @@ struct AnthropicClientTests {
     }
 
     @Test
-    func requestMovesSystemToTopLevelAndMergesToolResults() {
+    func requestMovesSystemToTopLevelAndMergesToolResults() throws {
         let thinking = JSON.object(["type": .string("thinking"), "thinking": .string(""), "signature": .string("sig")])
         let messages = [
             Message(role: .system, text: "Be brief."),
@@ -26,7 +26,7 @@ struct AnthropicClientTests {
             Message(role: .tool, content: [.toolResult(ToolCallResult(callID: "t1", name: "time", content: "noon"))]),
             Message(role: .tool, content: [.toolResult(ToolCallResult(callID: "t2", name: "echo", content: "hi"))]),
         ]
-        let body = AnthropicClient.requestBody(ModelRequest(model: "claude-opus-5-5", messages: messages)).objectValue!
+        let body = try AnthropicClient.requestBody(ModelRequest(model: "claude-opus-5-5", messages: messages)).objectValue!
         let turns = body["messages"]!.arrayValue!
 
         #expect(body["system"]?.stringValue == "Be brief.")
@@ -41,9 +41,9 @@ struct AnthropicClientTests {
     }
 
     @Test
-    func toolSchemaWithoutTypeIsSentAsObject() {
+    func toolSchemaWithoutTypeIsSentAsObject() throws {
         let tool = ToolDefinition(name: "noop", description: "No parameters.", parameters: .object([:]))
-        let body = AnthropicClient.requestBody(ModelRequest(model: "m", messages: [], tools: [tool])).objectValue!
+        let body = try AnthropicClient.requestBody(ModelRequest(model: "m", messages: [], tools: [tool])).objectValue!
         let schema = body["tools"]?.arrayValue?.first?.objectValue?["input_schema"]?.objectValue
         #expect(schema?["type"]?.stringValue == "object")
     }
@@ -104,5 +104,25 @@ struct AnthropicClientTests {
     func gatewayRoutesAnthropicProviders() throws {
         let config = ProviderConfig(name: "claude", api: .anthropic, baseURL: URL(string: "https://api.anthropic.com")!)
         #expect(try Gateway(providers: [config]).client() is AnthropicClient)
+    }
+}
+
+struct AnthropicUsageAndModelTests {
+    @Test
+    func cacheTokensCountAsInput() {
+        let usage = AnthropicClient.usage(from: .object([
+            "input_tokens": .int(10),
+            "cache_read_input_tokens": .int(1000),
+            "cache_creation_input_tokens": .int(200),
+            "output_tokens": .int(5),
+        ]))
+        #expect(usage == Usage(inputTokens: 1210, outputTokens: 5))
+    }
+
+    @Test
+    func requestWithoutModelIsRefused() {
+        #expect(throws: GatewayError.self) {
+            try AnthropicClient.requestBody(ModelRequest(messages: []))
+        }
     }
 }

@@ -31,7 +31,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
         let body = OpenAIRequest(
-            model: request.model ?? "unknown",
+            model: try request.requiredModel(),
             messages: Self.openAIMessages(request.messages),
             tools: Self.openAITools(request.tools),
             stream: false,
@@ -59,7 +59,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             let task = Task { [self] in
                 do {
                     let body = OpenAIRequest(
-                        model: request.model ?? "unknown",
+                        model: try request.requiredModel(),
                         messages: Self.openAIMessages(request.messages),
                         tools: Self.openAITools(request.tools),
                         stream: true,

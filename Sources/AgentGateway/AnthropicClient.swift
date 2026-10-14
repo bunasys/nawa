@@ -48,7 +48,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     // MARK: LanguageModel
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
-        let body = Self.requestBody(request)
+        let body = try Self.requestBody(request)
         let data = try await send(method: "POST", url: baseURL.appendingPathComponent("messages"), body: body)
         let reply: JSON
         do {
@@ -93,9 +93,9 @@ public struct AnthropicClient: LanguageModel, Sendable {
 
     // MARK: Domain -> wire
 
-    static func requestBody(_ request: ModelRequest) -> JSON {
+    static func requestBody(_ request: ModelRequest) throws -> JSON {
         var body: [String: JSON] = [
-            "model": .string(request.model ?? "unknown"),
+            "model": .string(try request.requiredModel()),
             "max_tokens": .int(request.maxOutputTokens ?? defaultMaxTokens),
             "messages": .array(anthropicMessages(request.messages)),
         ]
@@ -209,15 +209,22 @@ public struct AnthropicClient: LanguageModel, Sendable {
                 blocks.append(.opaque(provider: providerKind, payload: block))
             }
         }
-        let usage = object["usage"]?.objectValue ?? [:]
         return ModelResponse(
             message: Message(role: .assistant, content: blocks),
             finishReason: stopReason(from: object["stop_reason"]?.stringValue),
-            usage: Usage(
-                inputTokens: usage["input_tokens"]?.intValue ?? 0,
-                outputTokens: usage["output_tokens"]?.intValue ?? 0
-            )
+            usage: usage(from: object["usage"])
         )
+    }
+
+    /// Anthropic's `input_tokens` excludes prompt-cache reads and writes,
+    /// which are reported separately. `Usage` has no cache fields, so they are
+    /// counted as input: they are input the model processed, and dropping
+    /// them under-reports usage on every cached turn.
+    static func usage(from wire: JSON?) -> Usage {
+        let fields = wire?.objectValue ?? [:]
+        let input = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+            .reduce(0) { $0 + (fields[$1]?.intValue ?? 0) }
+        return Usage(inputTokens: input, outputTokens: fields["output_tokens"]?.intValue ?? 0)
     }
 
     static func stopReason(from wire: String?) -> StopReason? {
