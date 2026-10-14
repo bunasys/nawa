@@ -10,8 +10,7 @@ public struct CurrentTimeTool: Tool {
     public var definition: ToolDefinition {
         ToolDefinition(
             name: "current_time",
-            description: "Returns the current wall-clock date and time (UTC).",
-            parameters: .object(["type": .string("object"), "properties": .object([:])])
+            description: "Returns the current wall-clock date and time (UTC)."
         )
     }
 

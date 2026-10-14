@@ -7,7 +7,10 @@ public struct ToolDefinition: Sendable, Hashable, Codable {
     /// JSON Schema for the input parameters.
     public var parameters: JSON
 
-    public init(name: String, description: String, parameters: JSON = .object(["type": .string("object"), "properties": .object([:])])) {
+    /// The schema of a tool that takes no arguments.
+    public static let noParameters: JSON = .object(["type": .string("object"), "properties": .object([:])])
+
+    public init(name: String, description: String, parameters: JSON = ToolDefinition.noParameters) {
         self.name = name
         self.description = description
         self.parameters = parameters

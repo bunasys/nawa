@@ -184,7 +184,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     // MARK: Wire -> domain
 
     /// Tags the blocks this client replays verbatim (see `ContentBlock.opaque`).
-    static let providerKind = "anthropic"
+    static let providerKind = ContentBlock.OpaqueProvider.anthropic
 
     static func modelResponse(from reply: JSON, providerName: String) throws -> ModelResponse {
         guard let object = reply.objectValue, let content = object["content"]?.arrayValue else {

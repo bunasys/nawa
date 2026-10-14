@@ -26,7 +26,17 @@ public enum ContentBlock: Sendable, Hashable, Codable {
     /// back to the same provider unchanged — e.g. Anthropic `thinking` blocks,
     /// which carry the model's reasoning across tool calls. Other providers
     /// skip it.
+    ///
+    /// `provider` is the wire API's tag, not a configured provider name:
+    /// every endpoint speaking that API replays the block. Use the
+    /// `ContentBlock.OpaqueProvider` constants rather than string literals.
     case opaque(provider: String, payload: JSON)
+
+    /// Tags for `opaque` blocks, one per wire API that produces them.
+    public enum OpaqueProvider {
+        /// Anthropic Messages API (`thinking`, `redacted_thinking`, …).
+        public static let anthropic = "anthropic"
+    }
 
     /// The tool call id, if this block is a tool result.
     public var toolCallID: String? {
