@@ -197,3 +197,35 @@ struct WorkloadIdentityTests {
         #expect(federated.workloadIdentity == config)
     }
 }
+
+struct ProviderEnvironmentDefaultsTests {
+    let environment = [
+        "ANTHROPIC_WORKSPACE_ID": "wrkspc_env",
+        "ANTHROPIC_FEDERATION_RULE_ID": "fdrl_1",
+        "ANTHROPIC_ORGANIZATION_ID": "org",
+        "ANTHROPIC_SERVICE_ACCOUNT_ID": "svac_1",
+        "ANTHROPIC_IDENTITY_TOKEN": "jwt",
+    ]
+
+    @Test
+    func anthropicProviderFillsUnsetSettingsFromEnvironment() {
+        let provider = ProviderConfig(name: "a", api: .anthropic, baseURL: URL(string: "https://api.anthropic.com")!)
+            .withEnvironmentDefaults(environment)
+        #expect(provider.workspaceID == "wrkspc_env")
+        #expect(provider.workloadIdentity?.federationRuleID == "fdrl_1")
+    }
+
+    @Test
+    func configuredValuesWinOverEnvironment() {
+        let provider = ProviderConfig(
+            name: "a", api: .anthropic, baseURL: URL(string: "https://api.anthropic.com")!, workspaceID: "wrkspc_file"
+        ).withEnvironmentDefaults(environment)
+        #expect(provider.workspaceID == "wrkspc_file")
+    }
+
+    @Test
+    func openAIProviderIsUntouched() {
+        let provider = ProviderConfig(name: "o", baseURL: URL(string: "https://api.openai.com/v1")!)
+        #expect(provider.withEnvironmentDefaults(environment) == provider)
+    }
+}

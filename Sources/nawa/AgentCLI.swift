@@ -160,12 +160,12 @@ struct AgentCLI {
 
         let store = try AgentConfigStore.load()
         if let config = store.gatewayConfig(for: cwd), !config.providers.isEmpty {
-            return config.makeGateway()
+            return config.withEnvironmentDefaults(env).makeGateway()
         }
 
         let fileConfig = try GatewayConfig.loadFromEnvironmentOrFile()
         if !fileConfig.providers.isEmpty {
-            return fileConfig.makeGateway()
+            return fileConfig.withEnvironmentDefaults(env).makeGateway()
         }
 
         return try envGateway(baseURL: "https://api.openai.com/v1", env: env)
@@ -186,7 +186,7 @@ struct AgentCLI {
             baseURL: URL(string: baseURL)!,
             apiKey: env["NAWA_GATEWAY_API_KEY"] ?? env[fallbackKeyVariable],
             model: env["NAWA_MODEL"]
-        )
+        ).withEnvironmentDefaults(env)
         return Gateway(providers: [provider], activeProviderName: "default")
     }
 

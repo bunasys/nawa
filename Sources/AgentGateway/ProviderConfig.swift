@@ -66,4 +66,21 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
         }
         return apiKey
     }
+
+    /// This provider with unset Anthropic settings filled from the standard
+    /// `ANTHROPIC_*` variables the official SDKs read: the workspace from
+    /// `ANTHROPIC_WORKSPACE_ID` and federation from
+    /// `WorkloadIdentityConfig.fromEnvironment`.
+    ///
+    /// Call this once, while loading configuration, so a `Gateway` built from
+    /// the result behaves the same whatever the process environment later is.
+    public func withEnvironmentDefaults(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> ProviderConfig {
+        guard api == .anthropic else { return self }
+        var resolved = self
+        resolved.workspaceID = workspaceID ?? environment["ANTHROPIC_WORKSPACE_ID"]
+        resolved.workloadIdentity = workloadIdentity ?? WorkloadIdentityConfig.fromEnvironment(environment)
+        return resolved
+    }
 }

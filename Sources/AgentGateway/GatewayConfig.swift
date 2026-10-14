@@ -24,6 +24,16 @@ public struct GatewayConfig: Codable, Sendable, Equatable {
     }
 
     /// Build the runnable gateway from the typed config.
+    /// Every provider with its environment defaults applied (see
+    /// `ProviderConfig.withEnvironmentDefaults`).
+    public func withEnvironmentDefaults(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> GatewayConfig {
+        var resolved = self
+        resolved.providers = providers.map { $0.withEnvironmentDefaults(environment) }
+        return resolved
+    }
+
     public func makeGateway(apiKeyOverrides: [String: String] = [:]) -> Gateway {
         Gateway(
             providers: providers,

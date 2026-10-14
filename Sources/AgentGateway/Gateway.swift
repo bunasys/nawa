@@ -49,14 +49,14 @@ public struct Gateway: LanguageModel, Sendable {
             )
         case .anthropic:
             // Same precedence as Anthropic's SDKs: an API key shadows federation.
-            let workloadIdentity = apiKey == nil
-                ? provider.workloadIdentity ?? WorkloadIdentityConfig.fromEnvironment()
-                : nil
+            // Environment fallbacks are applied when configuration is loaded
+            // (`ProviderConfig.withEnvironmentDefaults`), not here.
+            let workloadIdentity = apiKey == nil ? provider.workloadIdentity : nil
             return AnthropicClient(
                 providerName: provider.name,
                 baseURL: provider.baseURL,
                 apiKey: apiKey,
-                workspaceID: provider.workspaceID ?? ProcessInfo.processInfo.environment["ANTHROPIC_WORKSPACE_ID"],
+                workspaceID: provider.workspaceID,
                 workloadIdentity: workloadIdentity,
                 session: session
             )
