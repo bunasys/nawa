@@ -21,3 +21,6 @@ DerivedData/
 
 # Stakpak session files
 .stakpak/session*
+
+# Local launcher scripts; they hold credentials (use env vars or env: refs instead)
+waku.sh

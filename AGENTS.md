@@ -129,4 +129,10 @@ tokens) turn on cost estimates for the main and helper models.
   adjacent to the data they operate on.
 - When adding a tool, add its test in the matching test suite.
 - Commands: build with `swift build`, test with `swift test`. Both must stay
-  green before committing. Never push to a remote.
+  green before committing.
+- `origin` is the public repo github.com/bunasys/nawa. Push only `main`
+  (`git push origin main`), never `--all` / `--mirror`: local
+  `refs/waku/*` snapshots are not meant to be published.
+- Never commit secrets: API keys go in environment variables or `env:NAME`
+  references, never in tracked files. Before pushing, scan the outgoing
+  commits (`git log -p origin/main..main`) for keys.
