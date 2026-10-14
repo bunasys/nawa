@@ -88,7 +88,7 @@ public struct ACPServer: Sendable {
                 factory: self.factory,
                 info: self.configuration.info,
                 capabilities: self.configuration.capabilities,
-                singleChannel: true
+                routing: .singleStream
             )
             socketBox.connection = connection
             var headers = HTTPFields()
@@ -217,13 +217,7 @@ public struct ACPServer: Sendable {
             for try await wsMessage in inbound.messages(maxSize: 1_000_000) {
                 guard case .text(let text) = wsMessage else { continue }
                 guard let parsed = try? parseJSONRPCLine(text) else { continue }
-                if case .request(let req) = parsed, req.method == "initialize" {
-                    let result = await connection.initializeResult()
-                    let response = JSONRPCMessage.makeSuccess(id: req.id, result: result)
-                    try? await outbound.write(.text(response.json.description))
-                } else {
-                    await connection.handle(parsed)
-                }
+                await connection.handle(parsed)
             }
         } catch {
             // socket closed
@@ -251,11 +245,11 @@ public actor ACPRegistry {
         factory: any ACPSessionFactory,
         info: ACPServerInfo,
         capabilities: ACPCapabilities,
-        singleChannel: Bool = false
+        routing: ACPOutboundRouting = .perSession
     ) -> ACPConnection {
         let id = "conn_\(UUID().uuidString.prefix(12))"
         let connection = ACPConnection(
-            connectionID: id, factory: factory, info: info, capabilities: capabilities, singleChannel: singleChannel
+            connectionID: id, factory: factory, info: info, capabilities: capabilities, routing: routing
         )
         connections[id] = connection
         return connection

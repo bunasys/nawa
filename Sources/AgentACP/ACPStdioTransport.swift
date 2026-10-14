@@ -31,7 +31,7 @@ public struct ACPStdioTransport: Sendable {
             factory: factory,
             info: info,
             capabilities: capabilities,
-            singleChannel: true
+            routing: .singleStream
         )
 
         let writer = Task {

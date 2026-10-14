@@ -102,7 +102,7 @@ struct ACPSingleChannelTests {
     @Test
     func stdioFlowAppliesSelectedModel() async throws {
         let recorder = ModelRecorder()
-        let connection = ACPConnection(connectionID: "test", factory: RecorderFactory(model: recorder), singleChannel: true)
+        let connection = ACPConnection(connectionID: "test", factory: RecorderFactory(model: recorder), routing: .singleStream)
         var outbound = await connection.outbound.makeAsyncIterator()
 
         await connection.handle(.request(JSONRPCRequest(method: "initialize", id: 0, params: .object([:]))))
@@ -157,7 +157,7 @@ struct ACPErrorReportingTests {
     /// must arrive as one, carrying the provider's own explanation.
     @Test
     func failedTurnIsAJSONRPCErrorWithTheProviderMessage() async throws {
-        let connection = ACPConnection(connectionID: "test", factory: UnauthorizedFactory(), singleChannel: true)
+        let connection = ACPConnection(connectionID: "test", factory: UnauthorizedFactory(), routing: .singleStream)
         var outbound = await connection.outbound.makeAsyncIterator()
 
         await connection.handle(.request(JSONRPCRequest(method: "session/new", id: 1, params: .object(["cwd": .string("/tmp")]))))
@@ -192,7 +192,7 @@ struct JSONRPCIDTests {
         }
         #expect(request.id == "6f1c-uuid")
 
-        let connection = ACPConnection(connectionID: "test", factory: RecorderFactory(model: ModelRecorder()), singleChannel: true)
+        let connection = ACPConnection(connectionID: "test", factory: RecorderFactory(model: ModelRecorder()), routing: .singleStream)
         var outbound = await connection.outbound.makeAsyncIterator()
         await connection.handle(parsed)
         let reply = await outbound.next()

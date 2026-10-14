@@ -20,6 +20,19 @@ public protocol ACPSessionFactory: Sendable {
     func makeLoop(sessionID: String, cwd: String, mcpServers: [MCPServerConfig]) async throws -> AgentLoop
 }
 
+/// How a connection delivers its outbound messages.
+///
+/// The transport decides, because it is the transport that knows how many
+/// pipes it has.
+public enum ACPOutboundRouting: Sendable {
+    /// Streamable HTTP: session-scoped messages go to that session's SSE
+    /// stream, everything else to the connection stream.
+    case perSession
+    /// stdio and WebSocket: one pipe, so every message goes to the
+    /// connection stream regardless of its route.
+    case singleStream
+}
+
 /// One ACP connection (one `Acp-Connection-Id`).
 ///
 /// Owns the connection-scoped outbound stream and the per-session streams, and
@@ -30,10 +43,7 @@ public actor ACPConnection {
     private let factory: any ACPSessionFactory
     private let info: ACPServerInfo
     private let capabilities: ACPCapabilities
-    /// When true every outbound message goes to the connection stream, for
-    /// transports with one pipe (stdio, WebSocket) rather than per-session
-    /// SSE streams.
-    private let singleChannel: Bool
+    private let routing: ACPOutboundRouting
 
     private let connectionStream = ACPEventStream()
     private var sessionStreams: [String: ACPEventStream] = [:]
@@ -44,13 +54,13 @@ public actor ACPConnection {
         factory: any ACPSessionFactory,
         info: ACPServerInfo = .nawa,
         capabilities: ACPCapabilities = .init(),
-        singleChannel: Bool = false
+        routing: ACPOutboundRouting = .perSession
     ) {
         self.connectionID = connectionID
         self.factory = factory
         self.info = info
         self.capabilities = capabilities
-        self.singleChannel = singleChannel
+        self.routing = routing
     }
 
     /// The connection-scoped outbound stream (for SSE GET handlers).
@@ -76,7 +86,7 @@ public actor ACPConnection {
         }
     }
 
-    /// The `initialize` result, returned inline by the POST handler.
+    /// The `initialize` result.
     public func initializeResult() -> JSON {
         .object([
             "protocolVersion": .int(ACPProtocolVersion.v1.rawValue),
@@ -91,8 +101,9 @@ public actor ACPConnection {
     private func handleRequest(_ request: JSONRPCRequest) async {
         switch request.method {
         case "initialize":
-            // Streamable HTTP answers `initialize` inline before a connection
-            // exists; stdio and WebSocket route it here like any other request.
+            // stdio and WebSocket route `initialize` here like any other
+            // request. Streamable HTTP must answer it in the POST response,
+            // because that response creates the connection (see ACPServer).
             connectionStream.publish(.makeSuccess(id: request.id, result: initializeResult()))
         case "session/new":
             await newSession(request: request)
@@ -226,16 +237,13 @@ public struct ConnectionSink: ACPMessageSink {
 }
 
 extension ACPConnection {
-    /// Publish a message to the appropriate stream.
+    /// Publish a message to the stream its route maps to under this
+    /// connection's `routing`.
     public func publish(_ message: JSONRPCMessage, route: ACPRoute) async {
-        if singleChannel {
+        switch (routing, route) {
+        case (.singleStream, _), (.perSession, .connection):
             connectionStream.publish(message)
-            return
-        }
-        switch route {
-        case .connection:
-            connectionStream.publish(message)
-        case .session(let sessionID):
+        case (.perSession, .session(let sessionID)):
             sessionStreams[sessionID]?.publish(message)
         }
     }
