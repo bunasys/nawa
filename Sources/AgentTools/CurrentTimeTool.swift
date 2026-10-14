@@ -11,7 +11,7 @@ public struct CurrentTimeTool: Tool {
         ToolDefinition(
             name: "current_time",
             description: "Returns the current wall-clock date and time (UTC).",
-            parameters: .object([:])
+            parameters: .object(["type": .string("object"), "properties": .object([:])])
         )
     }
 

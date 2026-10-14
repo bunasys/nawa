@@ -133,7 +133,7 @@ public actor MCPClient {
         nextID += 1
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
-            send(.makeRequest(method: method, id: id, params: params))
+            send(.makeRequest(method: method, id: .number(id), params: params))
         }
     }
 

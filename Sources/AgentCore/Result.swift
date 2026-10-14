@@ -54,6 +54,9 @@ public struct AgentResult: Sendable, Hashable, Codable {
     public var stopReason: StopReason?
     /// Estimated accumulated cost in US dollars, if pricing is configured.
     public var costEstimate: Double?
+    /// What went wrong, present on `errorDuringExecution` (e.g. the provider's
+    /// HTTP status and error body).
+    public var errorMessage: String?
 
     public init(
         kind: AgentResultKind,
@@ -62,7 +65,8 @@ public struct AgentResult: Sendable, Hashable, Codable {
         numTurns: Int = 0,
         sessionID: String,
         stopReason: StopReason? = nil,
-        costEstimate: Double? = nil
+        costEstimate: Double? = nil,
+        errorMessage: String? = nil
     ) {
         self.kind = kind
         self.text = text
@@ -71,6 +75,7 @@ public struct AgentResult: Sendable, Hashable, Codable {
         self.sessionID = sessionID
         self.stopReason = stopReason
         self.costEstimate = costEstimate
+        self.errorMessage = errorMessage
     }
 
     public var isSuccess: Bool { kind == .success }

@@ -30,6 +30,10 @@ public actor ACPConnection {
     private let factory: any ACPSessionFactory
     private let info: ACPServerInfo
     private let capabilities: ACPCapabilities
+    /// When true every outbound message goes to the connection stream, for
+    /// transports with one pipe (stdio, WebSocket) rather than per-session
+    /// SSE streams.
+    private let singleChannel: Bool
 
     private let connectionStream = ACPEventStream()
     private var sessionStreams: [String: ACPEventStream] = [:]
@@ -38,13 +42,15 @@ public actor ACPConnection {
     public init(
         connectionID: String,
         factory: any ACPSessionFactory,
-        info: ACPServerInfo = .swiftAgent,
-        capabilities: ACPCapabilities = .init()
+        info: ACPServerInfo = .nawa,
+        capabilities: ACPCapabilities = .init(),
+        singleChannel: Bool = false
     ) {
         self.connectionID = connectionID
         self.factory = factory
         self.info = info
         self.capabilities = capabilities
+        self.singleChannel = singleChannel
     }
 
     /// The connection-scoped outbound stream (for SSE GET handlers).
@@ -84,12 +90,18 @@ public actor ACPConnection {
 
     private func handleRequest(_ request: JSONRPCRequest) async {
         switch request.method {
+        case "initialize":
+            // Streamable HTTP answers `initialize` inline before a connection
+            // exists; stdio and WebSocket route it here like any other request.
+            connectionStream.publish(.makeSuccess(id: request.id ?? 0, result: initializeResult()))
         case "session/new":
             await newSession(request: request)
         case "session/load":
             await loadSession(request: request)
         case "session/prompt":
             await prompt(request: request)
+        case "session/set_model":
+            await setModel(request: request)
         case "session/request_permission":
             // A client→agent *response* to our permission request arrives here
             // as a result; but a request with this method is unexpected. Ignore.
@@ -164,6 +176,21 @@ public actor ACPConnection {
         await session.prompt(requestID: request.id!, content: content)
     }
 
+    private func setModel(request: JSONRPCRequest) async {
+        guard let params = request.params?.objectValue,
+              let sessionID = params["sessionId"]?.stringValue,
+              let modelID = params["modelId"]?.stringValue,
+              let session = sessions[sessionID]
+        else {
+            connectionStream.publish(
+                .makeError(id: request.id, code: .invalidParams, message: "session/set_model needs a known sessionId and a modelId")
+            )
+            return
+        }
+        await session.setModel(modelID)
+        connectionStream.publish(.makeSuccess(id: request.id ?? 0, result: .object([:])))
+    }
+
     // MARK: - Helpers
 
     /// Decode the `mcpServers` array from a `session/new` params object.
@@ -201,6 +228,10 @@ public struct ConnectionSink: ACPMessageSink {
 extension ACPConnection {
     /// Publish a message to the appropriate stream.
     public func publish(_ message: JSONRPCMessage, route: ACPRoute) async {
+        if singleChannel {
+            connectionStream.publish(message)
+            return
+        }
         switch route {
         case .connection:
             connectionStream.publish(message)

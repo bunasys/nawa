@@ -93,4 +93,29 @@ public enum GatewayError: Error, Sendable {
     case httpError(statusCode: Int, body: String)
     case network(String)
     case invalidResponse(String)
+    /// Exchanging an identity token for an Anthropic access token failed.
+    case workloadIdentity(String)
+}
+
+extension GatewayError: CustomStringConvertible, LocalizedError {
+    public var description: String {
+        switch self {
+        case .noProvider:
+            return "no provider configured (run `nawa config` or set NAWA_GATEWAY_URL)"
+        case .providerNotFound(let name):
+            return "provider \"\(name)\" not found"
+        case .modelNotFound(let detail):
+            return "model not found: \(detail)"
+        case .httpError(let statusCode, let body):
+            return "HTTP \(statusCode) from the model provider: \(body)"
+        case .network(let detail):
+            return "network error: \(detail)"
+        case .invalidResponse(let detail):
+            return "invalid response from the model provider: \(detail)"
+        case .workloadIdentity(let detail):
+            return "workload identity federation: \(detail)"
+        }
+    }
+
+    public var errorDescription: String? { description }
 }

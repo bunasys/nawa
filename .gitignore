@@ -18,3 +18,6 @@ DerivedData/
 
 # Common editor/OS files
 *.swp
+
+# Stakpak session files
+.stakpak/session*

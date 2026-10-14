@@ -49,6 +49,15 @@ public final class AgentLoop: @unchecked Sendable {
     private var _session: Session
     private var _usage: Usage
     private var _turnCounter: Int
+    private var _model: String?
+
+    /// The model id sent with each request; `nil` lets the gateway pick its
+    /// configured or discovered default. Clients may switch it between turns
+    /// (ACP `session/set_model`).
+    public var model: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _model }
+        set { lock.lock(); defer { lock.unlock() }; _model = newValue }
+    }
 
     /// The session this loop has been driving. Resumption: keep it, then run
     /// again with `run(prompt:continuing:true)`.
@@ -123,7 +132,7 @@ public final class AgentLoop: @unchecked Sendable {
 
                         // 1. Ask the model.
                         let request = ModelRequest(
-                            model: nil,
+                            model: self.model,
                             messages: self._session.messages,
                             tools: self.options.sendTools ? self.tools.definitions : nil,
                             maxOutputTokens: self.options.maxOutputTokens,
@@ -191,7 +200,8 @@ public final class AgentLoop: @unchecked Sendable {
                         kind: .errorDuringExecution,
                         usage: self._usage,
                         numTurns: self._turnCounter,
-                        sessionID: self._session.id
+                        sessionID: self._session.id,
+                        errorMessage: error.localizedDescription
                     )
                     self.emit(.informational("Loop error: \(error)"))
                     self.emit(.result(result))

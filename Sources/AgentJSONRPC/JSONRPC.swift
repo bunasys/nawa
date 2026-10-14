@@ -1,6 +1,33 @@
 import AgentCore
 import Foundation
 
+/// A JSON-RPC 2.0 request id. The spec allows a number or a string, and
+/// clients differ: Waku's ACP library sends UUID strings, MCP servers usually
+/// numbers. A response must echo the id exactly as it was sent.
+public enum JSONRPCID: Sendable, Hashable, ExpressibleByIntegerLiteral, ExpressibleByStringLiteral {
+    case number(Int)
+    case string(String)
+
+    public init(integerLiteral value: Int) { self = .number(value) }
+    public init(stringLiteral value: String) { self = .string(value) }
+
+    /// The id carried by a wire `id` field, if it is a valid one.
+    public init?(json: JSON?) {
+        switch json {
+        case .int(let value): self = .number(value)
+        case .string(let value): self = .string(value)
+        default: return nil
+        }
+    }
+
+    public var json: JSON {
+        switch self {
+        case .number(let value): return .int(value)
+        case .string(let value): return .string(value)
+        }
+    }
+}
+
 /// A JSON-RPC 2.0 message on the wire: a request, a response, or a notification.
 ///
 /// Shared by the MCP and ACP transports so both speak the same framing rules.
@@ -14,7 +41,7 @@ public enum JSONRPCMessage: Sendable, Hashable {
     /// An error response correlating to a request `id`.
     case errorResponse(JSONRPCError)
 
-    public var id: Int? {
+    public var id: JSONRPCID? {
         switch self {
         case .request(let r): return r.id
         case .successResponse(let r): return r.id
@@ -33,13 +60,13 @@ public enum JSONRPCMessage: Sendable, Hashable {
 }
 
 /// A JSON-RPC request or notification (without `result`/`error`).
-public struct JSONRPCRequest: Sendable, Hashable, Codable {
+public struct JSONRPCRequest: Sendable, Hashable {
     public var jsonrpc: String
-    public var id: Int?
+    public var id: JSONRPCID?
     public var method: String
     public var params: JSON?
 
-    public init(method: String, id: Int?, params: JSON? = nil, jsonrpc: String = "2.0") {
+    public init(method: String, id: JSONRPCID?, params: JSON? = nil, jsonrpc: String = "2.0") {
         self.method = method
         self.id = id
         self.params = params
@@ -60,11 +87,11 @@ public struct JSONRPCMethod: Sendable, Hashable, Codable {
 }
 
 /// A successful JSON-RPC response.
-public struct JSONRPCSuccess: Sendable, Hashable, Codable {
+public struct JSONRPCSuccess: Sendable, Hashable {
     public var jsonrpc: String
-    public var id: Int
+    public var id: JSONRPCID
     public var result: JSON?
-    public init(id: Int, result: JSON?, jsonrpc: String = "2.0") {
+    public init(id: JSONRPCID, result: JSON?, jsonrpc: String = "2.0") {
         self.id = id
         self.result = result
         self.jsonrpc = jsonrpc
@@ -85,11 +112,11 @@ public struct JSONRPCErrorObject: Sendable, Hashable, Codable {
 }
 
 /// An error JSON-RPC response.
-public struct JSONRPCError: Sendable, Hashable, Codable {
+public struct JSONRPCError: Sendable, Hashable {
     public var jsonrpc: String
-    public var id: Int?
+    public var id: JSONRPCID?
     public var error: JSONRPCErrorObject
-    public init(id: Int?, error: JSONRPCErrorObject, jsonrpc: String = "2.0") {
+    public init(id: JSONRPCID?, error: JSONRPCErrorObject, jsonrpc: String = "2.0") {
         self.id = id
         self.error = error
         self.jsonrpc = jsonrpc
@@ -109,7 +136,7 @@ public enum JSONRPCErrorCode: Int, Sendable {
 
 public extension JSONRPCMessage {
     /// Make a request message.
-    static func makeRequest(method: String, id: Int, params: JSON? = nil) -> JSONRPCMessage {
+    static func makeRequest(method: String, id: JSONRPCID, params: JSON? = nil) -> JSONRPCMessage {
         .request(JSONRPCRequest(method: method, id: id, params: params))
     }
 
@@ -119,12 +146,12 @@ public extension JSONRPCMessage {
     }
 
     /// Make a success response.
-    static func makeSuccess(id: Int, result: JSON? = nil) -> JSONRPCMessage {
+    static func makeSuccess(id: JSONRPCID, result: JSON? = nil) -> JSONRPCMessage {
         .successResponse(JSONRPCSuccess(id: id, result: result))
     }
 
     /// Make an error response.
-    static func makeError(id: Int?, code: JSONRPCErrorCode, message: String, data: JSON? = nil) -> JSONRPCMessage {
+    static func makeError(id: JSONRPCID?, code: JSONRPCErrorCode, message: String, data: JSON? = nil) -> JSONRPCMessage {
         .errorResponse(JSONRPCError(id: id, error: .init(code: code.rawValue, message: message, data: data)))
     }
 
@@ -136,7 +163,7 @@ public extension JSONRPCMessage {
                 "jsonrpc": .string("2.0"),
                 "method": .string(r.method),
             ]
-            if let id = r.id { obj["id"] = .int(id) }
+            if let id = r.id { obj["id"] = id.json }
             if let params = r.params { obj["params"] = params }
             return .object(obj)
         case .notification(let n):
@@ -149,14 +176,14 @@ public extension JSONRPCMessage {
         case .successResponse(let r):
             var obj: [String: JSON] = [
                 "jsonrpc": .string("2.0"),
-                "id": .int(r.id),
+                "id": r.id.json,
             ]
             if let result = r.result { obj["result"] = result }
             return .object(obj)
         case .errorResponse(let r):
             var obj: [String: JSON] = [
                 "jsonrpc": .string("2.0"),
-                "id": r.id.map(JSON.int) ?? .null,
+                "id": r.id?.json ?? .null,
                 "error": .object([
                     "code": .int(r.error.code),
                     "message": .string(r.error.message),
@@ -177,7 +204,7 @@ public func parseJSONRPCLine(_ line: String) throws -> JSONRPCMessage {
     let json = try JSONDecoder().decode(JSON.self, from: data)
     guard let object = json.objectValue else { throw JSONRPCParseError.notAnObject }
     if let method = object["method"]?.stringValue {
-        if let id = object["id"]?.intValue {
+        if let id = JSONRPCID(json: object["id"]) {
             return .request(JSONRPCRequest(method: method, id: id, params: object["params"]))
         } else {
             return .notification(JSONRPCMethod(method: method, params: object["params"]))
@@ -185,9 +212,9 @@ public func parseJSONRPCLine(_ line: String) throws -> JSONRPCMessage {
     } else if object["error"] != nil {
         let code = object["error"]?.objectValue?["code"]?.intValue ?? -32603
         let message = object["error"]?.objectValue?["message"]?.stringValue ?? "unknown error"
-        return .errorResponse(JSONRPCError(id: object["id"]?.intValue, error: .init(code: code, message: message, data: object["error"]?.objectValue?["data"])))
+        return .errorResponse(JSONRPCError(id: JSONRPCID(json: object["id"]), error: .init(code: code, message: message, data: object["error"]?.objectValue?["data"])))
     } else {
-        return .successResponse(JSONRPCSuccess(id: object["id"]?.intValue ?? 0, result: object["result"]))
+        return .successResponse(JSONRPCSuccess(id: JSONRPCID(json: object["id"]) ?? 0, result: object["result"]))
     }
 }
 

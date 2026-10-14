@@ -22,6 +22,12 @@ public enum ContentBlock: Sendable, Hashable, Codable {
     /// The result of a tool run, delivered back to the model.
     case toolResult(ToolCallResult)
 
+    /// A provider-specific block the harness does not interpret but must send
+    /// back to the same provider unchanged — e.g. Anthropic `thinking` blocks,
+    /// which carry the model's reasoning across tool calls. Other providers
+    /// skip it.
+    case opaque(provider: String, payload: JSON)
+
     /// The tool call id, if this block is a tool result.
     public var toolCallID: String? {
         if case .toolResult(let r) = self { return r.callID }

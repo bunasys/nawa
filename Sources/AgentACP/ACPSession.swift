@@ -39,7 +39,7 @@ public actor ACPSession {
     /// `requestID`) when the loop finishes.
     ///
     /// If a prompt is already running it is cancelled first.
-    public func prompt(requestID: Int, content: [ACPContentBlock]) {
+    public func prompt(requestID: JSONRPCID, content: [ACPContentBlock]) {
         promptTask?.cancel()
         let text = content.compactMap { block -> String? in
             if case .text(let t) = block { return t }
@@ -51,23 +51,36 @@ public actor ACPSession {
         }
     }
 
+    /// Use `modelID` for this session's next turns.
+    public func setModel(_ modelID: String) {
+        loop.model = modelID
+    }
+
     /// Cancel the in-flight prompt turn, if any. The turn ends with the
     /// `cancelled` stop reason.
     public func cancel() {
         promptTask?.cancel()
     }
 
-    private func runTurn(requestID: Int, prompt: String, continuing: Bool) async {
+    private func runTurn(requestID: JSONRPCID, prompt: String, continuing: Bool) async {
         let messageID = "msg_\(UUID().uuidString.prefix(8))"
-        var finalKind: AgentResultKind = .success
+        var finalResult: AgentResult?
         do {
             let stream = loop.run(prompt: prompt, continuing: continuing)
             for try await event in stream {
                 try Task.checkCancellation()
-                if case .result(let result) = event { finalKind = result.kind }
+                if case .result(let result) = event { finalResult = result }
                 await sendUpdate(for: event, messageID: messageID)
             }
-            let stop = ACPStopReason(resultKind: finalKind)
+            // A failed turn is a JSON-RPC error, not a stop reason: clients
+            // (Waku included) show an error's message to the user, whereas
+            // the closest stop reason, `refusal`, reads as "the model declined".
+            if let finalResult, finalResult.kind == .errorDuringExecution {
+                let message = finalResult.errorMessage ?? "the agent turn failed"
+                await sink.send(.makeError(id: requestID, code: .internalError, message: message), route: .session(sessionID))
+                return
+            }
+            let stop = ACPStopReason(resultKind: finalResult?.kind ?? .success)
             await sink.send(.makeSuccess(id: requestID, result: .object(["stopReason": .string(stop.rawValue)])), route: .session(sessionID))
         } catch is CancellationError {
             // The turn was cancelled by the client via `session/cancel`.

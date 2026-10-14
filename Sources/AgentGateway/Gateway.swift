@@ -5,7 +5,7 @@ import Foundation
 import FoundationNetworking
 #endif
 
-/// A collection of OpenAI-compatible providers with a single active provider.
+/// A collection of providers (OpenAI-compatible or Anthropic) with a single active provider.
 ///
 /// The Gateway is the configurable AI front door: it holds zero or more
 /// `ProviderConfig`s, resolves environment-variable API keys, picks the active
@@ -36,17 +36,31 @@ public struct Gateway: LanguageModel, Sendable {
         return providers.first { $0.name == name }
     }
 
-    /// The resolved, opened client for the given provider (defaults to active).
-    public func client(for providerName: String? = nil) throws -> OpenAICompatibleClient {
+    /// The client for the given provider (defaults to active), speaking
+    /// whichever wire API that provider is configured for.
+    public func client(for providerName: String? = nil) throws -> any LanguageModel {
         let provider = providerName.flatMap { name in providers.first { $0.name == name } } ?? activeProvider
         guard let provider else { throw GatewayError.noProvider }
         let apiKey = apiKeyOverrides[provider.name] ?? provider.resolvedAPIKey
-        return OpenAICompatibleClient(
-            providerName: provider.name,
-            baseURL: provider.baseURL,
-            apiKey: apiKey,
-            session: session
-        )
+        switch provider.api ?? .openAI {
+        case .openAI:
+            return OpenAICompatibleClient(
+                providerName: provider.name, baseURL: provider.baseURL, apiKey: apiKey, session: session
+            )
+        case .anthropic:
+            // Same precedence as Anthropic's SDKs: an API key shadows federation.
+            let workloadIdentity = apiKey == nil
+                ? provider.workloadIdentity ?? WorkloadIdentityConfig.fromEnvironment()
+                : nil
+            return AnthropicClient(
+                providerName: provider.name,
+                baseURL: provider.baseURL,
+                apiKey: apiKey,
+                workspaceID: provider.workspaceID ?? ProcessInfo.processInfo.environment["ANTHROPIC_WORKSPACE_ID"],
+                workloadIdentity: workloadIdentity,
+                session: session
+            )
+        }
     }
 
     // MARK: LanguageModel
@@ -90,19 +104,19 @@ public struct Gateway: LanguageModel, Sendable {
     ///
     /// Precedence: explicit request model → active provider's configured model
     /// → auto model discovery (`GET /v1/models`, filtered by whitelist).
-    public func resolveModel(client: OpenAICompatibleClient, requested: String?) async throws -> String {
+    public func resolveModel(client: any LanguageModel, requested: String?) async throws -> String {
         if let requested { return requested }
         if let configured = activeProvider?.model { return configured }
         return try await autoDiscover(client: client)
     }
 
     /// Auto model discovery: list models, filter by whitelist, pick the first.
-    public func autoModel(client: OpenAICompatibleClient) async throws -> String {
+    public func autoModel(client: any LanguageModel) async throws -> String {
         try await autoDiscover(client: client)
     }
 
     /// Auto model discovery: list models, filter by whitelist, pick the first.
-    public func autoDiscover(client: OpenAICompatibleClient) async throws -> String {
+    public func autoDiscover(client: any LanguageModel) async throws -> String {
         let models = try await client.listModels()
         let whitelist = activeProvider?.modelWhitelist
         let candidates = models.filter { whitelist == nil || whitelist!.contains($0.id) }

@@ -14,7 +14,7 @@ import Foundation
 ///   ]
 /// }
 /// ```
-public struct GatewayConfig: Codable, Sendable {
+public struct GatewayConfig: Codable, Sendable, Equatable {
     public var activeProvider: String?
     public var providers: [ProviderConfig]
 
@@ -38,10 +38,10 @@ public struct GatewayConfig: Codable, Sendable {
         return try JSONDecoder().decode(GatewayConfig.self, from: data)
     }
 
-    /// Load from the `AGENT_GATEWAY_CONFIG` env var if present, else from a
+    /// Load from the `NAWA_GATEWAY_CONFIG` env var if present, else from a
     /// `Gateways.json` next to the current file, else an empty default.
     public static func loadFromEnvironmentOrFile(
-        envKey configEnv: String = "AGENT_GATEWAY_CONFIG",
+        envKey configEnv: String = "NAWA_GATEWAY_CONFIG",
         fileName: String = "Gateways.json"
     ) throws -> GatewayConfig {
         if let path = ProcessInfo.processInfo.environment[configEnv] {

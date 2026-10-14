@@ -25,7 +25,7 @@ public struct ACPServerConfiguration: Sendable {
     public init(
         hostname: String = "127.0.0.1",
         port: Int = 7878,
-        info: ACPServerInfo = .swiftAgent,
+        info: ACPServerInfo = .nawa,
         capabilities: ACPCapabilities = .init()
     ) {
         self.hostname = hostname
@@ -87,7 +87,8 @@ public struct ACPServer: Sendable {
             let connection = await self.registry.createConnection(
                 factory: self.factory,
                 info: self.configuration.info,
-                capabilities: self.configuration.capabilities
+                capabilities: self.configuration.capabilities,
+                singleChannel: true
             )
             socketBox.connection = connection
             var headers = HTTPFields()
@@ -249,10 +250,13 @@ public actor ACPRegistry {
     public func createConnection(
         factory: any ACPSessionFactory,
         info: ACPServerInfo,
-        capabilities: ACPCapabilities
+        capabilities: ACPCapabilities,
+        singleChannel: Bool = false
     ) -> ACPConnection {
         let id = "conn_\(UUID().uuidString.prefix(12))"
-        let connection = ACPConnection(connectionID: id, factory: factory, info: info, capabilities: capabilities)
+        let connection = ACPConnection(
+            connectionID: id, factory: factory, info: info, capabilities: capabilities, singleChannel: singleChannel
+        )
         connections[id] = connection
         return connection
     }

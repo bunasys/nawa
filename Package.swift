@@ -4,7 +4,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "agent",
+    name: "nawa",
     platforms: [
         .macOS(.v15)
     ],
@@ -17,7 +17,7 @@ let package = Package(
         .library(name: "AgentLoop", targets: ["AgentLoop"]),
         .library(name: "AgentMCP", targets: ["AgentMCP"]),
         .library(name: "AgentACP", targets: ["AgentACP"]),
-        .executable(name: "agent", targets: ["agent"]),
+        .executable(name: "nawa", targets: ["nawa"]),
     ],
     dependencies: [
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.24.0"),
@@ -56,7 +56,7 @@ let package = Package(
         ]),
 
         // Executable: REPL + ACP server entry point.
-        .executableTarget(name: "agent", dependencies: [
+        .executableTarget(name: "nawa", dependencies: [
             "AgentCore", "AgentGateway", "AgentTools", "AgentInstructions",
             "AgentLoop", "AgentMCP", "AgentACP",
         ]),
