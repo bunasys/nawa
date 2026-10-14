@@ -59,12 +59,17 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
 
     /// Resolve the api key, expanding an `env:NAME` reference.
     public var resolvedAPIKey: String? {
-        guard let apiKey else { return nil }
-        if apiKey.hasPrefix("env:") {
-            let name = String(apiKey.dropFirst(4))
-            return ProcessInfo.processInfo.environment[name]
-        }
-        return apiKey
+        apiKey.flatMap { Self.resolveAPIKey($0) }
+    }
+
+    /// Expand an API key as written in configuration: `env:NAME` reads the
+    /// variable (nil when unset), anything else is the key itself.
+    public static func resolveAPIKey(
+        _ reference: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        guard reference.hasPrefix("env:") else { return reference }
+        return environment[String(reference.dropFirst(4))]
     }
 
     /// This provider with unset Anthropic settings filled from the standard

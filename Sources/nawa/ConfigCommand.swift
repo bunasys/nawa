@@ -57,11 +57,11 @@ enum ConfigCommand {
         }
         print()
 
-        let api = promptAPI()
-        let baseURL = promptBaseURL(api: api)
-        let apiKey = promptAPIKey()
-        let workloadIdentity = api == .anthropic && apiKey == nil ? promptWorkloadIdentity() : nil
-        let workspaceID = api == .anthropic && apiKey != nil ? promptWorkspaceID() : nil
+        let api = try promptAPI()
+        let baseURL = try promptBaseURL(api: api)
+        let apiKey = try promptAPIKey()
+        let workloadIdentity = api == .anthropic && apiKey == nil ? try promptWorkloadIdentity() : nil
+        let workspaceID = api == .anthropic && apiKey != nil ? try promptWorkspaceID() : nil
 
         let probe = ProviderConfig(
             name: "config", api: api, baseURL: baseURL, apiKey: apiKey?.resolvedKey,
@@ -75,14 +75,14 @@ enum ConfigCommand {
             model = try chooseModel(from: models)
         } catch {
             print("Could not list models: \(error)")
-            model = try Prompt.required("Model id (typed manually)")
+            model = try Prompt.line("Model id (typed manually)")
         }
 
-        let name = promptName(
+        let name = try promptName(
             defaultName: Self.defaultName(for: baseURL, taken: existing?.providers.map(\.name) ?? [])
         )
         if existing?.providers.contains(where: { $0.name == name }) == true {
-            guard Prompt.confirm("A provider named \"\(name)\" exists here. Replace it?", default: false) else {
+            guard try Prompt.confirm("A provider named \"\(name)\" exists here. Replace it?", default: false) else {
                 throw ConfigCommandError.cancelled
             }
         }
@@ -102,19 +102,19 @@ enum ConfigCommand {
         }
     }
 
-    static func promptAPI() -> ProviderAPI {
+    static func promptAPI() throws -> ProviderAPI {
         let choices = ProviderAPI.allCases.map(\.rawValue).joined(separator: "/")
         while true {
-            let answer = Prompt.line("API (\(choices))", default: ProviderAPI.openAI.rawValue).lowercased()
+            let answer = try Prompt.line("API (\(choices))", default: ProviderAPI.openAI.rawValue).lowercased()
             if let api = ProviderAPI(rawValue: answer) { return api }
             print("Enter one of: \(choices)")
         }
     }
 
-    static func promptBaseURL(api: ProviderAPI) -> URL {
+    static func promptBaseURL(api: ProviderAPI) throws -> URL {
         let suggested = api == .anthropic ? "https://api.anthropic.com" : "https://api.openai.com/v1"
         while true {
-            let raw = Prompt.line("Base URL", default: suggested)
+            let raw = try Prompt.line("Base URL", default: suggested)
             let trimmed = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
             if let url = URL(string: trimmed),
                let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
@@ -129,13 +129,11 @@ enum ConfigCommand {
     /// secret never lands on disk; literal keys are stored as-is.
     struct APIKeyInput {
         var stored: String
-        var resolvedKey: String? {
-            ProviderConfig(name: "", baseURL: URL(fileURLWithPath: "/"), apiKey: stored).resolvedAPIKey
-        }
+        var resolvedKey: String? { ProviderConfig.resolveAPIKey(stored) }
     }
 
-    static func promptAPIKey() -> APIKeyInput? {
-        let typed = Prompt.secret("API key (hidden; empty for none, or env:NAME to reference an env var)")
+    static func promptAPIKey() throws -> APIKeyInput? {
+        let typed = try Prompt.secret("API key (hidden; empty for none, or env:NAME to reference an env var)")
         guard !typed.isEmpty else { return nil }
         let input = APIKeyInput(stored: typed)
         if typed.hasPrefix("env:"), input.resolvedKey == nil {
@@ -146,9 +144,9 @@ enum ConfigCommand {
 
     /// Anthropic API keys not scoped to one workspace must name the workspace
     /// on every request.
-    static func promptWorkspaceID() -> String? {
+    static func promptWorkspaceID() throws -> String? {
         let fromEnvironment = ProcessInfo.processInfo.environment["ANTHROPIC_WORKSPACE_ID"] ?? ""
-        let answer = Prompt.line(
+        let answer = try Prompt.line(
             "Workspace ID (wrkspc_…, empty if the key is scoped to one workspace)", default: fromEnvironment
         )
         return answer.isEmpty ? nil : answer
@@ -157,18 +155,18 @@ enum ConfigCommand {
     /// Anthropic Workload Identity Federation: identifiers only — the JWT is
     /// read from a file on every exchange, so no secret is stored. Defaults
     /// come from the `ANTHROPIC_*` variables the official SDKs use.
-    static func promptWorkloadIdentity() -> WorkloadIdentityConfig? {
+    static func promptWorkloadIdentity() throws -> WorkloadIdentityConfig? {
         let fromEnvironment = WorkloadIdentityConfig.fromEnvironment()
         let question = "Authenticate with Workload Identity Federation (OIDC identity token)?"
-        guard Prompt.confirm(question, default: fromEnvironment != nil) else { return nil }
+        guard try Prompt.confirm(question, default: fromEnvironment != nil) else { return nil }
 
-        let ruleID = Prompt.line("Federation rule ID (fdrl_…)", default: fromEnvironment?.federationRuleID)
-        let organizationID = Prompt.line("Organization ID (UUID)", default: fromEnvironment?.organizationID)
-        let serviceAccountID = Prompt.line("Service account ID (svac_…)", default: fromEnvironment?.serviceAccountID)
-        let workspaceID = Prompt.line(
+        let ruleID = try Prompt.line("Federation rule ID (fdrl_…)", default: fromEnvironment?.federationRuleID)
+        let organizationID = try Prompt.line("Organization ID (UUID)", default: fromEnvironment?.organizationID)
+        let serviceAccountID = try Prompt.line("Service account ID (svac_…)", default: fromEnvironment?.serviceAccountID)
+        let workspaceID = try Prompt.line(
             "Workspace ID (wrkspc_…, empty if the rule has one workspace)", default: fromEnvironment?.workspaceID ?? ""
         )
-        let tokenFile = Prompt.line(
+        let tokenFile = try Prompt.line(
             "Path to the identity token (JWT) file", default: fromEnvironment?.identityTokenFile
         )
         return WorkloadIdentityConfig(
@@ -187,7 +185,7 @@ enum ConfigCommand {
             print(String(format: "  %3d. %@", index + 1, id))
         }
         while true {
-            let answer = Prompt.line("Choose a model (number or id)", default: "1")
+            let answer = try Prompt.line("Choose a model (number or id)", default: "1")
             if let number = Int(answer), (1...models.count).contains(number) {
                 return models[number - 1]
             }
@@ -196,9 +194,9 @@ enum ConfigCommand {
         }
     }
 
-    static func promptName(defaultName: String) -> String {
+    static func promptName(defaultName: String) throws -> String {
         while true {
-            let name = Prompt.line("Name for this provider", default: defaultName)
+            let name = try Prompt.line("Name for this provider", default: defaultName)
             if name.rangeOfCharacter(from: .whitespacesAndNewlines) == nil { return name }
             print("Names cannot contain whitespace.")
         }
@@ -263,40 +261,30 @@ enum ConfigCommandError: Error, LocalizedError {
 
 enum Prompt {
     /// Ask for a line of input, returning `default` on an empty answer.
-    static func line(_ label: String, default defaultValue: String? = nil) -> String {
+    static func line(_ label: String, default defaultValue: String? = nil) throws -> String {
         let suffix = defaultValue.map { " [\($0)]" } ?? ""
         while true {
             print("\(label)\(suffix): ", terminator: "")
             guard let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else {
                 print()
-                fatalErrorInputClosed()
+                throw ConfigCommandError.inputClosed
             }
             if !answer.isEmpty { return answer }
             if let defaultValue { return defaultValue }
         }
     }
 
-    /// Ask for a non-empty line of input.
-    static func required(_ label: String) throws -> String {
-        line(label)
-    }
-
     /// Ask for a secret; echo is disabled when stdin is a terminal.
-    static func secret(_ label: String) -> String {
+    static func secret(_ label: String) throws -> String {
         guard isatty(STDIN_FILENO) != 0 else {
-            return line(label, default: "")
+            return try line(label, default: "")
         }
-        guard let raw = getpass("\(label): ") else { fatalErrorInputClosed() }
+        guard let raw = getpass("\(label): ") else { throw ConfigCommandError.inputClosed }
         return String(cString: raw).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func confirm(_ label: String, default defaultValue: Bool) -> Bool {
-        let answer = line("\(label) (\(defaultValue ? "Y/n" : "y/N"))", default: defaultValue ? "y" : "n")
+    static func confirm(_ label: String, default defaultValue: Bool) throws -> Bool {
+        let answer = try line("\(label) (\(defaultValue ? "Y/n" : "y/N"))", default: defaultValue ? "y" : "n")
         return answer.lowercased().hasPrefix("y")
-    }
-
-    private static func fatalErrorInputClosed() -> Never {
-        FileHandle.standardError.write(Data("nawa config: \(ConfigCommandError.inputClosed.localizedDescription)\n".utf8))
-        exit(1)
     }
 }
