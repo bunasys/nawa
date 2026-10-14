@@ -93,7 +93,7 @@ struct AgentCLI {
             try await run()
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-            FileHandle.standardError.write(Data("agent: \(message)\n".utf8))
+            FileHandle.standardError.write(Data("nawa: \(message)\n".utf8))
             exit(1)
         }
     }
@@ -110,8 +110,9 @@ struct AgentCLI {
         )
 
         // Waku launches the agent as a Kimi Code CLI and generates commit
-        // messages with `--prompt …` (see WakuCompatibility.swift).
-        if args.contains("--prompt") {
+        // messages with `--prompt …` (see WakuCompatibility.swift). Only
+        // flags, no subcommand: `nawa config --prompt` is not a one-shot.
+        if command.hasPrefix("--"), args.contains("--prompt") {
             try await WakuCompatibility.oneShotPrompt(arguments: args)
             return
         }
@@ -179,11 +180,14 @@ struct AgentCLI {
             }
             api = parsed
         }
+        guard let url = URL(string: baseURL), url.scheme != nil, url.host != nil else {
+            throw CLIError.invalidGatewayURL(baseURL)
+        }
         let fallbackKeyVariable = api == .anthropic ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"
         let provider = ProviderConfig(
             name: "default",
             api: api,
-            baseURL: URL(string: baseURL)!,
+            baseURL: url,
             apiKey: env["NAWA_GATEWAY_API_KEY"] ?? env[fallbackKeyVariable],
             model: env["NAWA_MODEL"]
         ).withEnvironmentDefaults(env)
@@ -225,12 +229,15 @@ struct AgentCLI {
 
 enum CLIError: Error, LocalizedError {
     case unknownAPI(String)
+    case invalidGatewayURL(String)
 
     var errorDescription: String? {
         switch self {
         case .unknownAPI(let value):
             let known = ProviderAPI.allCases.map(\.rawValue).joined(separator: ", ")
             return "NAWA_GATEWAY_API=\(value) is not one of: \(known)"
+        case .invalidGatewayURL(let value):
+            return "NAWA_GATEWAY_URL=\(value) is not an absolute URL"
         }
     }
 }
