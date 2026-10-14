@@ -42,13 +42,16 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   exposes their tools.
 - `Sources/AgentACP` — `ACPServer`: ACP over streamable HTTP and WebSocket on
   a single `/acp` endpoint (Hummingbird), `ACPStdioTransport` (ACP over
-  stdin/stdout), plus the JSON-RPC frames.
+  stdin/stdout), plus the JSON-RPC frames. `ACPConnection` owns dispatch;
+  each transport picks its `ACPOutboundRouting` (`.perSession` SSE streams
+  for HTTP, `.singleStream` for stdio/WebSocket) and feeds raw frames to
+  `handle(text:)`, which also answers unparseable ones.
 - `Sources/nawa` — executable: `serve` (ACP server), `acp` (ACP over stdio),
   `repl` (interactive), and `config` (interactive per-directory provider setup,
   `ConfigCommand.swift`). `WakuCompatibility.swift` implements the Kimi Code
   CLI commands Waku calls, so Nawa can stand in for Kimi Code inside Waku.
   In `acp` mode stdout carries the protocol: never `print` there.
-- `Tests/` — 50 Swift Testing tests.
+- `Tests/` — Swift Testing suites, one per module.
 
 ## Build & test
 
@@ -85,7 +88,9 @@ Providers can also be configured in code through `ProviderConfig` + `Gateway`:
 multiple OpenAI-compatible endpoints (OpenAI, Azure, Ollama, vLLM, LiteLLM,
 LM Studio…) can be registered; the gateway routes to the active one and can
 auto-discover models via `GET /v1/models` when none is configured. API keys
-may be literals or `env:NAME` references.
+may be literals or `env:NAME` references. `Gateway` only routes: environment
+fallbacks (`ANTHROPIC_WORKSPACE_ID`, the federation variables) are applied
+once at load time with `GatewayConfig.withEnvironmentDefaults()`.
 
 ## Working with this repo (guidance for agents)
 
