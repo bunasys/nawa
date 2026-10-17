@@ -117,15 +117,19 @@ func collect(_ stream: AsyncThrowingStream<StreamChunk, any Error>) async throws
     var deltas: [String] = []
     var response: ModelResponse?
     for try await chunk in stream {
-        switch chunk {
-        case .thinkingDelta(let text): deltas.append("think:\(text)")
-        case .textDelta(let text): deltas.append("text:\(text)")
-        case .toolCallStart(let call): deltas.append("call:\(call.id):\(call.name)")
-        case .toolCallArguments(let id, let json): deltas.append("args:\(id):\(json)")
-        case .finished(let reply): response = reply
-        }
+        if case .finished(let reply) = chunk { response = reply } else { deltas.append(describe(chunk)) }
     }
     return (deltas, response)
+}
+
+func describe(_ chunk: StreamChunk) -> String {
+    switch chunk {
+    case .thinkingDelta(let text): "think:\(text)"
+    case .textDelta(let text): "text:\(text)"
+    case .toolCallStart(let call): "call:\(call.id):\(call.name)"
+    case .toolCallArguments(let id, let json): "args:\(id):\(json)"
+    case .finished: "finished"
+    }
 }
 
 struct ServerSentEventsTests {
@@ -242,5 +246,106 @@ struct OpenAIStreamingTests {
         #expect(bodies.count == 3)
         #expect(bodies[0].contains("stream_options"))
         #expect(!bodies[1].contains("stream_options") && !bodies[2].contains("stream_options"))
+    }
+}
+
+@Suite
+struct AnthropicStreamingTests {
+    /// What the Messages API streams for a reply with thinking, text and a
+    /// tool call (taken from the documented event sequence).
+    static let events = [
+        #"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":12,"cache_read_input_tokens":100,"output_tokens":1}}}"#,
+        #"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        #"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me "}}"#,
+        #"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"check."}}"#,
+        #"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig=="}}"#,
+        #"{"type":"content_block_stop","index":0}"#,
+        #"{"type":"ping"}"#,
+        #"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        #"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Check"}}"#,
+        #"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ing."}}"#,
+        #"{"type":"content_block_stop","index":1}"#,
+        #"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"echo","input":{}}}"#,
+        #"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"text\":"}}"#,
+        #"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"hi\"}"}}"#,
+        #"{"type":"content_block_stop","index":2}"#,
+        #"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}"#,
+        #"{"type":"message_stop"}"#,
+    ]
+
+    static func assemble(_ events: [String]) throws -> (chunks: [StreamChunk], response: ModelResponse) {
+        var assembler = AnthropicStreamAssembler(providerName: "test")
+        var chunks: [StreamChunk] = []
+        for event in events { chunks += try assembler.consume(event) }
+        return (chunks, try assembler.response())
+    }
+
+    @Test
+    func deltasArriveAsChunks() throws {
+        let (chunks, _) = try Self.assemble(Self.events)
+        #expect(chunks.map(describe) == [
+            "think:Let me ", "think:check.", "text:Check", "text:ing.",
+            "call:t1:echo", #"args:t1:{"text":"#, #"args:t1:"hi"}"#,
+        ])
+    }
+
+    @Test
+    func theStreamedReplyMatchesTheNonStreamedOne() throws {
+        let (_, streamed) = try Self.assemble(Self.events)
+        let whole = try AnthropicClient.modelResponse(from: .object([
+            "content": .array([
+                .object(["type": .string("thinking"), "thinking": .string("Let me check."), "signature": .string("sig==")]),
+                .object(["type": .string("text"), "text": .string("Checking.")]),
+                .object(["type": .string("tool_use"), "id": .string("t1"), "name": .string("echo"),
+                         "input": .object(["text": .string("hi")])]),
+            ]),
+            "stop_reason": .string("tool_use"),
+            "usage": .object(["input_tokens": .int(12), "cache_read_input_tokens": .int(100), "output_tokens": .int(42)]),
+        ]), providerName: "test")
+
+        #expect(streamed.message.content == whole.message.content)
+        #expect(streamed.finishReason == .toolUse)
+        #expect(streamed.usage == whole.usage)
+        #expect(streamed.usage.outputTokens == 42)
+    }
+
+    @Test
+    func redactedThinkingIsKeptAsItStarted() throws {
+        let block = #"{"type":"redacted_thinking","data":"opaque-bytes"}"#
+        let (_, response) = try Self.assemble([
+            #"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+            #"{"type":"content_block_start","index":0,"content_block":\#(block)}"#,
+            #"{"type":"content_block_stop","index":0}"#,
+            #"{"type":"message_stop"}"#,
+        ])
+        let payload = try JSONDecoder().decode(JSON.self, from: Data(block.utf8))
+        #expect(response.message.content == [.opaque(provider: "anthropic", payload: payload)])
+    }
+
+    @Test
+    func anErrorEventFailsTheStream() {
+        #expect(throws: GatewayError.self) {
+            try Self.assemble([#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#])
+        }
+    }
+
+    @Test
+    func aStreamCutBeforeMessageStopFails() {
+        #expect(throws: GatewayError.self) {
+            try Self.assemble(Array(Self.events.dropLast()))
+        }
+    }
+
+    @Test
+    func theClientStreamsOverHTTP() async throws {
+        let host = "anthropic-stream.test"
+        let session = StubURLProtocol.session(host: host, replies: [.init(pieces: [sse(Self.events)])])
+        let client = AnthropicClient(providerName: "claude", baseURL: URL(string: "https://\(host)/v1")!, apiKey: "k", session: session)
+        let (deltas, response) = try await collect(client.stream(ModelRequest(model: "claude", messages: [Message(role: .user, text: "hi")])))
+
+        #expect(deltas.first == "think:Let me ")
+        #expect(response?.message.text == "Checking.")
+        let body = try #require(StubURLProtocol.bodies(host: host).first)
+        #expect(body.contains(#""stream":true"#))
     }
 }

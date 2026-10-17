@@ -26,7 +26,9 @@ public struct AnthropicClient: LanguageModel, Sendable {
     /// The Messages API requires `max_tokens`; this applies when the caller sets none.
     static let defaultMaxTokens = 16_000
     /// Non-streaming replies can take minutes while the model thinks, far past
-    /// URLSession's 60-second default.
+    /// URLSession's 60-second default. URLSession counts it from the last
+    /// bytes received, so for streams (which send `ping`s) it is an idle
+    /// timeout and a long reply is never cut.
     static let requestTimeout: TimeInterval = 600
 
     public init(
@@ -59,17 +61,27 @@ public struct AnthropicClient: LanguageModel, Sendable {
         return try Self.modelResponse(from: reply, providerName: providerName)
     }
 
-    /// The harness loop only uses `complete`, so streaming is a single chunk
-    /// carrying the whole reply rather than a second SSE parser to maintain.
+    /// Streams `POST /v1/messages` and builds the same reply `complete`
+    /// would have returned: the closed blocks go through `modelResponse`,
+    /// so thinking blocks are kept as `.opaque` either way.
     public func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let response = try await complete(request)
-                    if !response.message.text.isEmpty {
-                        continuation.yield(.textDelta(response.message.text))
+                    var body = try Self.requestBody(request).objectValue ?? [:]
+                    body["stream"] = .bool(true)
+                    let urlRequest = try await makeRequest(method: "POST", url: baseURL.appendingPathComponent("messages"), body: .object(body))
+                    let (bytes, response) = try await session.bytes(for: urlRequest)
+                    if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                        var text = ""
+                        for try await line in bytes.lines { text += line + "\n" }
+                        throw GatewayError.httpError(statusCode: http.statusCode, body: text)
                     }
-                    continuation.yield(.finished(response))
+                    var assembler = AnthropicStreamAssembler(providerName: providerName)
+                    try await ServerSentEvents.forEachData(in: bytes) { payload in
+                        for chunk in try assembler.consume(payload) { continuation.yield(chunk) }
+                    }
+                    continuation.yield(.finished(try assembler.response()))
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -285,6 +297,16 @@ public struct AnthropicClient: LanguageModel, Sendable {
     }
 
     private func send(method: String, url: URL, body: JSON?) async throws -> Data {
+        let urlRequest = try await makeRequest(method: method, url: url, body: body)
+        let (data, response) = try await session.data(for: urlRequest)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw GatewayError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
+        }
+        return data
+    }
+
+    /// A request with the version and auth headers.
+    private func makeRequest(method: String, url: URL, body: JSON?) async throws -> URLRequest {
         var urlRequest = URLRequest(url: url, timeoutInterval: Self.requestTimeout)
         urlRequest.httpMethod = method
         urlRequest.setValue(Self.apiVersion, forHTTPHeaderField: "anthropic-version")
@@ -306,10 +328,108 @@ public struct AnthropicClient: LanguageModel, Sendable {
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
             urlRequest.httpBody = try JSONEncoder().encode(body)
         }
-        let (data, response) = try await session.data(for: urlRequest)
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            throw GatewayError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
+        return urlRequest
+    }
+}
+
+/// Turns Messages API stream events into `StreamChunk`s, and rebuilds the
+/// reply body `complete` would have received from them.
+///
+/// Each block is kept as the JSON object the non-streaming API returns:
+/// `content_block_start` opens it, deltas append to its text, thinking or
+/// signature, `input_json_delta`s are collected and parsed into `input` at
+/// `content_block_stop`. Block kinds this doesn't know are kept as they
+/// started, like `complete` keeps them.
+struct AnthropicStreamAssembler {
+    let providerName: String
+    private var blocks: [Int: [String: JSON]] = [:]
+    private var toolInput: [Int: String] = [:]
+    private var usage: [String: JSON] = [:]
+    private var stopReason: String?
+    private var stopped = false
+
+    init(providerName: String) { self.providerName = providerName }
+
+    mutating func consume(_ payload: String) throws -> [StreamChunk] {
+        guard let event = try? JSONDecoder().decode(JSON.self, from: Data(payload.utf8)).objectValue else { return [] }
+        let index = event["index"]?.intValue ?? 0
+        switch event["type"]?.stringValue {
+        case "message_start":
+            mergeUsage(event["message"]?.objectValue?["usage"])
+        case "content_block_start":
+            guard let block = event["content_block"]?.objectValue else { return [] }
+            blocks[index] = block
+            if block["type"]?.stringValue == "tool_use" {
+                toolInput[index] = ""
+                let call = ToolCall(id: block["id"]?.stringValue ?? "", name: block["name"]?.stringValue ?? "")
+                return [.toolCallStart(call)]
+            }
+        case "content_block_delta":
+            guard let delta = event["delta"]?.objectValue, blocks[index] != nil else { return [] }
+            switch delta["type"]?.stringValue {
+            case "text_delta":
+                let text = delta["text"]?.stringValue ?? ""
+                append(text, to: "text", of: index)
+                return text.isEmpty ? [] : [.textDelta(text)]
+            case "thinking_delta":
+                let text = delta["thinking"]?.stringValue ?? ""
+                append(text, to: "thinking", of: index)
+                return text.isEmpty ? [] : [.thinkingDelta(text)]
+            case "signature_delta":
+                append(delta["signature"]?.stringValue ?? "", to: "signature", of: index)
+            case "input_json_delta":
+                let json = delta["partial_json"]?.stringValue ?? ""
+                toolInput[index, default: ""] += json
+                if let id = blocks[index]?["id"]?.stringValue, !json.isEmpty {
+                    return [.toolCallArguments(id: id, partialJSON: json)]
+                }
+            default:
+                break
+            }
+        case "content_block_stop":
+            if let json = toolInput[index] {
+                let input = json.isEmpty ? JSON.object([:]) : (try? JSONDecoder().decode(JSON.self, from: Data(json.utf8))) ?? .object([:])
+                blocks[index]?["input"] = input
+            }
+        case "message_delta":
+            if let reason = event["delta"]?.objectValue?["stop_reason"]?.stringValue { stopReason = reason }
+            mergeUsage(event["usage"])
+        case "message_stop":
+            stopped = true
+        case "error":
+            let error = event["error"]?.objectValue
+            let kind = error?["type"]?.stringValue ?? "error"
+            let message = error?["message"]?.stringValue ?? "the stream failed"
+            throw GatewayError.invalidResponse("\(providerName): \(kind): \(message)")
+        default:
+            break  // ping, and events added later
         }
-        return data
+        return []
+    }
+
+    /// The reply, once `message_stop` has arrived.
+    func response() throws -> ModelResponse {
+        guard stopped else {
+            throw GatewayError.invalidResponse("the reply from \(providerName) ended before message_stop")
+        }
+        var reply: [String: JSON] = [
+            "content": .array(blocks.sorted { $0.key < $1.key }.map { .object($0.value) }),
+            "usage": .object(usage),
+        ]
+        if let stopReason { reply["stop_reason"] = .string(stopReason) }
+        return try AnthropicClient.modelResponse(from: .object(reply), providerName: providerName)
+    }
+
+    private mutating func append(_ text: String, to field: String, of index: Int) {
+        let existing = blocks[index]?[field]?.stringValue ?? ""
+        blocks[index]?[field] = .string(existing + text)
+    }
+
+    /// `message_start` has the input counts, `message_delta` the output
+    /// (and, on newer versions, final input counts): later values win.
+    private mutating func mergeUsage(_ wire: JSON?) {
+        for (key, value) in wire?.objectValue ?? [:] where value != .null {
+            usage[key] = value
+        }
     }
 }
