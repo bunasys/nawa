@@ -24,3 +24,6 @@ DerivedData/
 
 # Local launcher scripts; they hold credentials (use env vars or env: refs instead)
 waku.sh
+
+# Release builds
+dist/

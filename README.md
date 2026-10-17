@@ -76,6 +76,26 @@ into bigger systems.
 - ✅ **Predictable** loop — the agent loop yields typed events and is testable
   with a scripted model.
 
+## Download
+
+Prebuilt binaries are on the
+[releases page](https://github.com/bunasys/nawa/releases):
+
+| Platform | File | Needs |
+| --- | --- | --- |
+| macOS, Apple Silicon | `nawa-<version>-macos-arm64.tar.gz` | macOS 15 or later |
+| Linux, x86-64 | `nawa-<version>-linux-amd64.tar.gz` | nothing: fully static |
+
+```sh
+shasum -a 256 -c nawa-0.2.0-macos-arm64.tar.gz.sha256   # optional: check the download
+tar xzf nawa-0.2.0-macos-arm64.tar.gz   # or …-linux-amd64.tar.gz
+sudo mv nawa /usr/local/bin/
+nawa --version
+```
+
+The macOS binary is not notarized: if it was downloaded with a browser,
+macOS blocks it until you run `xattr -d com.apple.quarantine nawa`.
+
 ## Build & run
 
 ```sh
