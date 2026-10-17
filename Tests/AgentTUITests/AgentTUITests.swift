@@ -309,7 +309,7 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
     @Test func parallelToolCallsRunLiveThenCommitInOrder() {
         var transcript = Transcript()
         #expect(transcript.submit("fix it") == [.prompt("fix it")])
-        #expect(transcript.live.phase == .thinking)
+        #expect(transcript.live.phase == .waiting)
 
         let blocks = transcript.reduce(turn("Running both.\n", [call("a", "shell", ["command": "swift test"]), call("b", "read_file", ["path": "x.swift"])], session: 120, cost: 0.01))
         #expect(blocks == [.assistant("Running both.")])
@@ -327,7 +327,7 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
             .tool(ToolBlock(label: ToolLabel(name: "read_file", detail: "x.swift"), summary: ResultSummary(text: "2 lines"))),
         ])
         #expect(transcript.live.running.isEmpty)
-        #expect(transcript.live.phase == .thinking)
+        #expect(transcript.live.phase == .waiting)
         #expect(transcript.live.turn == 2)
 
         #expect(transcript.reduce(turn("Done.", session: 300)) == [.assistant("Done.")])
@@ -396,7 +396,60 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         _ = transcript.submit("go")
         #expect(transcript.reduce(.informational("Compacted 40 older messages into a summary.")) == [.note("Compacted 40 older messages into a summary.")])
         #expect(transcript.reduce(.toolResult(ToolCallResult(callID: "a", name: "shell", content: ""))) == [])
-        #expect(transcript.reduce(.stream(.textDelta("hi"))) == [])
+    }
+
+    @Test func streamedRepliesAreLiveUntilTheTurnCommitsThem() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        let start = ContinuousClock.now
+
+        #expect(transcript.reduce(.stream(.thinkingDelta("Let me look")), now: start) == [])
+        #expect(transcript.live.phase == .thinking)
+        #expect(transcript.reduce(.stream(.textDelta("Hel")), now: start + .seconds(4)) == [])
+        #expect(transcript.reduce(.stream(.textDelta("lo")), now: start + .seconds(5)) == [])
+        #expect(transcript.live.phase == .writing)
+        #expect(transcript.live.inFlight.thinking == "Let me look")
+        #expect(transcript.live.inFlight.text == "Hello")
+        #expect(transcript.live.inFlight.characters == 16)
+
+        // Reasoning ended when the text began: 4s, not 6s.
+        #expect(transcript.reduce(turn("Hello"), now: start + .seconds(6)) == [.note("thought for 4s"), .assistant("Hello")])
+        #expect(transcript.live.inFlight == LiveState.InFlight())
+    }
+
+    @Test func aTurnWithoutReasoningHasNoThoughtNote() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        _ = transcript.reduce(.stream(.textDelta("Hi")))
+        #expect(transcript.reduce(turn("Hi")) == [.assistant("Hi")])
+    }
+
+    @Test func aToolCallBeingWrittenIsShownByName() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        _ = transcript.reduce(.stream(.toolCallStart(ToolCall(id: "a", name: "shell"))))
+        _ = transcript.reduce(.stream(.toolCallArgumentsDelta(id: "a", partialJSON: #"{"command":"#)))
+        #expect(transcript.live.phase == .preparingTool)
+        #expect(transcript.live.inFlight.preparing?.name == "shell")
+        #expect(transcript.live.inFlight.characters == 11)
+    }
+
+    @Test func onlyTheNewestStreamedTextIsKept() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        for _ in 0..<100 { _ = transcript.reduce(.stream(.textDelta(String(repeating: "x", count: 100)))) }
+        _ = transcript.reduce(.stream(.textDelta("end")))
+        #expect(transcript.live.inFlight.text.count <= LiveState.InFlight.keep * 2)
+        #expect(transcript.live.inFlight.text.hasSuffix("end"))
+        #expect(transcript.live.inFlight.characters == 10_003)
+    }
+
+    @Test func anInterruptDropsTheStreamedText() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        _ = transcript.reduce(.stream(.textDelta("Hal")))
+        #expect(transcript.interrupt() == [.warning("interrupted")])
+        #expect(transcript.live.inFlight.text.isEmpty)
     }
 
     @Test func shortNumbers() {

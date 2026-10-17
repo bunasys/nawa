@@ -49,10 +49,66 @@ public struct SubAgentTrace: Sendable, Hashable {
 public struct LiveState: Sendable, Hashable {
     public enum Phase: Sendable, Hashable {
         case idle
-        /// Waiting for the model.
+        /// Waiting for the model's first words.
+        case waiting
+        /// The model is streaming its reasoning.
         case thinking
+        /// The model is streaming its reply.
+        case writing
+        /// The model is writing a tool call's arguments.
+        case preparingTool
         /// Waiting for the tools in `running`.
         case runningTools
+    }
+
+    /// The model call being streamed (proposal 0004). Only the newest part
+    /// of each text is kept: the preview shows a few rows and the whole
+    /// reply arrives with the turn.
+    public struct InFlight: Sendable, Hashable {
+        /// Characters of reasoning and of text kept for the preview.
+        public static let keep = 2048
+
+        public var thinking = ""
+        public var text = ""
+        /// The tool call whose arguments are being written.
+        public var preparing: ToolLabel?
+        /// Everything streamed in this call, for the `~N tokens` estimate.
+        public var characters = 0
+        /// When reasoning started arriving, and when the model moved on.
+        var thinkingStarted: ContinuousClock.Instant?
+        var thinkingEnded: ContinuousClock.Instant?
+
+        public init() {}
+
+        mutating func think(_ delta: String, at now: ContinuousClock.Instant) {
+            if thinkingStarted == nil { thinkingStarted = now }
+            thinkingEnded = nil
+            Self.append(delta, to: &thinking)
+            characters += delta.count
+        }
+
+        mutating func write(_ delta: String, at now: ContinuousClock.Instant) {
+            stopThinking(at: now)
+            Self.append(delta, to: &text)
+            characters += delta.count
+        }
+
+        mutating func stopThinking(at now: ContinuousClock.Instant) {
+            if thinkingStarted != nil, thinkingEnded == nil { thinkingEnded = now }
+        }
+
+        /// Seconds spent reasoning, once the model has shown some.
+        func thoughtSeconds(at now: ContinuousClock.Instant) -> Int? {
+            guard let start = thinkingStarted else { return nil }
+            let seconds = Int(((thinkingEnded ?? now) - start).components.seconds)
+            return max(seconds, 1)
+        }
+
+        private static func append(_ delta: String, to text: inout String) {
+            text += delta
+            // Trim in batches so a long stream isn't re-cut on every delta.
+            if text.utf8.count > keep * 8 || text.count > keep * 2 { text = String(text.suffix(keep)) }
+        }
     }
 
     public struct RunningTool: Sendable, Hashable {
@@ -66,7 +122,8 @@ public struct LiveState: Sendable, Hashable {
     public var turn = 0
     /// Calls of the current turn still waiting for their result, in call order.
     public var running: [RunningTool] = []
-    // Room for streamed text (proposal 0003, Decision 3) goes here.
+    /// The model call being streamed; empty between calls.
+    public var inFlight = InFlight()
 
     public var isBusy: Bool { phase != .idle }
 }
@@ -83,8 +140,9 @@ public struct SessionStats: Sendable, Hashable {
 
 /// Turns `AgentEvent`s into committed `Block`s plus the live state.
 ///
-/// A pure reducer: no terminal, no clock. Both the inline UI and plain
-/// mode drive one, so there is a single formatting path.
+/// A pure reducer: no terminal, and the time comes in with each event.
+/// Both the inline UI and plain mode drive one, so there is a single
+/// formatting path.
 public struct Transcript: Sendable {
     public private(set) var live = LiveState()
     public private(set) var stats = SessionStats()
@@ -95,15 +153,34 @@ public struct Transcript: Sendable {
 
     /// The user sent `prompt`; a run starts.
     public mutating func submit(_ prompt: String) -> [Block] {
-        live = LiveState(phase: .thinking, turn: 1)
+        live = LiveState(phase: .waiting, turn: 1)
         return [.prompt(prompt)]
     }
 
-    public mutating func reduce(_ event: AgentEvent) -> [Block] {
+    /// `now` times the reasoning for the `thought for 4s` note.
+    public mutating func reduce(_ event: AgentEvent, now: ContinuousClock.Instant = .now) -> [Block] {
         switch event {
-        case .initEvent, .stream, .toolResult:
-            // The header is printed at startup; streaming is a separate
-            // change; `.toolResults` carries the same results as a batch.
+        case .initEvent, .toolResult:
+            // The header is printed at startup; `.toolResults` carries the
+            // same results as a batch.
+            return []
+
+        case .stream(let update):
+            // Drawn live only: the whole turn arrives with `.assistant`.
+            switch update {
+            case .thinkingDelta(let delta):
+                live.inFlight.think(delta, at: now)
+                live.phase = .thinking
+            case .textDelta(let delta):
+                live.inFlight.write(delta, at: now)
+                live.phase = .writing
+            case .toolCallStart(let call):
+                live.inFlight.stopThinking(at: now)
+                live.inFlight.preparing = ToolLabel(call)
+                live.phase = .preparingTool
+            case .toolCallArgumentsDelta(_, let json):
+                live.inFlight.characters += json.count
+            }
             return []
 
         case .assistant(let update):
@@ -112,8 +189,14 @@ public struct Transcript: Sendable {
             stats.contextTokens = update.usage.total
             live.running = update.toolCalls.map { LiveState.RunningTool(id: $0.id, label: ToolLabel($0)) }
             live.phase = update.toolCalls.isEmpty ? .idle : .runningTools
+            var blocks: [Block] = []
+            if let seconds = live.inFlight.thoughtSeconds(at: now) {
+                blocks.append(.note("thought for \(Layout.elapsed(seconds))"))
+            }
+            live.inFlight = LiveState.InFlight()
             let text = update.text.trimmingTrailingWhitespace
-            return text.isEmpty ? [] : [.assistant(text)]
+            if !text.isEmpty { blocks.append(.assistant(text)) }
+            return blocks
 
         case .subAgent(let update):
             guard let index = live.running.firstIndex(where: { $0.id == update.callID }) else { return [] }
@@ -135,7 +218,7 @@ public struct Transcript: Sendable {
             }
             // Calls the loop dropped without a result are not left spinning.
             blocks += flushRunning()
-            live.phase = .thinking
+            live.phase = .waiting
             live.turn += 1
             return blocks
 
@@ -165,6 +248,7 @@ public struct Transcript: Sendable {
         guard live.isBusy else { return [] }
         let blocks = flushRunning() + [.warning("interrupted")]
         live.phase = .idle
+        live.inFlight = LiveState.InFlight()
         return blocks
     }
 
@@ -172,6 +256,7 @@ public struct Transcript: Sendable {
     public mutating func fail(_ message: String) -> [Block] {
         let blocks = flushRunning() + [.warning(message)]
         live.phase = .idle
+        live.inFlight = LiveState.InFlight()
         return blocks
     }
 

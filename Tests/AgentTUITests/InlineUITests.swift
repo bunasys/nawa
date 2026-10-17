@@ -166,6 +166,26 @@ struct VirtualTerminal {
         ])
         #expect(Layout(columns: 80).status(LiveState(), frame: 0, elapsedSeconds: 0, maxTurns: nil).isEmpty)
     }
+
+    @Test func statusPreviewsTheNewestStreamedRows() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        #expect(Layout(columns: 80).status(transcript.live, frame: 0, elapsedSeconds: 1, maxTurns: nil).map(\.text) == [
+            " ⠋ waiting for the model · 1s · esc to interrupt",
+        ])
+
+        let reasoning = (1...6).map { "step \($0)" }.joined(separator: "\n") + "\u{1B}[31m\n"
+        _ = transcript.reduce(.stream(.thinkingDelta(reasoning)))
+        let lines = Layout(columns: 80).status(transcript.live, frame: 0, elapsedSeconds: 3, maxTurns: nil)
+        #expect(lines.map(\.text) == [
+            " ⠋ thinking · ~11 tokens · 3s · esc to interrupt",
+            "   step 3", "   step 4", "   step 5", "   step 6[31m",
+        ])
+        #expect(lines[1].spans.last?.style == .dim)
+
+        _ = transcript.reduce(.stream(.textDelta("Done")))
+        #expect(Layout(columns: 80).status(transcript.live, frame: 0, elapsedSeconds: 3, maxTurns: nil).map(\.text).last == "   Done")
+    }
 }
 
 // MARK: - The inline chat

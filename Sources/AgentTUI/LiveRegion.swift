@@ -3,6 +3,14 @@
 /// ```
 ///  ⠹ running shell · 4s · turn 2 · esc to interrupt
 ///   ⠹ shell  swift test
+/// ```
+///
+/// or, while the reply streams in, its newest rows:
+///
+/// ```
+///  ⠹ thinking · ~420 tokens · 6s · esc to interrupt
+///    so the test fails because the fixture is built before the
+///    temporary directory exists; moving it into the test body
 /// ╭──────────────────────────────────────────╮
 /// │ › also add a regression test_            │
 /// ╰──────────────────────────────────────────╯
@@ -11,19 +19,32 @@
 extension Layout {
     static let spinner: [Character] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-    /// The status line and the calls still running, while a run is busy.
+    /// Rows of the streamed reply shown under the status line.
+    static let previewRows = 4
+
+    /// The status line, a preview of what the model is streaming, and the
+    /// calls still running, while a run is busy.
     public func status(_ live: LiveState, frame: Int, elapsedSeconds: Int, maxTurns: Int?) -> [StyledLine] {
         guard live.isBusy else { return [] }
         let spin = String(Self.spinner[frame % Self.spinner.count])
         let activity: String = switch live.phase {
-        case .idle, .thinking: "thinking"
+        case .idle, .waiting: "waiting for the model"
+        case .thinking: "thinking"
+        case .writing: "writing"
+        case .preparingTool: "preparing \(live.inFlight.preparing?.name ?? "a tool call")"
         case .runningTools where live.running.count == 1: "running \(live.running[0].label.name)"
         case .runningTools: "running \(live.running.count) tools"
         }
-        var parts = [activity, Self.elapsed(elapsedSeconds)]
+        var parts = [activity]
+        if live.inFlight.characters > 0 {
+            // About four characters per token: an estimate, until the usage arrives.
+            parts.append("~\(Format.tokens(max(live.inFlight.characters / 4, 1))) tokens")
+        }
+        parts.append(Self.elapsed(elapsedSeconds))
         if let maxTurns { parts.append("turn \(live.turn)/\(maxTurns)") } else if live.turn > 1 { parts.append("turn \(live.turn)") }
         parts.append("esc to interrupt")
         var lines = [row(parts.joined(separator: " · "), style: .dim, prefix: StyledSpan(" \(spin) ", .color(.cyan)))]
+        lines += preview(live)
         for tool in live.running {
             lines.append(callRow(tool.label, indent: 2, marker: StyledSpan("\(spin) ", .color(.cyan))))
             if let trace = tool.subAgent {
@@ -31,6 +52,18 @@ extension Layout {
             }
         }
         return lines
+    }
+
+    /// The newest rows of the reasoning (dim) or reply being streamed.
+    func preview(_ live: LiveState) -> [StyledLine] {
+        let (text, style): (String, Style) = switch live.phase {
+        case .thinking: (live.inFlight.thinking, .dim)
+        case .writing: (live.inFlight.text, .plain)
+        default: ("", .plain)
+        }
+        let shown = text.trimmingTrailingWhitespace
+        guard !shown.isEmpty else { return [] }
+        return Array(paragraph(shown, style: style, prefix: StyledSpan("   ")).suffix(Self.previewRows))
     }
 
     /// `4s`, `1m 05s`.
