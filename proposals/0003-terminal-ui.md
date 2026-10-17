@@ -416,7 +416,7 @@ Open questions settled when the proposal was accepted:
    another project is useful, and one file is simpler to find and delete.
 3. **Streaming is a separate change.** `LoopOptions.streamText` (the loop
    uses `gateway.stream` and yields `.stream(.textDelta)`) gets its own
-   proposal. The `Transcript` reducer ignores `.stream` until then, and
+   proposal: [0004](0004-streaming-progress.md). The `Transcript` reducer ignores `.stream` until then, and
    `LiveState` has room for an in-flight text block.
 4. **`maxTurns` is shown, not asked about.** While a turn runs, the
    status line shows `turn 3/20`. When the cap is hit, the transcript
