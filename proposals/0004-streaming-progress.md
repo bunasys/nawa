@@ -1,6 +1,6 @@
 # 0004: Show progress while the model thinks
 
-- Status: Draft
+- Status: Accepted
 - Depends on: 0003
 
 ## Summary
@@ -291,19 +291,15 @@ is complete, with its arguments.
 5. Update AGENTS.md (Token costs, the loop and gateway entries) and the
    README, and set this proposal's status.
 
-## Open questions
+## Decisions
 
-1. **Keep a trace of the reasoning in scrollback?** This proposal drops
-   the reasoning when the turn ends. One option is to commit a dim
-   `· thought for 23s` line, so scrollback still shows where the time
-   went. Another is an opt-in (`/thinking on`) that commits the full
-   reasoning, dimmed. Proposed: the one-line summary always, full text
-   not for now.
-2. **Servers that reject `stream_options`.** Some OpenAI-compatible
-   servers refuse unknown fields. Options are a per-provider flag in
-   `ProviderConfig`, or retrying once without the field after a 400 that
-   names it. Proposed: retry once, and remember the result for that
-   provider for the rest of the process.
-3. **Default on for ACP?** ACP clients expect chunks, and Zed shows
-   thoughts. Proposed: on everywhere, with `NAWA_STREAM=0` as the way
-   out.
+Open questions settled when the proposal was accepted:
+
+1. **A one-line trace of the reasoning.** When a turn had reasoning, a
+   dim `· thought for 23s` line is committed before the reply. The
+   reasoning text itself is not kept in scrollback for now.
+2. **Servers that reject `stream_options`** get one retry without it
+   after a 400 that names the field. The result is remembered for that
+   client for the rest of the process.
+3. **On everywhere.** Streaming is on for `repl`, `acp` and `serve`.
+   `NAWA_STREAM=0` turns it off.

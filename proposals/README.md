@@ -38,4 +38,4 @@ module, domain types in `AgentCore`, transports that only speak
 | [0001](0001-a2a-client.md) | A2A client: remote agents as sub-agents | Draft |
 | [0002](0002-a2a-server.md) | A2A server: Nawa as a remote agent | Draft |
 | [0003](0003-terminal-ui.md) | A terminal UI for `nawa repl` | Accepted |
-| [0004](0004-streaming-progress.md) | Show progress while the model thinks | Draft |
+| [0004](0004-streaming-progress.md) | Show progress while the model thinks | Accepted |

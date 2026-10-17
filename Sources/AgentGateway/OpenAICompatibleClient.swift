@@ -1,5 +1,6 @@
 import AgentCore
 import Foundation
+import Synchronization
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -58,77 +59,12 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         AsyncThrowingStream { continuation in
             let task = Task { [self] in
                 do {
-                    let body = OpenAIRequest(
-                        model: try request.requiredModel(),
-                        messages: Self.openAIMessages(request.messages),
-                        tools: Self.openAITools(request.tools),
-                        stream: true,
-                        temperature: request.temperature,
-                        maxTokens: request.maxOutputTokens
-                    )
-                    let payload = try JSONEncoder().encode(body)
-                    var urlRequest = URLRequest(url: chatCompletionsURL)
-                    urlRequest.httpMethod = "POST"
-                    urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-                    urlRequest.httpBody = payload
-
-                    let (bytes, response) = try await session.bytes(for: urlRequest)
-                    if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                        let text = try await Self.collectString(from: bytes)
-                        throw GatewayError.httpError(statusCode: http.statusCode, body: text)
+                    let bytes = try await openStream(request)
+                    var assembler = OpenAIStreamAssembler()
+                    try await ServerSentEvents.forEachData(in: bytes) { payload in
+                        for chunk in try assembler.consume(payload) { continuation.yield(chunk) }
                     }
-
-                    var text = ""
-                    var pendingToolCalls: [PendingToolCall] = []
-                    var cumulativeUsage = Usage.zero
-
-                    try await Self.drainSSE(bytes) { payload in
-                        if payload.hasPrefix("[DONE]") { return }
-                        guard let data = payload.data(using: .utf8),
-                            let chunk = try? JSONDecoder().decode(OpenAIStreamChunk.self, from: data)
-                        else { return }
-                        if let usage = chunk.usage {
-                            cumulativeUsage = Self.usage(usage)
-                        }
-                        guard let choice = chunk.choices?.first else { return }
-                        if let delta = choice.delta {
-                            if let content = delta.content, !content.isEmpty {
-                                text += content
-                                continuation.yield(.textDelta(content))
-                            }
-                            if let toolCalls = delta.toolCalls {
-                                for tc in toolCalls {
-                                    let index = tc.index ?? 0
-                                    while pendingToolCalls.count <= index {
-                                        pendingToolCalls.append(PendingToolCall(id: nil, name: nil, arguments: ""))
-                                    }
-                                    if let id = tc.id { pendingToolCalls[index].id = id }
-                                    if let name = tc.function?.name {
-                                        pendingToolCalls[index].name = name
-                                        continuation.yield(.toolCallStart(ToolCall(id: tc.id ?? "call_\(index)", name: name)))
-                                    }
-                                    if let args = tc.function?.arguments {
-                                        pendingToolCalls[index].arguments += args
-                                        continuation.yield(.toolCallArguments(id: pendingToolCalls[index].id ?? "call_\(index)", partialJSON: args))
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Final assembled message
-                    var blocks: [ContentBlock] = []
-                    if !text.isEmpty { blocks.append(.text(text)) }
-                    for call in pendingToolCalls {
-                        guard let id = call.id else { continue }
-                        let name = call.name ?? ""
-                        let args = (try? JSONDecoder().decode(JSON.self, from: Data(call.arguments.utf8))) ?? .object([:])
-                        blocks.append(.toolCall(ToolCall(id: id, name: name, arguments: args)))
-                    }
-                    let message = Message(role: .assistant, content: blocks.isEmpty ? [.text("")] : blocks)
-                    let completion = ModelResponse(message: message, finishReason: nil, usage: cumulativeUsage)
-                    continuation.yield(.finished(completion))
+                    continuation.yield(.finished(assembler.response()))
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -136,6 +72,48 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Endpoints that answered `stream_options` with a 400, by URL: asked
+    /// once per process, then streamed without usage.
+    private static let rejectsStreamOptions = Mutex<Set<String>>([])
+
+    /// Starts the streaming request. Usage is asked for with
+    /// `stream_options.include_usage` (OpenAI sends none without it); a
+    /// server that refuses the field gets one retry without it.
+    private func openStream(_ request: ModelRequest) async throws -> URLSession.AsyncBytes {
+        let endpoint = chatCompletionsURL.absoluteString
+        let askForUsage = !Self.rejectsStreamOptions.withLock { $0.contains(endpoint) }
+        do {
+            return try await openStream(request, askForUsage: askForUsage)
+        } catch GatewayError.httpError(statusCode: 400, let body) where askForUsage && body.contains("stream_options") {
+            Self.rejectsStreamOptions.withLock { _ = $0.insert(endpoint) }
+            return try await openStream(request, askForUsage: false)
+        }
+    }
+
+    private func openStream(_ request: ModelRequest, askForUsage: Bool) async throws -> URLSession.AsyncBytes {
+        let body = OpenAIRequest(
+            model: try request.requiredModel(),
+            messages: Self.openAIMessages(request.messages),
+            tools: Self.openAITools(request.tools),
+            stream: true,
+            temperature: request.temperature,
+            maxTokens: request.maxOutputTokens,
+            streamOptions: askForUsage ? ["include_usage": true] : nil
+        )
+        var urlRequest = URLRequest(url: chatCompletionsURL)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        urlRequest.httpBody = try JSONEncoder().encode(body)
+
+        let (bytes, response) = try await session.bytes(for: urlRequest)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            let text = try await Self.collectString(from: bytes)
+            throw GatewayError.httpError(statusCode: http.statusCode, body: text)
+        }
+        return bytes
     }
 
     public func listModels() async throws -> [ModelSummary] {
@@ -279,26 +257,71 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         }
         return text
     }
-
-    /// Read all SSE `data:` lines from the byte stream, invoking `onPayload`.
-    static func drainSSE(
-        _ bytes: URLSession.AsyncBytes,
-        onPayload: (String) throws -> Void
-    ) async throws {
-        for try await line in bytes.lines {
-            if line.hasPrefix("data:") {
-                let payload = String(line.dropFirst("data:".count)).trimmingCharacters(in: .whitespaces)
-                if !payload.isEmpty {
-                    try onPayload(payload)
-                }
-            }
-        }
-    }
 }
 
-/// Partial state while accumulating streaming tool calls.
-struct PendingToolCall {
-    var id: String?
-    var name: String?
-    var arguments: String
+/// Turns chat-completions stream chunks into `StreamChunk`s, and builds
+/// the reply `complete` would have returned from them.
+struct OpenAIStreamAssembler {
+    private struct PendingToolCall {
+        var id: String
+        var name: String
+        var arguments = ""
+    }
+
+    private var text = ""
+    private var calls: [Int: PendingToolCall] = [:]
+    private var usage = Usage.zero
+    private var finishReason: String?
+
+    /// One `data:` payload in, the deltas it carries out.
+    mutating func consume(_ payload: String) throws -> [StreamChunk] {
+        if payload == "[DONE]" { return [] }
+        guard let chunk = try? JSONDecoder().decode(OpenAIStreamChunk.self, from: Data(payload.utf8)) else { return [] }
+        if let error = chunk.error {
+            throw GatewayError.invalidResponse(error.message ?? "the server reported an error mid-stream")
+        }
+        if let wire = chunk.usage { usage = OpenAICompatibleClient.usage(wire) }
+        guard let choice = chunk.choices?.first else { return [] }
+        if let reason = choice.finishReason { finishReason = reason }
+        guard let delta = choice.delta else { return [] }
+
+        var out: [StreamChunk] = []
+        if let thinking = delta.reasoningContent ?? delta.reasoning, !thinking.isEmpty {
+            out.append(.thinkingDelta(thinking))
+        }
+        if let content = delta.content, !content.isEmpty {
+            text += content
+            out.append(.textDelta(content))
+        }
+        for call in delta.toolCalls ?? [] {
+            let index = call.index ?? 0
+            if calls[index] == nil {
+                let pending = PendingToolCall(id: call.id ?? "call_\(index)", name: call.function?.name ?? "")
+                calls[index] = pending
+                out.append(.toolCallStart(ToolCall(id: pending.id, name: pending.name)))
+            } else if let name = call.function?.name, calls[index]?.name.isEmpty == true {
+                calls[index]?.name = name
+            }
+            if let arguments = call.function?.arguments, !arguments.isEmpty, let id = calls[index]?.id {
+                calls[index]?.arguments += arguments
+                out.append(.toolCallArguments(id: id, partialJSON: arguments))
+            }
+        }
+        return out
+    }
+
+    func response() -> ModelResponse {
+        var blocks: [ContentBlock] = []
+        if !text.isEmpty { blocks.append(.text(text)) }
+        for (_, call) in calls.sorted(by: { $0.key < $1.key }) {
+            let arguments = (try? JSONDecoder().decode(JSON.self, from: Data(call.arguments.utf8))) ?? .object([:])
+            blocks.append(.toolCall(ToolCall(id: call.id, name: call.name, arguments: arguments)))
+        }
+        if blocks.isEmpty { blocks.append(.text("")) }
+        return ModelResponse(
+            message: Message(role: .assistant, content: blocks),
+            finishReason: OpenAICompatibleClient.stopReason(from: finishReason),
+            usage: usage
+        )
+    }
 }

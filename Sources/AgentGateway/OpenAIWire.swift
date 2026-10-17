@@ -11,6 +11,12 @@ struct OpenAIRequest: Encodable {
     let maxTokens: Int?
     let streamOptions: [String: Bool]?
 
+    enum CodingKeys: String, CodingKey {
+        case model, messages, tools, stream, temperature
+        case maxTokens = "max_tokens"
+        case streamOptions = "stream_options"
+    }
+
     init(
         model: String,
         messages: [OpenAIMessage],
@@ -135,6 +141,12 @@ struct OpenAIPromptTokensDetails: Decodable {
 struct OpenAIStreamChunk: Decodable {
     let choices: [OpenAIStreamChoice]?
     let usage: OpenAIUsage?
+    /// Some servers report a failure mid-stream as a chunk of its own.
+    let error: OpenAIStreamError?
+}
+
+struct OpenAIStreamError: Decodable {
+    let message: String?
 }
 
 struct OpenAIStreamChoice: Decodable {
@@ -148,9 +160,14 @@ struct OpenAIStreamChoice: Decodable {
 
 struct OpenAIDelta: Decodable {
     let content: String?
+    /// Reasoning text: `reasoning_content` (DeepSeek, vLLM, Kimi, LM Studio)
+    /// or `reasoning` (OpenRouter, Ollama).
+    let reasoningContent: String?
+    let reasoning: String?
     let toolCalls: [OpenAIStreamToolCall]?
     private enum CodingKeys: String, CodingKey {
-        case content
+        case content, reasoning
+        case reasoningContent = "reasoning_content"
         case toolCalls = "tool_calls"
     }
 }

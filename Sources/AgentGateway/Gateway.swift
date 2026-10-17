@@ -83,7 +83,7 @@ public struct Gateway: LanguageModel, Sendable {
                     let model = try await self.resolveModel(client: client, requested: request.model)
                     var adjusted = request
                     adjusted.model = model
-                    for chunk in await self.allChunks(of: client.stream(adjusted)) {
+                    for try await chunk in client.stream(adjusted) {
                         continuation.yield(chunk)
                     }
                     continuation.finish()
@@ -127,18 +127,3 @@ public struct Gateway: LanguageModel, Sendable {
     }
 }
 
-
-extension Gateway {
-    /// Collect all chunks from a streaming response as an array.
-    private func allChunks(of stream: AsyncThrowingStream<StreamChunk, any Error>) async -> [StreamChunk] {
-        var chunks: [StreamChunk] = []
-        do {
-            for try await chunk in stream {
-                chunks.append(chunk)
-            }
-        } catch {
-            // Final finish below reports the error via completion.
-        }
-        return chunks
-    }
-}

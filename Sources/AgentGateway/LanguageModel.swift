@@ -9,8 +9,10 @@ public protocol LanguageModel: Sendable {
     /// Send messages and (optionally) tools, get a complete response.
     func complete(_ request: ModelRequest) async throws -> ModelResponse
 
-    /// Stream a response in chunks; the final `.finished` chunk carries the
-    /// complete `ModelResponse`.
+    /// Stream a response: deltas as they arrive, then exactly one
+    /// `.finished` carrying the `ModelResponse` `complete` would have
+    /// returned. A failure throws; a stream that ends without `.finished`
+    /// is broken.
     func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error>
 
     /// List the models this provider offers today (auto model discovery).
@@ -74,6 +76,10 @@ public struct ModelResponse: Sendable {
 
 /// A chunk of a streaming reply.
 public enum StreamChunk: Sendable {
+    /// Reasoning text, as far as the provider shows it. Progress only: it
+    /// is not part of the reply (Anthropic's thinking blocks reach the
+    /// reply through `.finished`, as with `complete`).
+    case thinkingDelta(String)
     /// Partial text emitted so far.
     case textDelta(String)
     /// Tool call began with a zero-argument stub; more deltas follow.
