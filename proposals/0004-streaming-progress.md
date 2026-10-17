@@ -1,6 +1,6 @@
 # 0004: Show progress while the model thinks
 
-- Status: Accepted
+- Status: Implemented
 - Depends on: 0003
 
 ## Summary

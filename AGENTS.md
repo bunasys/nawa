@@ -23,9 +23,13 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `ToolCall`, `ToolCallResult`, `Session`, `Usage`, `AgentEvent`, `AgentResult`,
   `JSON` (a small dependency-free JSON value), `ToolRegistry`. No external deps.
 - `Sources/AgentGateway` — `LanguageModel` protocol, `OpenAICompatibleClient`
-  (chat/completions + SSE streaming + tool calling), `AnthropicClient`
-  (Messages API; keeps `thinking` blocks as `ContentBlock.opaque` and sends
-  them back unchanged; authenticates with an API key or Workload Identity
+  (chat/completions + SSE streaming + tool calling; streamed reasoning
+  becomes `StreamChunk.thinkingDelta`; asks for usage with
+  `stream_options` and retries once without it on servers that refuse
+  it), `AnthropicClient`
+  (Messages API, streamed by `AnthropicStreamAssembler`, which rebuilds
+  the blocks `complete` would get; keeps `thinking` blocks as
+  `ContentBlock.opaque` and sends them back unchanged; authenticates with an API key or Workload Identity
   Federation via `WorkloadIdentityTokenSource` in `WorkloadIdentity.swift`,
   one cached token per process), `Gateway` with multiple
   providers (each `ProviderConfig.api` is `openai` or `anthropic`) and auto model discovery (`GET /v1/models`), `ProviderConfig`,
@@ -50,14 +54,19 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `compaction` (summarize older messages; adds a `remember` tool whose notes
   survive), `subAgents` (a `task` tool running a fresh child loop), and
   `helperModel` (cheaper model for both, priced with `helperPricing`). See
-  `ContextShrinking.swift`. A sub-agent's events are forwarded live as
+  `ContextShrinking.swift`. The main turn streams (`streamReplies`, on by
+  default; `NAWA_STREAM=0` turns it off) and yields `.stream` events
+  as the reply arrives; summaries and sub-agents don't stream. ACP sends
+  reasoning as `agent_thought_chunk`. A sub-agent's events are forwarded live as
   `AgentEvent.subAgent(SubAgentUpdate)`, tagged with the parent's `task`
   call id; ACP shows them as `tool_call_update`s of that call. A sub-agent
   may only spend what is left of `maxBudgetUSD`.
 - `Sources/AgentTUI` — the `nawa repl` chat UI (proposal 0003; depends on
   `AgentCore` only, gets the agent as a `ChatSession` of closures).
   `Transcript` reduces `AgentEvent`s to committed `Block`s (append-only
-  scrollback) plus `LiveState`; `Layout` / `TranscriptLayout` turn them
+  scrollback) plus `LiveState`, whose `InFlight` holds the newest part of
+  a streaming reply for the live preview (proposal 0004; never committed:
+  the turn commits whole, after a `· thought for Ns` note); `Layout` / `TranscriptLayout` turn them
   into `StyledLine`s for a width (display-width wrapping, never the last
   column, agent text sanitized of control characters); `ToolDisplay` has
   the one-line tool labels and result summaries. `ChatApp.run` picks the
@@ -144,6 +153,10 @@ keeps cache reads/writes apart from fresh input; `Pricing` prices them.
 tokens) turn on cost estimates for the main and helper models.
 `NAWA_MAX_BUDGET_USD` stops a prompt once the session's estimated cost
 reaches it (needs `NAWA_PRICE`).
+Streaming costs nothing extra: the reply is the same, it just arrives
+in pieces. OpenAI-compatible streams only report usage when asked with
+`stream_options.include_usage`, so keep that in the request (servers
+that refuse it get one retry without it, and then no usage).
 
 ## Working with this repo (guidance for agents)
 

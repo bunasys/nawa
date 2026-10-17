@@ -80,12 +80,18 @@ into bigger systems.
 
 ```sh
 swift build
-swift test          # 50 tests — all green
+swift test
 swift run nawa config  # pick a provider + model for this directory (see below)
 swift run nawa serve   # ACP over streamable HTTP + WebSocket on :7878/acp
 swift run nawa acp     # ACP over stdio (for clients that launch the agent)
 swift run nawa repl    # chat in the terminal (Esc interrupts; --plain for line mode)
 ```
+
+Replies stream: while the model works, `repl` shows whether it is
+thinking or writing, a running token estimate and the newest lines of
+its reasoning or reply, and ACP clients get `agent_thought_chunk` /
+`agent_message_chunk` updates as they arrive. Set `NAWA_STREAM=0` to
+wait for whole replies instead.
 
 ## Configuring a provider per directory
 
