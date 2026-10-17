@@ -70,6 +70,14 @@ struct AgentLoopTests {
             ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("ping")])))]), finishReason: .toolUse),
             ModelResponse(message: Message(role: .assistant, text: "pong"), finishReason: .endTurn),
         ])
+        var results: [ToolCallResult] = []
+        var final: AgentResult?
+        for try await event in AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()])).run(prompt: "ping it") {
+            if case .toolResults(let batch) = event { results += batch }
+            if case .result(let result) = event { final = result }
+        }
+        #expect(results.map(\.content) == ["ping"])
+        #expect(final?.text == "pong")
     }
 
     @Test
