@@ -54,6 +54,17 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `AgentEvent.subAgent(SubAgentUpdate)`, tagged with the parent's `task`
   call id; ACP shows them as `tool_call_update`s of that call. A sub-agent
   may only spend what is left of `maxBudgetUSD`.
+- `Sources/AgentTUI` — the `nawa repl` chat UI (proposal 0003; depends on
+  `AgentCore` only, gets the agent as a `ChatSession` of closures).
+  `Transcript` reduces `AgentEvent`s to committed `Block`s (append-only
+  scrollback) plus `LiveState`; `Layout` / `TranscriptLayout` turn them
+  into `StyledLine`s for a width (display-width wrapping, never the last
+  column, agent text sanitized of control characters); `ToolDisplay` has
+  the one-line tool labels and result summaries. `KeyDecoder` and
+  `LineEditor` are ready for the inline UI. `PlainChat` is line mode
+  (pipes, and terminals until the inline UI lands); it turns Shift-Enter
+  sequences (`ESC[27;2;13~`, `ESC[13;2u`) typed in cooked mode back into
+  newlines.
 - `Sources/AgentMCP` — `MCPClient`: spawns MCP servers, speaks JSON-RPC 2.0,
   exposes their tools.
 - `Sources/AgentACP` — `ACPServer`: ACP over streamable HTTP and WebSocket on
@@ -67,8 +78,8 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `ConfigCommand.swift`). `WakuCompatibility.swift` implements the Kimi Code
   CLI commands Waku calls, so Nawa can stand in for Kimi Code inside Waku.
   In `acp` mode stdout carries the protocol: never `print` there.
-  `repl` turns Shift-Enter sequences (`ESC[27;2;13~`, `ESC[13;2u`) back
-  into newlines until the terminal UI (proposal 0003) replaces `readLine()`.
+  `repl` builds a `ChatSession` from an `AgentLoop` and hands it to
+  `AgentTUI`.
 - `Tests/` — Swift Testing suites, one per module.
 - `proposals/` — design proposals for larger changes (`NNNN-title.md`; format
   and index in `proposals/README.md`). Read the relevant one before building

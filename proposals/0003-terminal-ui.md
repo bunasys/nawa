@@ -204,9 +204,11 @@ public enum ChatApp {
 
 `Sources/nawa` builds the `ChatSession` from an `AgentLoop`: today's
 `repl(gateway:options:)` body, minus the printing. `/clear` builds a new
-`AgentLoop`. The loop's `onEvent` hook is used to forward `.informational`
-events ("Compacted 40 older messages into a summary.", "Hit maxTurns"),
-because those go to `onEvent` but are not yielded on the stream.
+`AgentLoop`. The loop yields its compaction note ("Compacted 40 older
+messages into a summary.") on the stream as `.informational`. Its other
+notes ("Hit maxTurns", "Loop error: …", the loop check) only go to
+`onEvent`, because the `.result` that follows already says the same, and
+the UI shows that.
 
 ### Event → transcript
 

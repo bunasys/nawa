@@ -137,7 +137,10 @@ public final class AgentLoop: @unchecked Sendable {
                         }
 
                         // 1. Ask the model, after trimming what it no longer needs.
-                        try await self.shrinkContext()
+                        try await self.shrinkContext { note in
+                            self.emit(note)
+                            continuation.yield(note)
+                        }
                         let request = ModelRequest(
                             model: self.model,
                             messages: self._session.messages,
@@ -382,19 +385,26 @@ public final class AgentLoop: @unchecked Sendable {
 
     // MARK: Context size
 
-    private func shrinkContext() async throws {
+    /// `report` gets the `.informational` note a compaction leaves; unlike
+    /// the loop's other notes it says something the result won't.
+    private func shrinkContext(report: (AgentEvent) -> Void) async throws {
         if let keep = options.keepToolResults {
             _session.messages = ContextShrinking.clearingOldToolResults(_session.messages, keep: keep)
         }
         guard let compaction = options.compaction, _contextTokens >= compaction.atContextTokens else { return }
-        try await compact(keepRecent: compaction.keepRecentMessages)
+        let compacted = try await compact(keepRecent: compaction.keepRecentMessages)
+        if compacted > 0 {
+            report(.informational("Compacted \(compacted) older messages into a summary."))
+        }
     }
 
     /// Replace the older part of the conversation with a model-written
     /// summary, keeping the recent messages word for word.
-    private func compact(keepRecent: Int) async throws {
+    /// Returns how many messages were folded into the summary (0 when there
+    /// was nothing old enough to compact).
+    private func compact(keepRecent: Int) async throws -> Int {
         let messages = _session.messages
-        guard let cut = ContextShrinking.compactionCut(messages, keepRecent: keepRecent) else { return }
+        guard let cut = ContextShrinking.compactionCut(messages, keepRecent: keepRecent) else { return 0 }
         let systemMessages = messages.prefix { $0.role == .system }
         let older = messages[systemMessages.count..<cut]
 
@@ -417,7 +427,7 @@ public final class AgentLoop: @unchecked Sendable {
         _session.messages = Array(systemMessages) + [Message(role: .user, text: summary)] + messages[cut...]
         // The next model call reports the new size; until then, don't compact again.
         _contextTokens = 0
-        emit(.informational("Compacted \(older.count) older messages into a summary."))
+        return older.count
     }
 
     // MARK: Cost

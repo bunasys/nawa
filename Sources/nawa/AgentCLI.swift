@@ -5,6 +5,7 @@ import AgentInstructions
 import AgentLoop
 import AgentMCP
 import AgentTools
+import AgentTUI
 import Foundation
 
 // MARK: - A simple session factory that composes the whole harness
@@ -252,89 +253,44 @@ struct AgentCLI {
         return Gateway(providers: [provider], activeProviderName: "default")
     }
 
-    static func repl(gateway: any LanguageModel, options: LoopOptions) async throws {
+    static func repl(gateway: Gateway, options: LoopOptions) async throws {
         let instructions = try? ProjectInstructions.loadForCurrentWorkingDirectory()
+        let directory = WorkingDirectory.defaultURL
         // No turn cap, like Claude Code: the loop check (LoopOptions.loopCheckAfterTurns)
         // stops a stuck run, and NAWA_MAX_BUDGET_USD caps the spend.
         let loop = AgentLoop(
             gateway: gateway,
-            tools: ToolRegistry(builtInTools(workingDirectory: WorkingDirectory.defaultURL)),
+            tools: ToolRegistry(builtInTools(workingDirectory: directory)),
             systemPrompt: instructions?.text,
             options: options
         )
-        print("Nawa REPL (type a prompt, Ctrl-D to quit)")
-        while let line = readLine() {
-            let stream = loop.run(prompt: modifiedEnterAsNewline(line), continuing: true)
-            for try await event in stream {
-                switch event {
-                case .assistant(let update):
-                    if !update.text.isEmpty { print("🤖 \(update.text)") }
-                    for call in update.toolCalls {
-                        print("🔧 \(call.name)(\(call.arguments.description))")
-                    }
-                    print("   \(usageLine(update))")
-                case .toolResult(let result):
-                    print("← \(result.name): \(result.content.prefix(200))")
-                case .result(let result):
-                    if !result.isSuccess {
-                        print("⚠️ \(result.errorMessage ?? result.kind.rawValue)")
-                    }
-                case .subAgent(let update):
-                    printSubAgent(update)
-                default:
-                    break
-                }
-            }
-            print()
+        let session = ChatSession(
+            header: SessionHeader(
+                provider: gateway.activeProvider?.name,
+                model: gateway.activeProvider?.model,
+                directory: displayPath(directory),
+                hasInstructions: instructions != nil
+            ),
+            contextLimit: options.compaction?.atContextTokens,
+            send: { prompt in loop.run(prompt: prompt, continuing: true) }
+        )
+        let interactive = isatty(STDIN_FILENO) != 0
+        // Until the inline UI lands (proposal 0003, step 3) a terminal gets
+        // plain mode too; a pipe gets rows that are never wrapped.
+        let columns = isatty(STDOUT_FILENO) != 0 ? 80 : Int(Int32.max)
+        let chat = PlainChat(session: session, layout: Layout(columns: columns), echoPrompts: !interactive) { text in
+            FileHandle.standardOutput.write(Data(text.utf8))
         }
+        await chat.run { readLine() }
     }
 
-    /// Terminals that report modified keys send Shift-Enter (or Ctrl/Alt-Enter)
-    /// as `ESC[27;2;13~` (xterm modifyOtherKeys) or `ESC[13;2u` (kitty
-    /// protocol). In cooked mode that lands in the line as text, so turn it
-    /// back into the newline the user meant. The ESC byte is optional because
-    /// some terminals swallow it on echo. See proposals/0003-terminal-ui.md.
-    static func modifiedEnterAsNewline(_ line: String) -> String {
-        line.replacing(/\x{1B}?\[(?:27;\d+;13~|13;\d+u)/, with: "\n")
-    }
-
-    /// A sub-agent's steps, indented under the `task` call that started it.
-    static func printSubAgent(_ update: SubAgentUpdate) {
-        let indent = "    ↳ "
-        switch update.event {
-        case .initEvent:
-            print("\(indent)sub-agent started on \(update.model ?? "the session model")")
-        case .assistant(let turn):
-            if !turn.text.isEmpty {
-                let text = turn.text.prefix(200).replacingOccurrences(of: "\n", with: "\n      ")
-                print("\(indent)🤖 \(text)")
-            }
-            for call in turn.toolCalls {
-                print("\(indent)🔧 \(call.name)(\(call.arguments.description.prefix(120)))")
-            }
-            print("\(indent)   \(usageLine(turn))")
-        case .toolResults(let results):
-            for result in results {
-                print("\(indent)← \(result.name): \(result.content.prefix(120).replacingOccurrences(of: "\n", with: " "))")
-            }
-        case .result(let result):
-            var line = "\(indent)sub-agent \(result.isSuccess ? "done" : "stopped") after \(result.numTurns) tool turns, \(result.usage.total) tokens"
-            if let cost = result.costEstimate { line += String(format: ", $%.4f", cost) }
-            print(line)
-        default:
-            break
-        }
-    }
-
-    /// One line of spend per turn, so an expensive session shows early.
-    static func usageLine(_ update: AssistantUpdate) -> String {
-        let turn = update.usage
-        var line = "turn: \(turn.promptTokens) in (\(turn.cacheReadTokens) cached), \(turn.outputTokens) out"
-        line += " · session: \(update.sessionUsage.total) tokens"
-        if let cost = update.sessionCost {
-            line += String(format: ", $%.4f", cost)
-        }
-        return line
+    /// `~/src/nawa` for a directory under the home directory.
+    static func displayPath(_ url: URL) -> String {
+        let path = url.standardizedFileURL.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") { return "~" + path.dropFirst(home.count) }
+        return path
     }
 }
 

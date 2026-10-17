@@ -232,9 +232,14 @@ struct AgentLoopTests {
         ])
         let options = LoopOptions(compaction: Compaction(atContextTokens: 400, keepRecentMessages: 2))
         let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), systemPrompt: "SYS", options: options)
-        let result = try await finalResult(loop.run(prompt: "go"))
+        var events: [AgentEvent] = []
+        for try await event in loop.run(prompt: "go") { events.append(event) }
+        let result = try #require(events.last.flatMap { if case .result(let r) = $0 { r } else { nil } })
 
         #expect(result.text == "done")
+        // The compaction note reaches the stream (not just onEvent), so a UI can show it.
+        let notes = events.compactMap { if case .informational(let text) = $0 { text } else { nil } }
+        #expect(notes.count == 1 && notes[0].hasPrefix("Compacted "))
         #expect(model.requests[2].tools == nil)
         #expect(model.requests[2].messages.last?.text.contains("tests live in Tests/") == true)
         let messages = loop.session.messages

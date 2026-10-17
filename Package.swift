@@ -62,7 +62,7 @@ let package = Package(
         // Executable: REPL + ACP server entry point.
         .executableTarget(name: "nawa", dependencies: [
             "AgentCore", "AgentGateway", "AgentTools", "AgentInstructions",
-            "AgentLoop", "AgentMCP", "AgentACP",
+            "AgentLoop", "AgentMCP", "AgentACP", "AgentTUI",
         ]),
 
         .testTarget(name: "AgentCoreTests", dependencies: ["AgentCore"]),

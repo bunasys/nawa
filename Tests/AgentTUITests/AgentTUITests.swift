@@ -290,3 +290,279 @@ import AgentCore
         #expect(summary.text == "exit 0 · no output")
     }
 }
+
+// MARK: - Transcript
+
+private func call(_ id: String, _ name: String, _ arguments: [String: String] = [:]) -> ToolCall {
+    ToolCall(id: id, name: name, arguments: .object(arguments.mapValues { .string($0) }))
+}
+
+private func turn(_ text: String = "", _ calls: [ToolCall] = [], session: Int = 0, cost: Double? = nil) -> AgentEvent {
+    .assistant(AssistantUpdate(text: text, toolCalls: calls, usage: Usage(inputTokens: session), sessionUsage: Usage(inputTokens: session), sessionCost: cost))
+}
+
+private func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0, cost: Double? = nil, error: String? = nil) -> AgentResult {
+    AgentResult(kind: kind, usage: Usage(inputTokens: tokens), numTurns: turns, sessionID: "s", costEstimate: cost, errorMessage: error)
+}
+
+@Suite struct TranscriptTests {
+    @Test func parallelToolCallsRunLiveThenCommitInOrder() {
+        var transcript = Transcript()
+        #expect(transcript.submit("fix it") == [.prompt("fix it")])
+        #expect(transcript.live.phase == .thinking)
+
+        let blocks = transcript.reduce(turn("Running both.\n", [call("a", "shell", ["command": "swift test"]), call("b", "read_file", ["path": "x.swift"])], session: 120, cost: 0.01))
+        #expect(blocks == [.assistant("Running both.")])
+        #expect(transcript.live.phase == .runningTools)
+        #expect(transcript.live.running.map(\.id) == ["a", "b"])
+        #expect(transcript.stats.usage.total == 120)
+        #expect(transcript.stats.cost == 0.01)
+
+        let committed = transcript.reduce(.toolResults([
+            ToolCallResult(callID: "a", name: "shell", content: "exit code: 0\nok"),
+            ToolCallResult(callID: "b", name: "read_file", content: "one\ntwo"),
+        ]))
+        #expect(committed == [
+            .tool(ToolBlock(label: ToolLabel(name: "shell", detail: "swift test"), summary: ResultSummary(text: "exit 0 · 1 line"))),
+            .tool(ToolBlock(label: ToolLabel(name: "read_file", detail: "x.swift"), summary: ResultSummary(text: "2 lines"))),
+        ])
+        #expect(transcript.live.running.isEmpty)
+        #expect(transcript.live.phase == .thinking)
+        #expect(transcript.live.turn == 2)
+
+        #expect(transcript.reduce(turn("Done.", session: 300)) == [.assistant("Done.")])
+        #expect(transcript.reduce(.result(result())) == [])
+        #expect(transcript.live.phase == .idle)
+    }
+
+    @Test func subAgentStepsAttachToTheirTaskCall() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        _ = transcript.reduce(turn("", [call("t", "task", ["prompt": "find the parser"])]))
+
+        func sub(_ event: AgentEvent, callID: String = "t") -> AgentEvent {
+            .subAgent(SubAgentUpdate(callID: callID, model: "haiku", event: event))
+        }
+        #expect(transcript.reduce(sub(turn("", [call("s1", "search", ["pattern": "gitignore"])]))) == [])
+        #expect(transcript.reduce(sub(turn("Found it."))) == [])
+        #expect(transcript.reduce(sub(.result(result(turns: 3, tokens: 8200, cost: 0.004)))) == [])
+        // An update for a call that isn't running is ignored.
+        #expect(transcript.reduce(sub(turn("stray"), callID: "nope")) == [])
+
+        let trace = transcript.live.running.first?.subAgent
+        #expect(trace?.model == "haiku")
+        #expect(trace?.steps == [.tool(ToolLabel(name: "search", detail: "gitignore")), .text("Found it.")])
+        #expect(trace?.outcome == "done · 3 turns · 8.2k tokens · $0.0040")
+
+        let blocks = transcript.reduce(.toolResults([ToolCallResult(callID: "t", name: "task", content: "Found it.")]))
+        guard case .tool(let block)? = blocks.first else { Issue.record("no tool block"); return }
+        #expect(block.subAgent == trace)
+    }
+
+    @Test func failedRunWarnsAndClearsRunningCalls() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        _ = transcript.reduce(turn("", [call("a", "shell", ["command": "make"])]))
+        let blocks = transcript.reduce(.result(result(.errorDuringExecution, error: "HTTP 529 overloaded")))
+        #expect(blocks == [
+            .tool(ToolBlock(label: ToolLabel(name: "shell", detail: "make"), summary: nil)),
+            .warning("error_during_execution: HTTP 529 overloaded"),
+        ])
+        #expect(!transcript.live.isBusy)
+    }
+
+    @Test func limitsSayWhatHappened() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        #expect(transcript.reduce(.result(result(.errorMaxBudgetUSD, cost: 1.25))) == [.warning("stopped: the budget is spent ($1.25)")])
+        _ = transcript.submit("go")
+        #expect(transcript.reduce(.result(result(.errorMaxTurns, turns: 20))) == [.note("stopped after 20 turns; send \"continue\" to keep going")])
+    }
+
+    @Test func interruptionMarksUnfinishedCalls() {
+        var transcript = Transcript()
+        #expect(transcript.interrupt() == [])  // nothing running
+        _ = transcript.submit("go")
+        _ = transcript.reduce(turn("", [call("a", "shell", ["command": "sleep 60"])]))
+        #expect(transcript.interrupt() == [
+            .tool(ToolBlock(label: ToolLabel(name: "shell", detail: "sleep 60"), summary: nil)),
+            .warning("interrupted"),
+        ])
+        #expect(transcript.interrupt() == [])  // only once
+    }
+
+    @Test func notesAndIgnoredEvents() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        #expect(transcript.reduce(.informational("Compacted 40 older messages into a summary.")) == [.note("Compacted 40 older messages into a summary.")])
+        #expect(transcript.reduce(.toolResult(ToolCallResult(callID: "a", name: "shell", content: ""))) == [])
+        #expect(transcript.reduce(.stream(.textDelta("hi"))) == [])
+    }
+
+    @Test func shortNumbers() {
+        #expect(Format.tokens(950) == "950")
+        #expect(Format.tokens(8200) == "8.2k")
+        #expect(Format.tokens(48_100) == "48.1k")
+        #expect(Format.tokens(120_000) == "120k")
+        #expect(Format.tokens(999_999) == "1M")
+        #expect(Format.tokens(1_234_567) == "1.2M")
+        #expect(Format.cost(0.004) == "$0.0040")
+        #expect(Format.cost(0.031) == "$0.031")
+        #expect(Format.cost(1.254) == "$1.25")
+    }
+}
+
+// MARK: - Transcript layout
+
+@Suite struct TranscriptLayoutTests {
+    let layout = Layout(columns: 60)
+
+    private func texts(_ lines: [StyledLine]) -> [String] { lines.map(\.text) }
+
+    @Test func blocks() {
+        #expect(texts(layout.lines(for: .prompt("fix it"))) == ["", "› fix it"])
+        #expect(texts(layout.lines(for: .assistant("one\ntwo"))) == ["● one", "  two"])
+        #expect(texts(layout.lines(for: .note("Compacted."))) == ["· Compacted."])
+        #expect(texts(layout.lines(for: .warning("interrupted"))) == ["⚠ interrupted"])
+    }
+
+    @Test func toolBlockWithSummaryAndLogPath() {
+        let summary = ResultSummary(text: "exit 1 · 43 lines · full output: /tmp/nawa-1.log", isError: true, fullOutputPath: "/tmp/nawa-1.log")
+        let lines = layout.lines(for: .tool(ToolBlock(label: ToolLabel(name: "shell", detail: "swift test"), summary: summary)))
+        #expect(texts(lines) == ["  ⏺ shell  swift test", "    └ exit 1 · 43 lines · full output: /tmp/nawa-1.log"])
+        #expect(lines[1].spans.last?.style == .color(.red))
+    }
+
+    @Test func unfinishedToolBlock() {
+        let lines = layout.lines(for: .tool(ToolBlock(label: ToolLabel(name: "shell", detail: "make"), summary: nil)))
+        #expect(texts(lines) == ["  ⏺ shell  make", "    └ interrupted"])
+    }
+
+    @Test func taskBlockShowsTheSubAgentAndItsOutcome() {
+        var trace = SubAgentTrace(model: "haiku")
+        trace.steps = [.tool(ToolLabel(name: "search", detail: "gitignore")), .text("Found it.")]
+        trace.outcome = "done · 3 turns · 8.2k tokens"
+        let block = ToolBlock(label: ToolLabel(name: "task", detail: "find the parser"), summary: ResultSummary(text: "1 line"), subAgent: trace)
+        #expect(texts(layout.lines(for: .tool(block))) == [
+            "  ⏺ task  find the parser",
+            "    ↳ haiku",
+            "      ⏺ search  gitignore",
+            "      ● Found it.",
+            "    └ done · 3 turns · 8.2k tokens",
+        ])
+    }
+
+    @Test func longSubAgentTracesCountTheHiddenSteps() {
+        var trace = SubAgentTrace(model: nil)
+        trace.steps = (1...10).map { .text("step \($0)") }
+        let lines = texts(layout.subAgentLines(trace, indent: 4, finished: true))
+        #expect(lines.prefix(3) == ["    ↳ sub-agent", "      ⋯ 2 earlier steps", "      ● step 3"])
+        #expect(lines.count == 2 + Layout.maxSubAgentSteps)
+        // While running, only the latest step.
+        #expect(texts(layout.subAgentLines(trace, indent: 4, finished: false)) == ["    ↳ sub-agent", "      ● step 10"])
+    }
+
+    @Test func callRowsFitOneRowAndStripEscapes() {
+        let narrow = Layout(columns: 20)
+        let row = narrow.callRow(ToolLabel(name: "shell", detail: "echo \u{1B}]52;c;aGk=\u{07} and a long tail"), indent: 2)
+        #expect(row.width <= narrow.width)
+        #expect(!row.text.contains("\u{1B}"))
+        #expect(row.text.hasPrefix("  ⏺ shell  echo"))
+        #expect(row.text.hasSuffix("…"))
+    }
+
+    @Test func headerAndFooter() {
+        let facts = SessionHeader(provider: "anthropic", model: "claude-sonnet-4-5", directory: "~/src/nawa", hasInstructions: true)
+        #expect(Layout(columns: 80).header(facts).text == " nawa · anthropic · claude-sonnet-4-5 · ~/src/nawa · AGENTS.md")
+        #expect(layout.header(facts).text.hasSuffix("AGENT…"))  // cut to one row
+        #expect(layout.header(SessionHeader(directory: "/tmp")).text == " nawa · /tmp")
+
+        var stats = SessionStats()
+        stats.usage = Usage(inputTokens: 17_100, outputTokens: 0, cacheReadTokens: 31_000)
+        stats.cost = 0.031
+        stats.contextTokens = 27_600
+        #expect(layout.footer(stats, contextLimit: 120_000, extra: "/help").text == " 48.1k tokens (31k cached) · $0.031 · context 23% · /help")
+        #expect(layout.footer(SessionStats(), contextLimit: nil).text == " 0 tokens")
+    }
+}
+
+// MARK: - Plain mode
+
+@Suite struct PlainChatTests {
+    private func scripted(_ events: [AgentEvent], fail: (any Error)? = nil) -> ChatSession {
+        ChatSession(header: SessionHeader(directory: "~/p"), contextLimit: 1000) { _ in
+            AsyncThrowingStream { continuation in
+                for event in events { continuation.yield(event) }
+                continuation.finish(throwing: fail)
+            }
+        }
+    }
+
+    private func run(_ session: ChatSession, input: [String], echoPrompts: Bool = true) async -> String {
+        final class Sink: @unchecked Sendable { var text = "" }
+        let sink = Sink()
+        var lines = input[...]
+        let chat = PlainChat(session: session, layout: Layout(columns: 80), echoPrompts: echoPrompts) { sink.text += $0 }
+        await chat.run { lines.popFirst() }
+        return sink.text
+    }
+
+    @Test func runPrintsCommittedBlocksThenTheFooter() async {
+        let session = scripted([
+            turn("Checking.", [call("a", "shell", ["command": "ls"])], session: 100),
+            .toolResults([ToolCallResult(callID: "a", name: "shell", content: "exit code: 0\na\nb")]),
+            turn("Two files.", session: 250, cost: 0.002),
+            .result(result()),
+        ])
+        let output = await run(session, input: ["  ", "list files"])
+        #expect(output == """
+             nawa · ~/p
+
+            › list files
+            ● Checking.
+              ⏺ shell  ls
+                └ exit 0 · 2 lines
+            ● Two files.
+             250 tokens · $0.0020 · context 25%
+
+            """)
+    }
+
+    @Test func aTerminalEchoesThePromptSoItIsNotRepeated() async {
+        let output = await run(scripted([turn("Hi.", session: 10), .result(result())]), input: ["hello"], echoPrompts: false)
+        #expect(output == """
+             nawa · ~/p
+            Type a prompt and press Enter; Ctrl-D quits.
+            ● Hi.
+             10 tokens · context 1%
+
+
+            """)
+    }
+
+    @Test func aStreamThatEndsEarlyIsInterruptedAndErrorsAreShown() async {
+        struct Boom: Error, CustomStringConvertible { var description: String { "connection reset" } }
+        let cut = await run(scripted([turn("", [call("a", "shell", ["command": "make"])])]), input: ["go"])
+        #expect(cut.contains("  ⏺ shell  make\n    └ interrupted\n⚠ interrupted\n"))
+        let failed = await run(scripted([], fail: Boom()), input: ["go"])
+        #expect(failed.hasSuffix("› go\n⚠ connection reset\n"))
+    }
+
+    @Test func shiftEnterFromModifyOtherKeysBecomesNewline() {
+        let line = "last session returned this error:\u{1B}[27;2;13~1. Inline."
+        #expect(PlainChat.modifiedEnterAsNewline(line) == "last session returned this error:\n1. Inline.")
+    }
+
+    @Test func shiftEnterFromKittyProtocolBecomesNewline() {
+        #expect(PlainChat.modifiedEnterAsNewline("a\u{1B}[13;2ub\u{1B}[13;5uc") == "a\nb\nc")
+    }
+
+    @Test func sequenceWithoutEscIsStillANewline() {
+        #expect(PlainChat.modifiedEnterAsNewline("error:[27;2;13~1.") == "error:\n1.")
+    }
+
+    @Test func ordinaryTextIsUntouched() {
+        let line = "array[27] and [13;2] stay as they are"
+        #expect(PlainChat.modifiedEnterAsNewline(line) == line)
+    }
+}
