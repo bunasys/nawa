@@ -17,6 +17,7 @@ let package = Package(
         .library(name: "AgentLoop", targets: ["AgentLoop"]),
         .library(name: "AgentMCP", targets: ["AgentMCP"]),
         .library(name: "AgentACP", targets: ["AgentACP"]),
+        .library(name: "AgentTUI", targets: ["AgentTUI"]),
         .executable(name: "nawa", targets: ["nawa"]),
     ],
     dependencies: [
@@ -55,6 +56,9 @@ let package = Package(
             .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
         ]),
 
+        // Terminal UI for the REPL: key decoding, line editing, layout, inline rendering.
+        .target(name: "AgentTUI", dependencies: ["AgentCore"]),
+
         // Executable: REPL + ACP server entry point.
         .executableTarget(name: "nawa", dependencies: [
             "AgentCore", "AgentGateway", "AgentTools", "AgentInstructions",
@@ -68,6 +72,7 @@ let package = Package(
         .testTarget(name: "AgentInstructionsTests", dependencies: ["AgentInstructions"]),
         .testTarget(name: "AgentMCPTests", dependencies: ["AgentMCP"]),
         .testTarget(name: "AgentACPTests", dependencies: ["AgentACP"]),
+        .testTarget(name: "AgentTUITests", dependencies: ["AgentCore", "AgentTUI"]),
         .testTarget(name: "nawaTests", dependencies: ["nawa"]),
     ]
 )
