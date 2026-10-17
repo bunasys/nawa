@@ -207,6 +207,20 @@ struct JSONRPCIDTests {
         let reply = await outbound.next()
         #expect(reply?.json.objectValue?["id"] == .string("6f1c-uuid"))
     }
+
+    /// When stdin closes, the stdio transport finishes the stream and still
+    /// writes the replies already queued (piped input used to lose them).
+    @Test
+    func finishingOutboundKeepsWhatIsQueuedThenEnds() async throws {
+        let connection = ACPConnection(connectionID: "test", factory: RecorderFactory(model: ModelRecorder()), routing: .singleStream)
+        await connection.handle(.request(JSONRPCRequest(method: "initialize", id: 0, params: .object([:]))))
+        await connection.handle(text: "not json")
+        await connection.finishOutbound()
+        var replies: [JSONRPCMessage] = []
+        for await message in await connection.outbound { replies.append(message) }
+        #expect(replies.count == 2)
+        #expect(replies.first?.json.objectValue?["result"]?.objectValue?["protocolVersion"]?.intValue == 1)
+    }
 }
 
 struct JSONRPCResponseIDTests {

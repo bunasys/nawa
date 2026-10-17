@@ -74,7 +74,11 @@ final class HangingHTTPServer: @unchecked Sendable {
     private let accepted = Mutex<Int32>(-1)
 
     init(firstBytes: String) throws {
+        #if canImport(Glibc)
+        let listener = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        #else
         let listener = socket(AF_INET, SOCK_STREAM, 0)
+        #endif
         self.listener = listener
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
@@ -102,7 +106,7 @@ final class HangingHTTPServer: @unchecked Sendable {
     }
 
     func close() {
-        shutdown(listener, SHUT_RDWR)
+        shutdown(listener, Int32(SHUT_RDWR))
         Foundation.close(listener)
         accepted.withLock { if $0 >= 0 { Foundation.close($0) } }
     }
@@ -246,6 +250,77 @@ struct OpenAIStreamingTests {
         #expect(bodies.count == 3)
         #expect(bodies[0].contains("stream_options"))
         #expect(!bodies[1].contains("stream_options") && !bodies[2].contains("stream_options"))
+    }
+}
+
+/// `ResponseByteStream` is what streams on Linux; it is tested here on
+/// every platform.
+struct ResponseByteStreamTests {
+    @Test
+    func theBodyArrivesWholeAndInOrder() async throws {
+        let host = "byte-stream.test"
+        let session = StubURLProtocol.session(host: host, replies: [.init(pieces: ["data: one\n", "", "data: two\n"])])
+        let (bytes, response) = try await ResponseByteStream.open(
+            URLRequest(url: URL(string: "https://\(host)/x")!), configuration: session.configuration
+        )
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        #expect(try await collectText(bytes) == "data: one\ndata: two\n")
+    }
+
+    @Test
+    func anErrorStatusStillComesWithItsBody() async throws {
+        let host = "byte-stream-error.test"
+        let session = StubURLProtocol.session(host: host, replies: [.init(status: 503, pieces: ["overloaded"])])
+        let (bytes, response) = try await ResponseByteStream.open(
+            URLRequest(url: URL(string: "https://\(host)/x")!), configuration: session.configuration
+        )
+        #expect((response as? HTTPURLResponse)?.statusCode == 503)
+        #expect(try await collectText(bytes) == "overloaded")
+    }
+
+    @Test
+    func aFailedConnectionIsAnError() async throws {
+        // Port 1 on loopback: nothing listens there.
+        await #expect(throws: (any Error).self) {
+            _ = try await ResponseByteStream.open(
+                URLRequest(url: URL(string: "http://127.0.0.1:1/x")!), configuration: .ephemeral
+            )
+        }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func bytesArriveBeforeTheResponseEndsAndStoppingEndsIt() async throws {
+        let server = try HangingHTTPServer(firstBytes: "data: first\n")
+        defer { server.close() }
+        let (bytes, _) = try await ResponseByteStream.open(
+            URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/x")!), configuration: .ephemeral
+        )
+        // The response never ends; the first line must still come through,
+        // and leaving the loop must not hang.
+        var line: [UInt8] = []
+        for try await byte in bytes {
+            if byte == UInt8(ascii: "\n") { break }
+            line.append(byte)
+        }
+        #expect(String(decoding: line, as: UTF8.self) == "data: first")
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func cancellingTheReaderEndsAHangingResponse() async throws {
+        let server = try HangingHTTPServer(firstBytes: "data: first\n")
+        defer { server.close() }
+        let reader = Task {
+            let (bytes, _) = try await ResponseByteStream.open(
+                URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/x")!), configuration: .ephemeral
+            )
+            var count = 0
+            for try await _ in bytes { count += 1 }
+            return count
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        reader.cancel()
+        // Either an error or an early end is fine; hanging is not.
+        _ = try? await reader.value
     }
 }
 

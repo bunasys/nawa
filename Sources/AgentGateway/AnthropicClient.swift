@@ -71,11 +71,9 @@ public struct AnthropicClient: LanguageModel, Sendable {
                     var body = try Self.requestBody(request).objectValue ?? [:]
                     body["stream"] = .bool(true)
                     let urlRequest = try await makeRequest(method: "POST", url: baseURL.appendingPathComponent("messages"), body: .object(body))
-                    let (bytes, response) = try await session.bytes(for: urlRequest)
+                    let (bytes, response) = try await session.streamBytes(for: urlRequest)
                     if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                        var text = ""
-                        for try await line in bytes.lines { text += line + "\n" }
-                        throw GatewayError.httpError(statusCode: http.statusCode, body: text)
+                        throw GatewayError.httpError(statusCode: http.statusCode, body: try await collectText(bytes))
                     }
                     var assembler = AnthropicStreamAssembler(providerName: providerName)
                     try await ServerSentEvents.forEachData(in: bytes) { payload in

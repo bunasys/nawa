@@ -3,6 +3,10 @@ import AgentCore
 import Foundation
 import Testing
 
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
 /// A fake `/v1/oauth/token` endpoint: counts exchanges, records the last body,
 /// and answers with a numbered token or an error status.
 final class TokenEndpointStub: URLProtocol, @unchecked Sendable {
@@ -30,8 +34,10 @@ final class TokenEndpointStub: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         Self.exchanges += 1
-        // URLProtocol sees the body as a stream, not `httpBody`.
-        if let stream = request.httpBodyStream {
+        // Apple's URLProtocol sees the body as a stream; Linux's keeps `httpBody`.
+        if let data = request.httpBody {
+            Self.lastBody = try? JSONDecoder().decode(JSON.self, from: data)
+        } else if let stream = request.httpBodyStream {
             stream.open()
             var data = Data()
             var buffer = [UInt8](repeating: 0, count: 4096)

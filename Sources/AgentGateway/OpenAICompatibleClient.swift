@@ -81,7 +81,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
     /// Starts the streaming request. Usage is asked for with
     /// `stream_options.include_usage` (OpenAI sends none without it); a
     /// server that refuses the field gets one retry without it.
-    private func openStream(_ request: ModelRequest) async throws -> URLSession.AsyncBytes {
+    private func openStream(_ request: ModelRequest) async throws -> HTTPResponseBytes {
         let endpoint = chatCompletionsURL.absoluteString
         let askForUsage = !Self.rejectsStreamOptions.withLock { $0.contains(endpoint) }
         do {
@@ -92,7 +92,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         }
     }
 
-    private func openStream(_ request: ModelRequest, askForUsage: Bool) async throws -> URLSession.AsyncBytes {
+    private func openStream(_ request: ModelRequest, askForUsage: Bool) async throws -> HTTPResponseBytes {
         let body = OpenAIRequest(
             model: try request.requiredModel(),
             messages: Self.openAIMessages(request.messages),
@@ -108,10 +108,9 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
         urlRequest.httpBody = try JSONEncoder().encode(body)
 
-        let (bytes, response) = try await session.bytes(for: urlRequest)
+        let (bytes, response) = try await session.streamBytes(for: urlRequest)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            let text = try await Self.collectString(from: bytes)
-            throw GatewayError.httpError(statusCode: http.statusCode, body: text)
+            throw GatewayError.httpError(statusCode: http.statusCode, body: try await collectText(bytes))
         }
         return bytes
     }
@@ -248,14 +247,6 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             throw GatewayError.httpError(statusCode: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
         }
         return data
-    }
-
-    static func collectString(from bytes: URLSession.AsyncBytes) async throws -> String {
-        var text = ""
-        for try await line in bytes.lines {
-            text += line + "\n"
-        }
-        return text
     }
 }
 

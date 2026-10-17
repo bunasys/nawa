@@ -66,6 +66,13 @@ public actor ACPConnection {
     /// The connection-scoped outbound stream (for SSE GET handlers).
     public var outbound: AsyncStream<JSONRPCMessage> { connectionStream.stream }
 
+    /// Ends the connection-scoped stream once what is already queued on it
+    /// has been read; later messages are dropped. For a transport whose
+    /// client has gone (stdin closed) but whose last replies must still go out.
+    public func finishOutbound() {
+        connectionStream.finish()
+    }
+
     /// The session-scoped outbound stream for `sessionID`, creating it if needed.
     public func sessionOutbound(for sessionID: String) -> AsyncStream<JSONRPCMessage> {
         if sessionStreams[sessionID] == nil {

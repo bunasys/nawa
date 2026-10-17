@@ -110,6 +110,32 @@ swift build
 swift test
 ```
 
+Nawa builds on macOS and Linux. Linux Foundation lacks a few Apple APIs,
+so a couple of spots pick their implementation per platform; keep any new
+platform-specific code just as small:
+- `URLSession.streamBytes(for:)` (`AgentGateway/StreamingHTTP.swift`) is
+  `bytes(for:)` on macOS and `ResponseByteStream` (delegate-based) on Linux.
+- stdin in `ACPStdioTransport` is `FileHandle.bytes.lines` on macOS and
+  `InputLines` (`DispatchIO`) on Linux.
+Both Linux types build everywhere and are tested on macOS too. To run the
+suite on Linux: `docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src swift:6.4 swift test`
+(slow under emulation).
+
+## Releases
+
+The version lives in `ACPServerInfo.nawa` (`Sources/AgentACP/ACPTypes.swift`);
+`nawa --version` prints it. A release tags `vX.Y.Z` on `main` and attaches
+`nawa-X.Y.Z-macos-arm64.tar.gz` and `nawa-X.Y.Z-linux-amd64.tar.gz` (each
+with a `.sha256`) to a GitHub release:
+- macOS: `swift build -c release --product nawa` (ad-hoc signed, not notarized).
+- Linux: fully static with the Swift Static Linux SDK (musl) matching the
+  `swift:6.4` image's compiler (verify its `.sig` against swift.org's keys),
+  `swift build -c release --product nawa --swift-sdk x86_64-swift-linux-musl`
+  inside `swift:6.4` on `linux/amd64`. `--static-swift-stdlib` alone still
+  needs `libcurl` on the user's machine.
+Smoke-test the Linux binary in a plain `ubuntu` container: `--version`, and
+an `initialize` line piped into `nawa acp` must get its reply and exit.
+
 ## Running
 
 ```
