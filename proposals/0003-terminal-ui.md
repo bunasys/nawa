@@ -245,7 +245,7 @@ their first line.
 The renderer uses only sequences that every VT100-descended terminal, tmux
 and mosh support:
 
-- `CR`, `LF`, `ESC[nA` (cursor up), `ESC[K` / `ESC[J` (erase to end of
+- `CR`, `LF`, `ESC[nA` / `ESC[nC` (cursor up / right), `ESC[K` / `ESC[J` (erase to end of
   line / screen), `ESC[?25l` / `ESC[?25h` (hide/show cursor).
 - SGR for bold, dim, and the 16 standard colours. No truecolour, no
   256-colour palette assumptions. `NO_COLOR` turns colour off.
@@ -273,7 +273,15 @@ marks as 0 and East Asian wide characters and emoji as 2. This matters for
 Arabic, CJK and emoji in prompts and replies. The renderer never writes in
 the last column, to avoid the auto-wrap differences between terminals. On
 resize, the live region is cleared and redrawn. Scrollback that was already
-written reflows only if the terminal itself reflows it.
+written reflows only if the terminal itself reflows it. When the window
+gets narrower, `InlineScreen` counts the rows of the old live region at
+the new width, as reflowing terminals (most, and tmux) re-wrap them; on
+one that truncates instead (xterm), narrowing the window moves up too far
+and erases a few transcript rows from the screen. That is the cheaper
+mistake: counting the other way would leave stale copies of the prompt box
+in the scrollback of every reflowing terminal. The live region is capped to
+fit the screen (the prompt box scrolls to its cursor), because cursor-up
+stops at the top row.
 
 **Restoring the terminal.** Raw mode is entered with `cfmakeraw`-style
 flags but keeps `OPOST`, so `\n` still maps to CRLF for any stray output.
@@ -376,15 +384,19 @@ All in a new `AgentTUITests` suite (Swift Testing). None of it needs a TTY.
 
 Each step leaves `swift build` and `swift test` green.
 
-1. Add the `AgentTUI` target and tests with `KeyDecoder`, `LineEditor` and
+1. *(done)* Add the `AgentTUI` target and tests with `KeyDecoder`, `LineEditor` and
    `Layout` (pure, nothing calls them yet).
-2. Add `Transcript` and plain mode, and move `AgentCLI.repl` onto it.
+2. *(done)* Add `Transcript` and plain mode, and move `AgentCLI.repl` onto it.
    Output looks about the same as today, but there is now one formatting
    path, and `printSubAgent`/`usageLine` move into `AgentTUI`.
-3. Add `Terminal` and `InlineScreen`, and have `ChatApp` run the inline UI
-   when it is attached to a TTY. Add a `--plain` flag.
-4. Interrupt, queued prompts, slash commands, and the footer's context
-   fill.
+3. *(done)* Add `Terminal` and `InlineScreen`, and have `ChatApp` run the inline UI
+   when it is attached to a TTY. Add a `--plain` flag. Interrupt and
+   queued prompts landed here too: raw mode turns off `SIGINT`, so without
+   them Ctrl-C could not stop a turn. `AgentLoop` now answers tool calls
+   left unanswered by an interrupt (as errors) before the next prompt, as
+   providers reject a conversation with dangling calls.
+4. Slash commands (`/clear`, `/help`, …). The footer's context fill
+   already landed in step 2.
 5. Update AGENTS.md (layout + Running), README and the `nawa` usage text,
    and set this proposal's status.
 

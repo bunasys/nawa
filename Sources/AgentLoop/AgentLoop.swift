@@ -216,6 +216,14 @@ public final class AgentLoop: @unchecked Sendable {
     /// loop check, so both apply to each prompt rather than the whole conversation.
     private func appendUser(_ prompt: String) {
         lock.lock(); defer { lock.unlock() }
+        // A run interrupted between the model's tool calls and their results
+        // left calls unanswered, and providers refuse such a conversation.
+        if let last = _session.messages.last, last.role == .assistant {
+            for call in last.toolCalls {
+                let result = ToolCallResult(callID: call.id, name: call.name, content: "interrupted by the user before it finished", isError: true)
+                _session.append(result.asMessage)
+            }
+        }
         _session.append(Message(role: .user, text: prompt))
         _turnCounter = 0
         _loopDetector.reset()

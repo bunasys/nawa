@@ -84,7 +84,7 @@ swift test          # 50 tests — all green
 swift run nawa config  # pick a provider + model for this directory (see below)
 swift run nawa serve   # ACP over streamable HTTP + WebSocket on :7878/acp
 swift run nawa acp     # ACP over stdio (for clients that launch the agent)
-swift run nawa repl    # interactive loop
+swift run nawa repl    # chat in the terminal (Esc interrupts; --plain for line mode)
 ```
 
 ## Configuring a provider per directory

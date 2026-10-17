@@ -60,9 +60,16 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   scrollback) plus `LiveState`; `Layout` / `TranscriptLayout` turn them
   into `StyledLine`s for a width (display-width wrapping, never the last
   column, agent text sanitized of control characters); `ToolDisplay` has
-  the one-line tool labels and result summaries. `KeyDecoder` and
-  `LineEditor` are ready for the inline UI. `PlainChat` is line mode
-  (pipes, and terminals until the inline UI lands); it turns Shift-Enter
+  the one-line tool labels and result summaries. `ChatApp.run` picks the
+  UI: `InlineChat` on a terminal, `PlainChat` otherwise (or `--plain`).
+  `InlineChat` is one main-actor loop over keys, run events, ticks and
+  resizes; Enter during a run queues, Esc / Ctrl-C interrupt (ending the
+  run's stream cancels it). `InlineScreen` draws each frame as one string
+  of relative moves (no alternate screen); `LiveRegion.swift` lays out the
+  status line and the prompt box. `Terminal` is the only file touching
+  termios, ioctl and signals. Tests replay frames on `VirtualTerminal`.
+  `PlainChat` is line mode
+  (pipes, `TERM=dumb`); it turns Shift-Enter
   sequences (`ESC[27;2;13~`, `ESC[13;2u`) typed in cooked mode back into
   newlines.
 - `Sources/AgentMCP` — `MCPClient`: spawns MCP servers, speaks JSON-RPC 2.0,

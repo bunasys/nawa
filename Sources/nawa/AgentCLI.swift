@@ -140,14 +140,15 @@ struct AgentCLI {
             try await WakuCompatibility.providerCommand(arguments: Array(args.dropFirst()))
         case "repl":
             let gateway = try resolveGateway()
-            try await repl(gateway: gateway, options: loopOptions)
+            let plain = args.dropFirst().contains("--plain")
+            try await repl(gateway: gateway, options: loopOptions, mode: plain ? .plain : .auto)
         case "config":
             try await ConfigCommand.run(arguments: Array(args.dropFirst()))
         default:
             print("Usage: nawa [serve|acp|repl|config|provider list]")
             print("  serve  — start the ACP server (streamable HTTP + WebSocket) on :7878")
             print("  acp    — speak ACP over stdio (for editors and Waku that launch the agent)")
-            print("  repl   — run a single prompt from stdin against the agent loop")
+            print("  repl [--plain] — chat with the agent in the terminal (--plain: line mode)")
             print("  config — configure a provider (OpenAI-compatible or Anthropic) for the current directory")
             print("  provider list [--json] — list the active provider's models")
         }
@@ -253,7 +254,7 @@ struct AgentCLI {
         return Gateway(providers: [provider], activeProviderName: "default")
     }
 
-    static func repl(gateway: Gateway, options: LoopOptions) async throws {
+    static func repl(gateway: Gateway, options: LoopOptions, mode: ChatApp.Mode = .auto) async throws {
         let instructions = try? ProjectInstructions.loadForCurrentWorkingDirectory()
         let directory = WorkingDirectory.defaultURL
         // No turn cap, like Claude Code: the loop check (LoopOptions.loopCheckAfterTurns)
@@ -274,14 +275,7 @@ struct AgentCLI {
             contextLimit: options.compaction?.atContextTokens,
             send: { prompt in loop.run(prompt: prompt, continuing: true) }
         )
-        let interactive = isatty(STDIN_FILENO) != 0
-        // Until the inline UI lands (proposal 0003, step 3) a terminal gets
-        // plain mode too; a pipe gets rows that are never wrapped.
-        let columns = isatty(STDOUT_FILENO) != 0 ? 80 : Int(Int32.max)
-        let chat = PlainChat(session: session, layout: Layout(columns: columns), echoPrompts: !interactive) { text in
-            FileHandle.standardOutput.write(Data(text.utf8))
-        }
-        await chat.run { readLine() }
+        try await ChatApp.run(session, mode: mode, maxTurns: options.maxTurns)
     }
 
     /// `~/src/nawa` for a directory under the home directory.

@@ -272,6 +272,39 @@ struct AgentLoopTests {
         let cost = pricing.cost(of: Usage(inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 10_000, cacheWriteTokens: 1000))
         #expect(abs(cost - (1 + 10 + 1 + 1.25)) < 1e-9)
     }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aPromptAfterAnInterruptedToolCallAnswersTheCallFirst() async throws {
+        let call = ToolCall(id: "c1", name: "slow", arguments: .object([:]))
+        let model = ScriptedModel(responses: [
+            toolCallResponse(call),
+            ModelResponse(message: Message(role: .assistant, text: "ok")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SlowTool()]))
+
+        // Interrupt while the tool runs: stop reading the stream.
+        for try await event in loop.run(prompt: "one") {
+            if case .assistant = event { break }
+        }
+        let second = try await finalResult(loop.run(prompt: "two", continuing: true))
+
+        #expect(second.text == "ok")
+        let messages = try #require(model.requests.last?.messages)
+        let answered = messages.contains { message in
+            message.content.contains { if case .toolResult(let r) = $0 { r.callID == "c1" && r.isError } else { false } }
+        }
+        #expect(answered)
+        #expect(messages.last?.text == "two")
+    }
+}
+
+/// Runs until cancelled.
+struct SlowTool: Tool {
+    var definition: ToolDefinition { ToolDefinition(name: "slow", description: "", parameters: .object([:])) }
+    func run(arguments: JSON) async throws -> String {
+        try await Task.sleep(for: .seconds(60))
+        return "finished"
+    }
 }
 
 func toolCallResponse(_ call: ToolCall, usage: Usage = .zero) -> ModelResponse {

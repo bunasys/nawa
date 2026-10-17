@@ -293,15 +293,15 @@ import AgentCore
 
 // MARK: - Transcript
 
-private func call(_ id: String, _ name: String, _ arguments: [String: String] = [:]) -> ToolCall {
+func call(_ id: String, _ name: String, _ arguments: [String: String] = [:]) -> ToolCall {
     ToolCall(id: id, name: name, arguments: .object(arguments.mapValues { .string($0) }))
 }
 
-private func turn(_ text: String = "", _ calls: [ToolCall] = [], session: Int = 0, cost: Double? = nil) -> AgentEvent {
+func turn(_ text: String = "", _ calls: [ToolCall] = [], session: Int = 0, cost: Double? = nil) -> AgentEvent {
     .assistant(AssistantUpdate(text: text, toolCalls: calls, usage: Usage(inputTokens: session), sessionUsage: Usage(inputTokens: session), sessionCost: cost))
 }
 
-private func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0, cost: Double? = nil, error: String? = nil) -> AgentResult {
+func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0, cost: Double? = nil, error: String? = nil) -> AgentResult {
     AgentResult(kind: kind, usage: Usage(inputTokens: tokens), numTurns: turns, sessionID: "s", costEstimate: cost, errorMessage: error)
 }
 
