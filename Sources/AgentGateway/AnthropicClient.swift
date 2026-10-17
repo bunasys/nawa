@@ -380,6 +380,7 @@ struct AnthropicStreamAssembler {
             case "input_json_delta":
                 let json = delta["partial_json"]?.stringValue ?? ""
                 toolInput[index, default: ""] += json
+                try ServerSentEvents.checkToolArguments(toolInput[index] ?? "")
                 if let id = blocks[index]?["id"]?.stringValue, !json.isEmpty {
                     return [.toolCallArguments(id: id, partialJSON: json)]
                 }

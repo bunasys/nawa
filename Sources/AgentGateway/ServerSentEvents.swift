@@ -7,6 +7,16 @@
 /// rather than growing without bound on a broken server.
 enum ServerSentEvents {
     static let maxLineBytes = 1 << 20
+    /// The most tool-call argument JSON one call may stream: far more than
+    /// any `max_tokens`, so only a broken or hostile server reaches it.
+    static let maxToolArgumentBytes = 8 << 20
+
+    /// Fails once `json` has grown past `maxToolArgumentBytes`.
+    static func checkToolArguments(_ json: String) throws {
+        if json.utf8.count > maxToolArgumentBytes {
+            throw GatewayError.invalidResponse("a streamed tool call's arguments are over \(maxToolArgumentBytes) bytes")
+        }
+    }
 
     static func forEachData<Bytes: AsyncSequence>(
         in bytes: Bytes,

@@ -349,3 +349,17 @@ struct AnthropicStreamingTests {
         #expect(body.contains(#""stream":true"#))
     }
 }
+
+@Suite
+struct StreamLimitTests {
+    @Test
+    func toolArgumentsCannotGrowWithoutBound() throws {
+        var assembler = AnthropicStreamAssembler(providerName: "test")
+        _ = try assembler.consume(#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"echo","input":{}}}"#)
+        let piece = String(repeating: "a", count: 1 << 20)
+        let event = #"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\#(piece)"}}"#
+        #expect(throws: GatewayError.self) {
+            for _ in 0..<9 { _ = try assembler.consume(event) }
+        }
+    }
+}

@@ -304,6 +304,7 @@ struct OpenAIStreamAssembler {
             }
             if let arguments = call.function?.arguments, !arguments.isEmpty, let id = calls[index]?.id {
                 calls[index]?.arguments += arguments
+                try ServerSentEvents.checkToolArguments(calls[index]?.arguments ?? "")
                 out.append(.toolCallArguments(id: id, partialJSON: arguments))
             }
         }
