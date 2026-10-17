@@ -63,6 +63,27 @@ struct AgentLoopTests {
     }
 
     @Test
+    func maxTurnsCapsEachPromptNotTheWholeConversation() async throws {
+        let call = ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("hi")]))
+        let model = ScriptedModel(responses: [
+            toolCallResponse(call),
+            ModelResponse(message: Message(role: .assistant, text: "first")),
+            toolCallResponse(call),
+            ModelResponse(message: Message(role: .assistant, text: "second")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: LoopOptions(maxTurns: 2))
+
+        // Each prompt needs one tool turn; together they would exceed the cap.
+        let first = try await finalResult(loop.run(prompt: "one"))
+        let second = try await finalResult(loop.run(prompt: "two", continuing: true))
+
+        #expect(first.text == "first")
+        #expect(second.isSuccess)
+        #expect(second.text == "second")
+        #expect(second.numTurns == 1)
+    }
+
+    @Test
     func subAgentAnswersAndItsUsageCountsInTheParent() async throws {
         let model = ScriptedModel(responses: [
             toolCallResponse(ToolCall(id: "c1", name: "task", arguments: .object(["prompt": .string("find X")])), usage: Usage(inputTokens: 10)),

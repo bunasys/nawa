@@ -68,5 +68,6 @@ let package = Package(
         .testTarget(name: "AgentInstructionsTests", dependencies: ["AgentInstructions"]),
         .testTarget(name: "AgentMCPTests", dependencies: ["AgentMCP"]),
         .testTarget(name: "AgentACPTests", dependencies: ["AgentACP"]),
+        .testTarget(name: "nawaTests", dependencies: ["nawa"]),
     ]
 )

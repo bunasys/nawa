@@ -64,6 +64,8 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `ConfigCommand.swift`). `WakuCompatibility.swift` implements the Kimi Code
   CLI commands Waku calls, so Nawa can stand in for Kimi Code inside Waku.
   In `acp` mode stdout carries the protocol: never `print` there.
+  `repl` turns Shift-Enter sequences (`ESC[27;2;13~`, `ESC[13;2u`) back
+  into newlines until the terminal UI (proposal 0003) replaces `readLine()`.
 - `Tests/` — Swift Testing suites, one per module.
 - `proposals/` — design proposals for larger changes (`NNNN-title.md`; format
   and index in `proposals/README.md`). Read the relevant one before building

@@ -250,7 +250,7 @@ struct AgentCLI {
         )
         print("Nawa REPL (type a prompt, Ctrl-D to quit)")
         while let line = readLine() {
-            let stream = loop.run(prompt: line, continuing: true)
+            let stream = loop.run(prompt: modifiedEnterAsNewline(line), continuing: true)
             for try await event in stream {
                 switch event {
                 case .assistant(let update):
@@ -273,6 +273,15 @@ struct AgentCLI {
             }
             print()
         }
+    }
+
+    /// Terminals that report modified keys send Shift-Enter (or Ctrl/Alt-Enter)
+    /// as `ESC[27;2;13~` (xterm modifyOtherKeys) or `ESC[13;2u` (kitty
+    /// protocol). In cooked mode that lands in the line as text, so turn it
+    /// back into the newline the user meant. The ESC byte is optional because
+    /// some terminals swallow it on echo. See proposals/0003-terminal-ui.md.
+    static func modifiedEnterAsNewline(_ line: String) -> String {
+        line.replacing(/\x{1B}?\[(?:27;\d+;13~|13;\d+u)/, with: "\n")
     }
 
     /// A sub-agent's steps, indented under the `task` call that started it.

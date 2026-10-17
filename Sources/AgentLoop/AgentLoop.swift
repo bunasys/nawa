@@ -199,9 +199,12 @@ public final class AgentLoop: @unchecked Sendable {
         }
     }
 
+    /// Starts a run: appends the prompt and resets the turn counter, so
+    /// `maxTurns` caps each prompt rather than the whole conversation.
     private func appendUser(_ prompt: String) {
         lock.lock(); defer { lock.unlock() }
         _session.append(Message(role: .user, text: prompt))
+        _turnCounter = 0
     }
 
     private func result(
