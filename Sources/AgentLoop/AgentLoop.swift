@@ -149,7 +149,10 @@ public final class AgentLoop: @unchecked Sendable {
                             temperature: self.options.temperature
                         )
 
-                        let response = try await self.gateway.complete(request)
+                        let response = try await self.ask(request) { update in
+                            self.emit(.stream(update))
+                            continuation.yield(.stream(update))
+                        }
                         self._usage.accumulate(response.usage)
                         self._contextTokens = response.usage.total
 
@@ -368,11 +371,30 @@ public final class AgentLoop: @unchecked Sendable {
         return ToolCallResult(callID: call.id, name: call.name, content: childResult.text ?? "")
     }
 
-    /// A sub-agent's options: no further sub-agents, the helper's pricing
+    /// One model call for the main turn: streamed when `streamReplies` is
+    /// on, with each partial update handed to `progress` as it arrives.
+    private func ask(_ request: ModelRequest, progress: (AgentStreamUpdate) -> Void) async throws -> ModelResponse {
+        guard options.streamReplies else { return try await gateway.complete(request) }
+        for try await chunk in gateway.stream(request) {
+            switch chunk {
+            case .thinkingDelta(let text): progress(.thinkingDelta(text))
+            case .textDelta(let text): progress(.textDelta(text))
+            case .toolCallStart(let call): progress(.toolCallStart(call))
+            case .toolCallArguments(let id, let json): progress(.toolCallArgumentsDelta(id: id, partialJSON: json))
+            case .finished(let response): return response
+            }
+        }
+        try Task.checkCancellation()
+        throw GatewayError.incompleteStream
+    }
+
+    /// A sub-agent's options: no further sub-agents, no streaming (only its
+    /// result is shown), the helper's pricing
     /// when it runs on the helper model, and what is left of the budget.
     private var childOptions: LoopOptions {
         var child = options
         child.subAgents = false
+        child.streamReplies = false
         if options.helperModel != nil {
             child.pricing = options.helperPricing ?? options.pricing
         }
@@ -536,6 +558,9 @@ public struct LoopOptions: Sendable {
     public var helperModel: String?
     /// Pricing for `helperModel`. Nil = priced like the main model.
     public var helperPricing: Pricing?
+    /// Stream the main turn's reply, yielding `.stream` events as it
+    /// arrives. Summaries and sub-agents never stream.
+    public var streamReplies: Bool
 
     public init(
         maxTurns: Int? = nil,
@@ -549,7 +574,8 @@ public struct LoopOptions: Sendable {
         compaction: Compaction? = nil,
         subAgents: Bool = false,
         helperModel: String? = nil,
-        helperPricing: Pricing? = nil
+        helperPricing: Pricing? = nil,
+        streamReplies: Bool = true
     ) {
         self.maxTurns = maxTurns
         self.loopCheckAfterTurns = loopCheckAfterTurns
@@ -563,5 +589,6 @@ public struct LoopOptions: Sendable {
         self.subAgents = subAgents
         self.helperModel = helperModel
         self.helperPricing = helperPricing
+        self.streamReplies = streamReplies
     }
 }

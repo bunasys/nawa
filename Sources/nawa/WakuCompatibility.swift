@@ -67,7 +67,7 @@ enum WakuCompatibility {
         let loop = AgentLoop(
             gateway: try AgentCLI.resolveGateway(),
             tools: ToolRegistry([]),
-            options: LoopOptions(maxTurns: 1, sendTools: false)
+            options: LoopOptions(maxTurns: 1, sendTools: false, streamReplies: false)  // prints the reply only once it is done
         )
         loop.model = value(after: "--model", in: arguments)
 

@@ -22,6 +22,24 @@ public protocol LanguageModel: Sendable {
     var providerName: String { get }
 }
 
+extension LanguageModel {
+    /// A stream made of `complete`'s reply as a single `.finished` chunk,
+    /// for models that can't stream.
+    public func completeAsStream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    continuation.yield(.finished(try await complete(request)))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
 /// A request sent to a language model.
 public struct ModelRequest: Sendable {
     /// Provider to use; `nil` means "the gateway's active provider".
@@ -111,6 +129,8 @@ public enum GatewayError: Error, Sendable {
     case invalidResponse(String)
     /// Exchanging an identity token for an Anthropic access token failed.
     case workloadIdentity(String)
+    /// A streamed reply ended without its final chunk.
+    case incompleteStream
 }
 
 extension GatewayError: CustomStringConvertible, LocalizedError {
@@ -130,6 +150,8 @@ extension GatewayError: CustomStringConvertible, LocalizedError {
             return "invalid response from the model provider: \(detail)"
         case .workloadIdentity(let detail):
             return "workload identity federation: \(detail)"
+        case .incompleteStream:
+            return "the model provider's reply ended before it was complete"
         }
     }
 

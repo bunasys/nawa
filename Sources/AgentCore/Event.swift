@@ -86,7 +86,9 @@ public struct AssistantUpdate: Sendable {
 }
 
 /// Payload for ``AgentEvent/stream(_:)`` — partial output while a turn streams.
-public enum AgentStreamUpdate: Sendable {
+public enum AgentStreamUpdate: Sendable, Equatable {
+    /// Reasoning the model shows while it thinks (not kept in the session).
+    case thinkingDelta(String)
     case textDelta(String)
     case toolCallStart(ToolCall)
     case toolCallArgumentsDelta(id: String, partialJSON: String)

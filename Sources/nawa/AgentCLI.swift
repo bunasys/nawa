@@ -170,7 +170,8 @@ struct AgentCLI {
     /// by the same provider as the main model. `NAWA_PRICE` and
     /// `NAWA_HELPER_PRICE` (`"input,output"` USD per million tokens) turn on
     /// cost estimates. `NAWA_MAX_BUDGET_USD` stops a prompt once the session's
-    /// estimated cost reaches it, so it needs `NAWA_PRICE`.
+    /// estimated cost reaches it, so it needs `NAWA_PRICE`. Replies stream
+    /// (progress while the model thinks) unless `NAWA_STREAM=0`.
     static func defaultLoopOptions(env: [String: String] = ProcessInfo.processInfo.environment) -> LoopOptions {
         LoopOptions(
             maxBudgetUSD: maxBudget(env),
@@ -179,7 +180,8 @@ struct AgentCLI {
             compaction: Compaction(atContextTokens: 120_000, keepRecentMessages: 20),
             subAgents: true,
             helperModel: env["NAWA_HELPER_MODEL"],
-            helperPricing: pricing(env, "NAWA_HELPER_PRICE")
+            helperPricing: pricing(env, "NAWA_HELPER_PRICE"),
+            streamReplies: env["NAWA_STREAM"] != "0"
         )
     }
 

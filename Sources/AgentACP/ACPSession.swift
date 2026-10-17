@@ -65,12 +65,13 @@ public actor ACPSession {
     private func runTurn(requestID: JSONRPCID, prompt: String, continuing: Bool) async {
         let messageID = "msg_\(UUID().uuidString.prefix(8))"
         var finalResult: AgentResult?
+        var textStreamed = false
         do {
             let stream = loop.run(prompt: prompt, continuing: continuing)
             for try await event in stream {
                 try Task.checkCancellation()
                 if case .result(let result) = event { finalResult = result }
-                await sendUpdate(for: event, messageID: messageID)
+                await sendUpdate(for: event, messageID: messageID, textStreamed: &textStreamed)
             }
             // A failed turn is a JSON-RPC error, not a stop reason: clients
             // (Waku included) show an error's message to the user, whereas
@@ -98,13 +99,16 @@ public actor ACPSession {
 
     /// Translate one `AgentEvent` into the appropriate ACP `session/update`
     /// notification(s) and emit them on the session-scoped sink.
-    private func sendUpdate(for event: AgentEvent, messageID: String) async {
+    /// `textStreamed` says whether the current model call's text already
+    /// went out as stream deltas, so its `.assistant` doesn't repeat it.
+    private func sendUpdate(for event: AgentEvent, messageID: String, textStreamed: inout Bool) async {
         switch event {
         case .initEvent:
             // No wire notification for the init event; it is internal.
             break
         case .assistant(let update):
-            if !update.text.isEmpty {
+            defer { textStreamed = false }
+            if !update.text.isEmpty, !textStreamed {
                 let payload = ACPSessionUpdate.messageChunk(
                     kind: .agentMessageChunk,
                     messageID: messageID,
@@ -151,13 +155,22 @@ public actor ACPSession {
         case .stream(let update):
             switch update {
             case .textDelta(let delta):
+                textStreamed = true
                 let payload = ACPSessionUpdate.messageChunk(
                     kind: .agentMessageChunk,
                     messageID: messageID,
                     content: .text(delta)
                 )
                 await emitUpdate(payload)
-            default:
+            case .thinkingDelta(let delta):
+                let payload = ACPSessionUpdate.messageChunk(
+                    kind: .agentThoughtChunk,
+                    messageID: messageID,
+                    content: .text(delta)
+                )
+                await emitUpdate(payload)
+            case .toolCallStart, .toolCallArgumentsDelta:
+                // The tool call is announced with the finished turn.
                 break
             }
         case .informational:

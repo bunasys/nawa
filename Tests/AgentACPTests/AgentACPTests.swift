@@ -85,7 +85,7 @@ final class ModelRecorder: LanguageModel, Sendable {
     }
 
     func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
-        AsyncThrowingStream { $0.finish() }
+        completeAsStream(request)
     }
 
     func listModels() async throws -> [ModelSummary] { [] }
@@ -145,7 +145,7 @@ struct UnauthorizedModel: LanguageModel {
     }
 
     func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
-        AsyncThrowingStream { $0.finish() }
+        completeAsStream(request)
     }
 
     func listModels() async throws -> [ModelSummary] { [] }
@@ -265,5 +265,55 @@ struct ACPSubAgentProgressTests {
     func subAgentResultIsLeftToTheToolResult() {
         let result = AgentResult(kind: .success, text: "x", usage: .zero, numTurns: 0, sessionID: "s")
         #expect(ACPSession.subAgentProgress(SubAgentUpdate(callID: "c1", model: nil, event: .result(result))) == nil)
+    }
+}
+
+/// Streams some reasoning and the reply "Hello" in two pieces.
+struct StreamingReplyModel: LanguageModel {
+    let providerName = "streaming"
+
+    func complete(_ request: ModelRequest) async throws -> ModelResponse {
+        ModelResponse(message: Message(role: .assistant, text: "Hello"), finishReason: .endTurn)
+    }
+
+    func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
+        AsyncThrowingStream { continuation in
+            for chunk: StreamChunk in [.thinkingDelta("hmm"), .textDelta("Hel"), .textDelta("lo")] { continuation.yield(chunk) }
+            continuation.yield(.finished(ModelResponse(message: Message(role: .assistant, text: "Hello"), finishReason: .endTurn)))
+            continuation.finish()
+        }
+    }
+
+    func listModels() async throws -> [ModelSummary] { [] }
+}
+
+struct StreamingReplyFactory: ACPSessionFactory {
+    func makeLoop(sessionID: String, cwd: String, mcpServers: [MCPServerConfig]) async throws -> AgentLoop {
+        AgentLoop(gateway: StreamingReplyModel(), tools: ToolRegistry([]), cwd: cwd)
+    }
+}
+
+@Suite(.timeLimit(.minutes(1)))
+struct ACPStreamingTests {
+    @Test
+    func reasoningIsAThoughtAndStreamedTextIsNotSentTwice() async throws {
+        let connection = ACPConnection(connectionID: "test", factory: StreamingReplyFactory(), routing: .singleStream)
+        var outbound = await connection.outbound.makeAsyncIterator()
+        await connection.handle(.request(JSONRPCRequest(method: "session/new", id: 1, params: .object(["cwd": .string("/tmp")]))))
+        let sessionID = try #require(await outbound.next()?.json.objectValue?["result"]?.objectValue?["sessionId"]?.stringValue)
+
+        await connection.handle(.request(JSONRPCRequest(method: "session/prompt", id: 2, params: .object([
+            "sessionId": .string(sessionID),
+            "prompt": .array([.object(["type": .string("text"), "text": .string("hi")])]),
+        ]))))
+        var chunks: [String] = []
+        while let message = await outbound.next(), message.id != 2 {
+            guard let update = message.json.objectValue?["params"]?.objectValue?["update"]?.objectValue,
+                  let kind = update["sessionUpdate"]?.stringValue, kind.hasSuffix("_chunk"),
+                  let text = update["content"]?.objectValue?["text"]?.stringValue
+            else { continue }
+            chunks.append("\(kind):\(text)")
+        }
+        #expect(chunks == ["agent_thought_chunk:hmm", "agent_message_chunk:Hel", "agent_message_chunk:lo"])
     }
 }

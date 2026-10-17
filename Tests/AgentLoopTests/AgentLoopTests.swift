@@ -28,7 +28,7 @@ final class ScriptedModel: LanguageModel, @unchecked Sendable {
     }
 
     func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
-        AsyncThrowingStream { $0.finish() }
+        completeAsStream(request)
     }
 
     func listModels() async throws -> [ModelSummary] { [] }
@@ -312,6 +312,57 @@ func toolCallResponse(_ call: ToolCall, usage: Usage = .zero) -> ModelResponse {
 }
 
 /// The event's case name, for comparing event sequences.
+/// Streams the given chunks; `complete` answers "not streamed".
+struct StreamingModel: LanguageModel {
+    let providerName = "streaming"
+    let chunks: [StreamChunk]
+
+    func complete(_ request: ModelRequest) async throws -> ModelResponse {
+        ModelResponse(message: Message(role: .assistant, text: "not streamed"), finishReason: .endTurn)
+    }
+
+    func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
+        AsyncThrowingStream { continuation in
+            for chunk in chunks { continuation.yield(chunk) }
+            continuation.finish()
+        }
+    }
+
+    func listModels() async throws -> [ModelSummary] { [] }
+}
+
+@Suite
+struct StreamingLoopTests {
+    static let reply = ModelResponse(message: Message(role: .assistant, text: "Hello"), finishReason: .endTurn)
+
+    @Test
+    func deltasArriveAsStreamEventsBeforeTheTurn() async throws {
+        let model = StreamingModel(chunks: [.thinkingDelta("hmm"), .textDelta("Hel"), .textDelta("lo"), .finished(Self.reply)])
+        var events: [AgentEvent] = []
+        for try await event in AgentLoop(gateway: model, tools: ToolRegistry([])).run(prompt: "hi") { events.append(event) }
+
+        let updates = events.compactMap { if case .stream(let update) = $0 { update } else { nil } }
+        #expect(updates == [.thinkingDelta("hmm"), .textDelta("Hel"), .textDelta("lo")])
+        #expect(events.map(kind) == ["init", "stream", "stream", "stream", "assistant", "result"])
+        if case .result(let result) = events.last { #expect(result.text == "Hello") }
+    }
+
+    @Test
+    func aStreamWithoutItsReplyFailsTheRun() async throws {
+        let model = StreamingModel(chunks: [.textDelta("Hel")])
+        let result = try await finalResult(AgentLoop(gateway: model, tools: ToolRegistry([])).run(prompt: "hi"))
+        #expect(result.kind == .errorDuringExecution)
+        #expect(result.errorMessage?.contains("ended before") == true)
+    }
+
+    @Test
+    func streamingCanBeTurnedOff() async throws {
+        let model = StreamingModel(chunks: [.finished(Self.reply)])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([]), options: LoopOptions(streamReplies: false))
+        #expect(try await finalResult(loop.run(prompt: "hi")).text == "not streamed")
+    }
+}
+
 func kind(_ event: AgentEvent) -> String {
     switch event {
     case .initEvent: "init"
