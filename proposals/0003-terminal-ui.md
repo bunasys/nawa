@@ -1,6 +1,6 @@
 # 0003: A terminal UI for `nawa repl`
 
-- Status: Accepted
+- Status: Implemented
 - Depends on: none
 
 ## Summary
@@ -399,8 +399,8 @@ Each step leaves `swift build` and `swift test` green.
    (`SlashCommand`, shared by the inline UI and plain mode). They run at
    once, even during a turn, except `/clear`, which waits for it. The
    footer's context fill already landed in step 2.
-5. Update AGENTS.md (layout + Running), README and the `nawa` usage text,
-   and set this proposal's status.
+5. *(done)* Update AGENTS.md (layout + Running), README and the `nawa`
+   usage text, and set this proposal's status.
 
 ## Decisions
 

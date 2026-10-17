@@ -149,7 +149,7 @@ struct AgentCLI {
             print("Usage: nawa [serve|acp|repl|config|provider list]")
             print("  serve  — start the ACP server (streamable HTTP + WebSocket) on :7878")
             print("  acp    — speak ACP over stdio (for editors and Waku that launch the agent)")
-            print("  repl [--plain] — chat with the agent in the terminal (--plain: line mode)")
+            print("  repl [--plain] — chat with the agent in the terminal (--plain: line mode; /help inside lists commands)")
             print("  config — configure a provider (OpenAI-compatible or Anthropic) for the current directory")
             print("  provider list [--json] — list the active provider's models")
         }

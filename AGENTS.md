@@ -75,7 +75,9 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   resizes; Enter during a run queues, Esc / Ctrl-C interrupt (ending the
   run's stream cancels it). `InlineScreen` draws each frame as one string
   of relative moves (no alternate screen); `LiveRegion.swift` lays out the
-  status line and the prompt box. `Terminal` is the only file touching
+  status line and the prompt box. `SlashCommand` (`/help`, `/clear`,
+  `/cost`, `/tools`, `/exit`) runs the same in both UIs; `/clear` calls
+  `ChatSession.reset`. `Terminal` is the only file touching
   termios, ioctl and signals. Tests replay frames on `VirtualTerminal`.
   `PlainChat` is line mode
   (pipes, `TERM=dumb`); it turns Shift-Enter
@@ -94,8 +96,8 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `ConfigCommand.swift`). `WakuCompatibility.swift` implements the Kimi Code
   CLI commands Waku calls, so Nawa can stand in for Kimi Code inside Waku.
   In `acp` mode stdout carries the protocol: never `print` there.
-  `repl` builds a `ChatSession` from an `AgentLoop` and hands it to
-  `AgentTUI`.
+  `repl` builds a `ChatSession` from an `AgentLoop` (a fresh one on
+  `/clear`) and hands it to `AgentTUI`.
 - `Tests/` — Swift Testing suites, one per module.
 - `proposals/` — design proposals for larger changes (`NNNN-title.md`; format
   and index in `proposals/README.md`). Read the relevant one before building

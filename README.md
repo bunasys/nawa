@@ -87,6 +87,12 @@ swift run nawa acp     # ACP over stdio (for clients that launch the agent)
 swift run nawa repl    # chat in the terminal (Esc interrupts; --plain for line mode)
 ```
 
+In `repl`, Enter sends (prompts typed during a turn wait their turn),
+Alt-Enter or Ctrl-J adds a newline, Esc or Ctrl-C interrupts, and Ctrl-D
+on an empty prompt quits. `/help` lists the commands: `/clear` starts a
+new conversation, `/cost` shows tokens and cost so far, `/tools` lists
+the agent's tools, `/exit` quits.
+
 Replies stream: while the model works, `repl` shows whether it is
 thinking or writing, a running token estimate and the newest lines of
 its reasoning or reply, and ACP clients get `agent_thought_chunk` /
