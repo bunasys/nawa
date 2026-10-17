@@ -12,15 +12,19 @@ public struct ChatSession: Sendable {
     public var header: SessionHeader
     /// Context-fill denominator (the compaction threshold), if any.
     public var contextLimit: Int?
+    /// Names of the tools the agent can call (`/tools`).
+    public var tools: [String]
 
     public init(
         header: SessionHeader,
         contextLimit: Int? = nil,
+        tools: [String] = [],
         send: @escaping @Sendable (String) -> AsyncThrowingStream<AgentEvent, any Error>,
         reset: @escaping @Sendable () -> Void = {}
     ) {
         self.header = header
         self.contextLimit = contextLimit
+        self.tools = tools
         self.send = send
         self.reset = reset
     }

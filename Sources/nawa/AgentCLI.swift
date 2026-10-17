@@ -1,3 +1,4 @@
+import Synchronization
 import AgentACP
 import AgentCore
 import AgentGateway
@@ -261,12 +262,16 @@ struct AgentCLI {
         let directory = WorkingDirectory.defaultURL
         // No turn cap, like Claude Code: the loop check (LoopOptions.loopCheckAfterTurns)
         // stops a stuck run, and NAWA_MAX_BUDGET_USD caps the spend.
-        let loop = AgentLoop(
-            gateway: gateway,
-            tools: ToolRegistry(builtInTools(workingDirectory: directory)),
-            systemPrompt: instructions?.text,
-            options: options
-        )
+        @Sendable func makeLoop() -> AgentLoop {
+            AgentLoop(
+                gateway: gateway,
+                tools: ToolRegistry(builtInTools(workingDirectory: directory)),
+                systemPrompt: instructions?.text,
+                options: options
+            )
+        }
+        // `/clear` swaps in a fresh loop: a new conversation, same tools.
+        let loop = Mutex(makeLoop())
         let session = ChatSession(
             header: SessionHeader(
                 provider: gateway.activeProvider?.name,
@@ -275,7 +280,9 @@ struct AgentCLI {
                 hasInstructions: instructions != nil
             ),
             contextLimit: options.compaction?.atContextTokens,
-            send: { prompt in loop.run(prompt: prompt, continuing: true) }
+            tools: loop.withLock { $0.toolDefinitions.map(\.name) },
+            send: { prompt in loop.withLock { $0 }.run(prompt: prompt, continuing: true) },
+            reset: { loop.withLock { $0 = makeLoop() } }
         )
         try await ChatApp.run(session, mode: mode, maxTurns: options.maxTurns)
     }

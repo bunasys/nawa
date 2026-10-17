@@ -395,8 +395,10 @@ Each step leaves `swift build` and `swift test` green.
    them Ctrl-C could not stop a turn. `AgentLoop` now answers tool calls
    left unanswered by an interrupt (as errors) before the next prompt, as
    providers reject a conversation with dangling calls.
-4. Slash commands (`/clear`, `/help`, …). The footer's context fill
-   already landed in step 2.
+4. *(done)* Slash commands: `/help`, `/clear`, `/cost`, `/tools`, `/exit`
+   (`SlashCommand`, shared by the inline UI and plain mode). They run at
+   once, even during a turn, except `/clear`, which waits for it. The
+   footer's context fill already landed in step 2.
 5. Update AGENTS.md (layout + Running), README and the `nawa` usage text,
    and set this proposal's status.
 

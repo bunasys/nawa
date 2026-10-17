@@ -192,8 +192,25 @@ final class InlineChat {
         default:
             guard case .submit(let text) = editor.apply(key) else { return }
             guard !text.allSatisfy(\.isWhitespace) else { return }
-            if current == nil { start(text) } else { queued.append(text) }
+            if let command = SlashCommand(text) {
+                run(command)
+            } else if current == nil {
+                start(text)
+            } else {
+                queued.append(text)
+            }
         }
+    }
+
+    /// Commands run at once, even during a turn; they are not queued.
+    private func run(_ command: SlashCommand) {
+        let (blocks, effect) = command.perform(stats: transcript.stats, session: session, busy: current != nil)
+        switch effect {
+        case .none: break
+        case .cleared: transcript = Transcript(maxTurns: transcript.maxTurns)
+        case .quit: quitting = true
+        }
+        commit(blocks)
     }
 
     // MARK: - Runs
@@ -293,7 +310,7 @@ final class InlineChat {
         let hint: String? = if quitArmed {
             "press ctrl-c again to quit"
         } else if transcript.stats.usage.total == 0 {
-            "alt-enter for a newline · ctrl-d to quit"
+            "/help for commands · alt-enter for a newline"
         } else {
             nil
         }

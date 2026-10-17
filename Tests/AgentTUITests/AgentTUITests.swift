@@ -585,7 +585,7 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         let output = await run(scripted([turn("Hi.", session: 10), .result(result())]), input: ["hello"], echoPrompts: false)
         #expect(output == """
              nawa · ~/p
-            Type a prompt and press Enter; Ctrl-D quits.
+            Type a prompt and press Enter; /help lists commands, Ctrl-D quits.
             ● Hi.
              10 tokens · context 1%
 
@@ -617,5 +617,66 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
     @Test func ordinaryTextIsUntouched() {
         let line = "array[27] and [13;2] stay as they are"
         #expect(PlainChat.modifiedEnterAsNewline(line) == line)
+    }
+}
+
+@Suite struct SlashCommandTests {
+    @Test func parsesCommandsAndLeavesPromptsAlone() {
+        #expect(SlashCommand("/help") == .help)
+        #expect(SlashCommand("  /CLEAR  ") == .clear)
+        #expect(SlashCommand("/cost please") == .cost)
+        #expect(SlashCommand("/frobnicate") == .unknown("/frobnicate"))
+        #expect(SlashCommand("fix /help") == nil)
+        #expect(SlashCommand("/usr/bin/env is missing") == nil)
+        #expect(SlashCommand("/") == nil)
+    }
+
+    @Test func clearResetsTheSessionUnlessARunIsBusy() {
+        final class Resets: @unchecked Sendable { var count = 0 }
+        let resets = Resets()
+        let session = ChatSession(header: SessionHeader(directory: "~"), send: { _ in AsyncThrowingStream { $0.finish() } }, reset: { resets.count += 1 })
+
+        let busy = SlashCommand.clear.perform(stats: SessionStats(), session: session, busy: true)
+        #expect(busy.effect == .none)
+        #expect(resets.count == 0)
+
+        let idle = SlashCommand.clear.perform(stats: SessionStats(), session: session, busy: false)
+        #expect(idle.effect == .cleared)
+        #expect(resets.count == 1)
+    }
+
+    @Test func costBreaksTheTokensDown() {
+        var stats = SessionStats()
+        stats.usage = Usage(inputTokens: 2100, outputTokens: 500, cacheReadTokens: 9800)
+        stats.cost = 0.012
+        stats.contextTokens = 90
+        #expect(SlashCommand.costReport(stats, contextLimit: 1000) == "12.4k tokens: 2.1k input, 9.8k cached, 500 output · $0.012 · context 9%")
+        #expect(SlashCommand.costReport(SessionStats(), contextLimit: nil) == "nothing spent yet")
+    }
+
+    @Test func toolsListsTheSessionsTools() {
+        let session = ChatSession(header: SessionHeader(directory: "~"), tools: ["shell", "read_file"], send: { _ in AsyncThrowingStream { $0.finish() } })
+        #expect(SlashCommand.tools.perform(stats: SessionStats(), session: session, busy: false).blocks == [.note("2 tools: shell, read_file")])
+    }
+
+    @Test func plainModeRunsCommandsInsteadOfSendingThem() async {
+        final class Sent: @unchecked Sendable { var prompts: [String] = [] }
+        let sent = Sent()
+        let session = ChatSession(header: SessionHeader(directory: "~/p"), send: { prompt in
+            sent.prompts.append(prompt)
+            return AsyncThrowingStream { $0.finish() }
+        })
+        final class Sink: @unchecked Sendable { var text = "" }
+        let sink = Sink()
+        var lines = ["/tools", "/nope", "/exit", "never sent"][...]
+        await PlainChat(session: session, layout: Layout(columns: 80), echoPrompts: true) { sink.text += $0 }.run { lines.popFirst() }
+
+        #expect(sent.prompts.isEmpty)
+        #expect(sink.text == """
+             nawa · ~/p
+            · no tools
+            ⚠ unknown command /nope; /help lists them
+
+            """)
     }
 }

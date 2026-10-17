@@ -260,7 +260,7 @@ public final class AgentLoop: @unchecked Sendable {
 
     /// The registry's tools plus the ones the loop itself provides. The order
     /// never changes between turns, so the request prefix stays cacheable.
-    private var toolDefinitions: [ToolDefinition] {
+    public var toolDefinitions: [ToolDefinition] {
         var definitions = tools.definitions
         if options.subAgents { definitions.append(Self.taskDefinition) }
         if options.compaction != nil { definitions.append(Self.rememberDefinition) }

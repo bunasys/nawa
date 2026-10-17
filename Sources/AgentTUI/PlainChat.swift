@@ -25,11 +25,18 @@ public struct PlainChat {
     public func run(readLine: () -> String?) async {
         var transcript = Transcript()
         emit([layout.header(session.header)])
-        if !echoPrompts { emit(["Type a prompt and press Enter; Ctrl-D quits."]) }
+        if !echoPrompts { emit(["Type a prompt and press Enter; /help lists commands, Ctrl-D quits."]) }
 
         while let line = readLine() {
             let prompt = Self.modifiedEnterAsNewline(line)
             guard !prompt.allSatisfy(\.isWhitespace) else { continue }
+            if let command = SlashCommand(prompt) {
+                let (blocks, effect) = command.perform(stats: transcript.stats, session: session, busy: false)
+                emit(blocks)
+                if effect == .cleared { transcript = Transcript(maxTurns: transcript.maxTurns) }
+                if effect == .quit { return }
+                continue
+            }
             let promptBlocks = transcript.submit(prompt)
             if echoPrompts { emit(promptBlocks) }
 

@@ -276,6 +276,25 @@ final class FakeTerminal: TerminalIO {
         #expect(quit.screen.screen == " nawa · ~/p\n")
     }
 
+    @Test func slashCommandsRunInPlaceAndExitQuits() async {
+        let terminal = FakeTerminal()
+        let chat = InlineChat(session: session { prompt in [turn("re \(prompt)", session: 10), .result(result())] }, terminal: terminal, color: false)
+        let (keys, continuation) = AsyncStream<[Key]>.makeStream()
+        let task = Task { await chat.run(keys: keys) }
+        continuation.yield([.text("hi"), .enter, .text("/clear"), .enter])
+        while !terminal.output.contains("re hi") { await Task.yield() }
+        continuation.yield([.text("/clear"), .enter, .text("/exit"), .enter])
+        await task.value
+        continuation.finish()
+        #expect(terminal.screen.screen.hasSuffix("""
+            › hi
+            ⚠ /clear waits for the turn to end; esc interrupts it
+            ● re hi
+            · new conversation
+
+            """))
+    }
+
     @Test func theLiveRegionShowsTheBoxAndTheHint() async {
         // Input that stays open: the frame drawn so far is the idle prompt.
         let terminal = FakeTerminal(columns: 30)
@@ -287,7 +306,7 @@ final class FakeTerminal: TerminalIO {
         let screen = terminal.screen
         let rule = String(repeating: "─", count: 27)
         let rows = screen.screen.split(separator: "\n").suffix(4).map(String.init)
-        #expect(rows == ["╭\(rule)╮", "│ › hey" + String(repeating: " ", count: 20) + " │", "╰\(rule)╯", " alt-enter for a newline · c…"])
+        #expect(rows == ["╭\(rule)╮", "│ › hey" + String(repeating: " ", count: 20) + " │", "╰\(rule)╯", " /help for commands · alt-en…"])
         continuation.finish()
         await task.value
     }
