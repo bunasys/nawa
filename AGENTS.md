@@ -42,7 +42,10 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   directory, root-first / nearest-last so the closest file wins.
 - `Sources/AgentLoop` — `AgentLoop`: the Runner/Event loop. Drives a session
   (init event → turns → tool execution → result), with maxTurns/maxBudget
-  caps, usage accounting, and cost estimates. `LoopOptions` also turns on
+  caps, usage accounting, and cost estimates. There is no turn cap by
+  default: from turn 50 (`loopCheckAfterTurns`) `LoopDetector` stops a run
+  whose last 10 turns repeat the same tool calls with the same results 3
+  times. `LoopOptions` also turns on
   the token savers: `keepToolResults` (clear old tool output in batches),
   `compaction` (summarize older messages; adds a `remember` tool whose notes
   survive), `subAgents` (a `task` tool running a fresh child loop), and
@@ -121,6 +124,8 @@ keeps cache reads/writes apart from fresh input; `Pricing` prices them.
 `NAWA_HELPER_MODEL` sets the helper model for `serve` / `acp` / `repl`;
 `NAWA_PRICE` and `NAWA_HELPER_PRICE` (`"input,output"` USD per million
 tokens) turn on cost estimates for the main and helper models.
+`NAWA_MAX_BUDGET_USD` stops a prompt once the session's estimated cost
+reaches it (needs `NAWA_PRICE`).
 
 ## Working with this repo (guidance for agents)
 

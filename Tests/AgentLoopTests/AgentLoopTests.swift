@@ -39,6 +39,16 @@ struct EchoTool: Tool {
     func run(arguments: JSON) async throws -> String { arguments.objectValue?["text"]?.stringValue ?? "" }
 }
 
+/// Returns a different number on every call, like a build whose errors change.
+final class CountingTool: Tool, @unchecked Sendable {
+    var calls = 0
+    var definition: ToolDefinition { ToolDefinition(name: "count", description: "", parameters: .object([:])) }
+    func run(arguments: JSON) async throws -> String {
+        calls += 1
+        return "\(calls)"
+    }
+}
+
 struct AgentLoopTests {
     @Test
     func loopRunsToCompletionWithNoToolCalls() async throws {
@@ -81,6 +91,47 @@ struct AgentLoopTests {
         #expect(second.isSuccess)
         #expect(second.text == "second")
         #expect(second.numTurns == 1)
+    }
+
+    @Test
+    func repeatingTheSameToolCallIsStoppedOnceTheCheckStarts() async throws {
+        let call = ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("same")]))
+        let model = ScriptedModel(responses: [toolCallResponse(call)])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: LoopOptions(loopCheckAfterTurns: 5))
+
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        // The repeats are visible by turn 3, but the check waits for turn 5.
+        #expect(result.kind == .errorDuringExecution)
+        #expect(result.numTurns == 5)
+        #expect(result.errorMessage?.contains("echo") == true)
+    }
+
+    @Test
+    func aCycleOfTwoTurnsCountsAsALoop() async throws {
+        let ping = ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("ping")]))
+        let pong = ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("pong")]))
+        let model = ScriptedModel(responses: [ping, pong, ping, pong, ping, pong].map { toolCallResponse($0) })
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: LoopOptions(loopCheckAfterTurns: 1))
+
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.kind == .errorDuringExecution)
+        #expect(result.numTurns == 5)
+    }
+
+    @Test
+    func theSameCallWithChangingResultsIsProgressNotALoop() async throws {
+        let call = ToolCall(id: "c1", name: "count", arguments: .object([:]))
+        var responses = Array(repeating: toolCallResponse(call), count: 12)
+        responses.append(ModelResponse(message: Message(role: .assistant, text: "done")))
+        let model = ScriptedModel(responses: responses)
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([CountingTool()]), options: LoopOptions(loopCheckAfterTurns: 1))
+
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.isSuccess)
+        #expect(result.numTurns == 12)
     }
 
     @Test

@@ -167,9 +167,11 @@ struct AgentCLI {
     /// names a cheaper model for sub-agents and summaries; it must be served
     /// by the same provider as the main model. `NAWA_PRICE` and
     /// `NAWA_HELPER_PRICE` (`"input,output"` USD per million tokens) turn on
-    /// cost estimates.
+    /// cost estimates. `NAWA_MAX_BUDGET_USD` stops a prompt once the session's
+    /// estimated cost reaches it, so it needs `NAWA_PRICE`.
     static func defaultLoopOptions(env: [String: String] = ProcessInfo.processInfo.environment) -> LoopOptions {
         LoopOptions(
+            maxBudgetUSD: maxBudget(env),
             pricing: pricing(env, "NAWA_PRICE"),
             keepToolResults: 20,
             compaction: Compaction(atContextTokens: 120_000, keepRecentMessages: 20),
@@ -177,6 +179,18 @@ struct AgentCLI {
             helperModel: env["NAWA_HELPER_MODEL"],
             helperPricing: pricing(env, "NAWA_HELPER_PRICE")
         )
+    }
+
+    private static func maxBudget(_ env: [String: String]) -> Double? {
+        guard let text = env["NAWA_MAX_BUDGET_USD"] else { return nil }
+        guard let budget = Double(text), budget > 0 else {
+            FileHandle.standardError.write(Data("nawa: ignoring NAWA_MAX_BUDGET_USD=\(text); expected a positive number of USD\n".utf8))
+            return nil
+        }
+        if env["NAWA_PRICE"] == nil {
+            FileHandle.standardError.write(Data("nawa: NAWA_MAX_BUDGET_USD has no effect without NAWA_PRICE\n".utf8))
+        }
+        return budget
     }
 
     private static func pricing(_ env: [String: String], _ name: String) -> Pricing? {
@@ -240,13 +254,13 @@ struct AgentCLI {
 
     static func repl(gateway: any LanguageModel, options: LoopOptions) async throws {
         let instructions = try? ProjectInstructions.loadForCurrentWorkingDirectory()
-        var replOptions = options
-        replOptions.maxTurns = 20
+        // No turn cap, like Claude Code: the loop check (LoopOptions.loopCheckAfterTurns)
+        // stops a stuck run, and NAWA_MAX_BUDGET_USD caps the spend.
         let loop = AgentLoop(
             gateway: gateway,
             tools: ToolRegistry(builtInTools(workingDirectory: WorkingDirectory.defaultURL)),
             systemPrompt: instructions?.text,
-            options: replOptions
+            options: options
         )
         print("Nawa REPL (type a prompt, Ctrl-D to quit)")
         while let line = readLine() {

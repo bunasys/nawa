@@ -25,7 +25,8 @@ public struct WorkingDirectory: Sendable {
 /// 3. **Tool execution** — every requested tool runs; results come back as
 ///    tool messages (user role on the wire).
 /// 4. **Repeat** — steps 2-3 repeat until the model produces a turn with no
-///    tool calls, or a limit (max turns / budget) is hit.
+///    tool calls, a limit (max turns / budget) is hit, or the run is caught
+///    repeating itself (`LoopDetector`).
 /// 5. **result event** — the final answer + cumulative usage + turn count.
 ///
 /// A reference type so that a long-lived session can be resumed: call
@@ -49,6 +50,7 @@ public final class AgentLoop: @unchecked Sendable {
     private var _session: Session
     private var _usage: Usage
     private var _turnCounter: Int
+    private var _loopDetector: LoopDetector
     private var _model: String?
     /// Size of the conversation at the last model call (prompt + reply), the
     /// signal for compaction.
@@ -85,7 +87,7 @@ public final class AgentLoop: @unchecked Sendable {
     ///   - gateway: Language model to use.
     ///   - tools: Tool registry the model may call.
     ///   - systemPrompt: Optional instructions prepended to every conversation.
-    ///   - options: Optional limits (maxTurns, maxBudgetUSD).
+    ///   - options: Optional limits (maxTurns, loop check, maxBudgetUSD).
     ///   - cwd: Working directory for tools; defaults to the process cwd.
     ///   - onEvent: Observability hook; fires for every event the loop yields.
     public init(
@@ -109,6 +111,7 @@ public final class AgentLoop: @unchecked Sendable {
         self._session = session
         self._usage = .zero
         self._turnCounter = 0
+        self._loopDetector = LoopDetector(checkAfterTurns: options.loopCheckAfterTurns)
     }
 
     /// Run a prompt, streaming `AgentEvent`s.
@@ -188,6 +191,13 @@ public final class AgentLoop: @unchecked Sendable {
                         }
                         self._session.messages.append(contentsOf: results.map { $0.asMessage })
                         continuation.yield(.toolResults(results))
+
+                        if let repeatedTools = self._loopDetector.record(calls: response.message.toolCalls, results: results) {
+                            let message = "Stopped after \(self._turnCounter) tool turns: the same \(repeatedTools.joined(separator: ", ")) calls returned the same results \(LoopDetector.repeatLimit) times in the last \(LoopDetector.window) turns."
+                            self.emit(.informational(message))
+                            self.finish(continuation, self.result(.errorDuringExecution, errorMessage: message))
+                            return
+                        }
                     }
                 } catch {
                     self.emit(.informational("Loop error: \(error)"))
@@ -199,12 +209,13 @@ public final class AgentLoop: @unchecked Sendable {
         }
     }
 
-    /// Starts a run: appends the prompt and resets the turn counter, so
-    /// `maxTurns` caps each prompt rather than the whole conversation.
+    /// Starts a run: appends the prompt and resets the turn counter and the
+    /// loop check, so both apply to each prompt rather than the whole conversation.
     private func appendUser(_ prompt: String) {
         lock.lock(); defer { lock.unlock() }
         _session.append(Message(role: .user, text: prompt))
         _turnCounter = 0
+        _loopDetector.reset()
     }
 
     private func result(
@@ -482,6 +493,9 @@ public struct LoopOptions: Sendable {
     // No mutable defaults in a Sendable struct — everything is set via init.
     /// Maximum number of tool-use turns. Nil = unlimited.
     public var maxTurns: Int?
+    /// From this many tool turns on, stop a run that keeps repeating the same
+    /// tool calls with the same results (see `LoopDetector`). Nil = never check.
+    public var loopCheckAfterTurns: Int?
     /// Maximum spend in USD. Nil = unlimited.
     public var maxBudgetUSD: Double?
     /// Maximum output tokens per model call.
@@ -507,6 +521,7 @@ public struct LoopOptions: Sendable {
 
     public init(
         maxTurns: Int? = nil,
+        loopCheckAfterTurns: Int? = 50,
         maxBudgetUSD: Double? = nil,
         maxOutputTokens: Int? = nil,
         temperature: Double? = nil,
@@ -519,6 +534,7 @@ public struct LoopOptions: Sendable {
         helperPricing: Pricing? = nil
     ) {
         self.maxTurns = maxTurns
+        self.loopCheckAfterTurns = loopCheckAfterTurns
         self.maxBudgetUSD = maxBudgetUSD
         self.maxOutputTokens = maxOutputTokens
         self.temperature = temperature
