@@ -121,20 +121,30 @@ Both Linux types build everywhere and are tested on macOS too. To run the
 suite on Linux: `docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src swift:6.4 swift test`
 (slow under emulation).
 
-## Releases
+## CI and releases
 
-The version lives in `ACPServerInfo.nawa` (`Sources/AgentACP/ACPTypes.swift`);
-`nawa --version` prints it. A release tags `vX.Y.Z` on `main` and attaches
-`nawa-X.Y.Z-macos-arm64.tar.gz` and `nawa-X.Y.Z-linux-amd64.tar.gz` (each
-with a `.sha256`) to a GitHub release:
-- macOS: `swift build -c release --product nawa` (ad-hoc signed, not notarized).
-- Linux: fully static with the Swift Static Linux SDK (musl) matching the
-  `swift:6.4` image's compiler (verify its `.sig` against swift.org's keys),
-  `swift build -c release --product nawa --swift-sdk x86_64-swift-linux-musl`
-  inside `swift:6.4` on `linux/amd64`. `--static-swift-stdlib` alone still
-  needs `libcurl` on the user's machine.
-Smoke-test the Linux binary in a plain `ubuntu` container: `--version`, and
-an `initialize` line piped into `nawa acp` must get its reply and exit.
+GitHub Actions (`.github/workflows/`):
+- `ci.yml` builds and tests on every push to `main` and every pull request:
+  macOS (`macos-26`, its default Xcode) and Linux (`swift:6.4.1` container).
+- `release.yml` publishes a release when a tag `vX.Y.Z` is pushed: it runs
+  `ci.yml`, builds `nawa-X.Y.Z-macos-arm64.tar.gz` (ad-hoc signed, not
+  notarized) and `nawa-X.Y.Z-linux-amd64.tar.gz` (fully static, Swift Static
+  Linux SDK / musl), each with a `.sha256`, checks `--version` and an ACP
+  `initialize` on both, then creates the GitHub release with generated notes
+  (or adds the files to one that already exists, e.g. written by hand).
+  Run it by hand from the Actions tab for a dry run that publishes nothing.
+
+To release: set the version in `ACPServerInfo.nawa`
+(`Sources/AgentACP/ACPTypes.swift`; `nawa --version` prints it), commit,
+push `main`, then `git tag -a vX.Y.Z -m "Nawa X.Y.Z" && git push origin vX.Y.Z`.
+The run fails if the tag and the version differ.
+
+The Static Linux SDK must match the container's compiler exactly: to move
+to a newer Swift, change the `swift:` image in both workflows together with
+`STATIC_SDK_URL` and `STATIC_SDK_CHECKSUM` in `release.yml` (verify the
+SDK's `.sig` against swift.org's keys before taking its checksum).
+`--static-swift-stdlib` alone is not enough: that binary still needs
+`libcurl` on the user's machine.
 
 ## Running
 

@@ -1,5 +1,7 @@
 # Nawa (نواة) — a small, CUPID-built agent harness in Swift
 
+[![CI](https://github.com/bunasys/nawa/actions/workflows/ci.yml/badge.svg)](https://github.com/bunasys/nawa/actions/workflows/ci.yml)
+
 **Nawa** (نواة, "kernel") is the agent harness at the core of Buna Systems' agent work, built as
 a SwiftPM package. It embeds the agent loop, a configurable multi-provider AI
 gateway, tools + MCP, AGENTS.md loading, and the ACP protocol (streamable HTTP

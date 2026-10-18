@@ -1,0 +1,130 @@
+# Push a tag `vX.Y.Z` on main to publish a release: tests run, then the
+# macOS arm64 and static Linux amd64 binaries are built, checked and
+# attached to the GitHub release `vX.Y.Z` (created with generated notes,
+# or added to if it already exists). The tag must match the version
+# `nawa --version` prints (ACPServerInfo.nawa in Sources/AgentACP/ACPTypes.swift).
+# Run it by hand (Actions > Release > Run workflow) for a dry run: the same
+# builds and checks, binaries kept as run artifacts, nothing published.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  macos:
+    name: Build macOS (arm64)
+    needs: test
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: swift build -c release --product nawa
+      - name: Check
+        run: |
+          bin=.build/release/nawa
+          version="$("$bin" --version | sed 's/^nawa //')"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match nawa --version ($version)"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}'
+          test "$(printf '%s\n' "$init" | "$bin" acp | grep -c '"result"')" = 1
+      - name: Package
+        run: |
+          name="nawa-$VERSION-macos-arm64"
+          mkdir -p stage dist
+          cp .build/release/nawa README.md LICENSE stage/
+          COPYFILE_DISABLE=1 tar czf "dist/$name.tar.gz" --uid 0 --gid 0 --uname root --gname root -C stage nawa README.md LICENSE
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Build Linux (amd64, static)
+    needs: test
+    runs-on: ubuntu-latest
+    # The Static Linux SDK below only works with this exact compiler.
+    container: swift:6.4.1
+    timeout-minutes: 45
+    env:
+      # Pinned by checksum: the file whose signature was checked against
+      # swift.org's release key when this was set up.
+      STATIC_SDK_URL: https://download.swift.org/swift-6.4.1-release/static-sdk/swift-6.4.1-RELEASE/swift-6.4.1-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz
+      STATIC_SDK_CHECKSUM: cef5592d7430ed3c5ae1ddda479849c6f5252bd94a5723db1559f984caf38a7c
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the Static Linux SDK
+        run: swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_CHECKSUM"
+      - name: Build
+        run: |
+          swift build -c release --product nawa --swift-sdk x86_64-swift-linux-musl
+          bin="$(swift build -c release --swift-sdk x86_64-swift-linux-musl --show-bin-path)/nawa"
+          mkdir -p stage
+          strip -o stage/nawa "$bin"
+      - name: Check
+        run: |
+          bin=stage/nawa
+          # Fully static: no interpreter, no shared libraries.
+          if ldd "$bin" 2>/dev/null | grep -q '=>'; then ldd "$bin"; exit 1; fi
+          version="$("$bin" --version | sed 's/^nawa //')"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match nawa --version ($version)"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}'
+          test "$(printf '%s\n' "$init" | timeout 10 "$bin" acp | grep -c '"result"')" = 1
+      - name: Package
+        run: |
+          name="nawa-$VERSION-linux-amd64"
+          mkdir -p dist
+          cp README.md LICENSE stage/
+          tar czf "dist/$name.tar.gz" --owner 0 --group 0 -C stage nawa README.md LICENSE
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [macos, linux]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify checksums
+        run: cd dist && sha256sum -c -- *.sha256
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+              --title "Nawa ${GITHUB_REF_NAME#v}" --generate-notes
+          fi
