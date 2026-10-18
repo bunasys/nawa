@@ -221,3 +221,6 @@ per-directory config alone the picker may be empty, and sessions use the
 model configured for the project. Approvals: Nawa does not yet ask the client
 for permission before running tools.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
