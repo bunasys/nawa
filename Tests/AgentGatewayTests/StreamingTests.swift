@@ -261,7 +261,7 @@ struct ResponseByteStreamTests {
         let host = "byte-stream.test"
         let session = StubURLProtocol.session(host: host, replies: [.init(pieces: ["data: one\n", "", "data: two\n"])])
         let (bytes, response) = try await ResponseByteStream.open(
-            URLRequest(url: URL(string: "https://\(host)/x")!), configuration: session.configuration
+            URLRequest(url: URL(string: "https://\(host)/x")!), on: session
         )
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
         #expect(try await collectText(bytes) == "data: one\ndata: two\n")
@@ -272,7 +272,7 @@ struct ResponseByteStreamTests {
         let host = "byte-stream-error.test"
         let session = StubURLProtocol.session(host: host, replies: [.init(status: 503, pieces: ["overloaded"])])
         let (bytes, response) = try await ResponseByteStream.open(
-            URLRequest(url: URL(string: "https://\(host)/x")!), configuration: session.configuration
+            URLRequest(url: URL(string: "https://\(host)/x")!), on: session
         )
         #expect((response as? HTTPURLResponse)?.statusCode == 503)
         #expect(try await collectText(bytes) == "overloaded")
@@ -283,7 +283,7 @@ struct ResponseByteStreamTests {
         // Port 1 on loopback: nothing listens there.
         await #expect(throws: (any Error).self) {
             _ = try await ResponseByteStream.open(
-                URLRequest(url: URL(string: "http://127.0.0.1:1/x")!), configuration: .ephemeral
+                URLRequest(url: URL(string: "http://127.0.0.1:1/x")!), on: URLSession(configuration: .ephemeral)
             )
         }
     }
@@ -293,7 +293,7 @@ struct ResponseByteStreamTests {
         let server = try HangingHTTPServer(firstBytes: "data: first\n")
         defer { server.close() }
         let (bytes, _) = try await ResponseByteStream.open(
-            URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/x")!), configuration: .ephemeral
+            URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/x")!), on: URLSession(configuration: .ephemeral)
         )
         // The response never ends; the first line must still come through,
         // and leaving the loop must not hang.
@@ -311,7 +311,7 @@ struct ResponseByteStreamTests {
         defer { server.close() }
         let reader = Task {
             let (bytes, _) = try await ResponseByteStream.open(
-                URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/x")!), configuration: .ephemeral
+                URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/x")!), on: URLSession(configuration: .ephemeral)
             )
             var count = 0
             for try await _ in bytes { count += 1 }
@@ -321,6 +321,88 @@ struct ResponseByteStreamTests {
         reader.cancel()
         // Either an error or an early end is fine; hanging is not.
         _ = try? await reader.value
+    }
+
+    /// Releasing a session after HTTPS aborts the process on Linux
+    /// (swift-corelibs-foundation#5203), so streams reuse one per session.
+    @Test
+    func requestsAskedOnOneSessionShareOneStreamingSession() {
+        let first = URLSession(configuration: .ephemeral)
+        let second = URLSession(configuration: .ephemeral)
+        #expect(StreamingSession.for(first) === StreamingSession.for(first))
+        #expect(StreamingSession.for(first) !== StreamingSession.for(second))
+    }
+
+    @Test
+    func aReleasedOwnersStreamingSessionServesTheNextOwnerWithTheSameSettings() {
+        // Unusual timeouts keep other tests, which run in parallel, from
+        // taking over the released entry first.
+        func session(timeout: TimeInterval) -> URLSession {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = timeout
+            return URLSession(configuration: configuration)
+        }
+        // A released URLSession is freed at once (checked on macOS and Linux),
+        // which clears the streaming session's weak reference to it.
+        var first: URLSession? = session(timeout: 123.25)
+        let streaming = StreamingSession.for(first!)
+        first = nil
+
+        #expect(StreamingSession.for(session(timeout: 123.25)) === streaming)
+        #expect(StreamingSession.for(session(timeout: 456.75)) !== streaming)
+    }
+
+    @Test
+    func sharedStreamingSessionsKeepNoCookiesCredentialsOrCache() {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 321.5
+        let stateless = StreamingSession.stateless(configuration)
+        #expect(stateless.httpCookieStorage == nil)
+        #expect(stateless.httpShouldSetCookies == false)
+        #expect(stateless.urlCredentialStorage == nil)
+        #expect(stateless.urlCache == nil)
+        #expect(stateless.timeoutIntervalForRequest == 321.5)
+        // The caller's configuration is left as it was.
+        #expect(configuration.httpCookieStorage != nil)
+    }
+
+    @Test
+    func differentProxiesDoNotShareAStreamingSession() {
+        let direct = URLSessionConfiguration.ephemeral
+        let proxied = URLSessionConfiguration.ephemeral
+        proxied.connectionProxyDictionary = ["HTTPSProxy": "proxy.example", "HTTPSPort": 8080]
+        #expect(!StreamingSession.sameSettings(direct, proxied))
+        #expect(StreamingSession.sameSettings(direct, URLSessionConfiguration.ephemeral))
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aReaderCancelledBeforeTheRequestStartsEndsAtOnce() async throws {
+        let server = try HangingHTTPServer(firstBytes: "data: first\n")
+        defer { server.close() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 789.5
+        let owner = URLSession(configuration: configuration)
+
+        let reader = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await ResponseByteStream.open(
+                URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/x")!), on: owner
+            )
+        }
+        await #expect(throws: (any Error).self) { _ = try await reader.value }
+        #expect(StreamingSession.for(owner).pendingRequests == 0)
+    }
+
+    @Test
+    func concurrentStreamsOnOneSessionEachGetTheirOwnBody() async throws {
+        let session = StubURLProtocol.session(host: "shared-a.test", replies: [.init(pieces: ["a1\n", "a2\n"])])
+        _ = StubURLProtocol.session(host: "shared-b.test", replies: [.init(pieces: ["b1\n", "b2\n"])])
+        async let a = ResponseByteStream.open(URLRequest(url: URL(string: "https://shared-a.test/x")!), on: session)
+        async let b = ResponseByteStream.open(URLRequest(url: URL(string: "https://shared-b.test/x")!), on: session)
+        let (bytesA, _) = try await a
+        let (bytesB, _) = try await b
+        #expect(try await collectText(bytesA) == "a1\na2\n")
+        #expect(try await collectText(bytesB) == "b1\nb2\n")
     }
 }
 
