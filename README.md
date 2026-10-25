@@ -145,6 +145,32 @@ env override → the saved config for the directory (for ACP, the session's
 `cwd`) → `Gateways.json` (or `NAWA_GATEWAY_CONFIG`) → OpenAI with
 `OPENAI_API_KEY`.
 
+### Fallback providers
+
+`Gateways.json` can name providers to fall back to, tried in order when the
+active one can't serve a request: a rate limit or exhausted quota (429, or
+Anthropic's "credit balance is too low"), an outage (5xx, 529), a network
+failure, or a credential or model the provider rejects (401, 402, 403, 404).
+A malformed request (other 400s) fails straight away, since it would fail
+anywhere.
+
+```json
+{
+  "activeProvider": "anthropic",
+  "providers": [
+    { "name": "anthropic", "api": "anthropic", "baseURL": "https://api.anthropic.com", "apiKey": "env:ANTHROPIC_API_KEY", "model": "claude-opus-5-5" },
+    { "name": "openrouter", "baseURL": "https://openrouter.ai/api/v1", "apiKey": "env:OPENROUTER_API_KEY", "model": "z-ai/glm-5.3" }
+  ],
+  "fallbackProviders": ["openrouter"]
+}
+```
+
+Each provider uses its own `model`, since model ids differ between providers.
+A provider that failed is skipped for a minute, so a long run doesn't wait on
+it before every call. A streamed reply fails over only before its first
+chunk. A request that names a provider (`ModelRequest.providerName`) never
+fails over. In code, pass `fallbackProviderNames` to `Gateway`.
+
 ## Anthropic
 
 Anthropic (and Anthropic-compatible gateways) use the Messages API rather

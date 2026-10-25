@@ -11,16 +11,20 @@ import Foundation
 ///     { "name": "openai",        "baseURL": "https://api.openai.com/v1",     "apiKey": "env:OPENAI_API_KEY", "model": "gpt-4o-mini" },
 ///     { "name": "local-ollama",  "baseURL": "http://localhost:11434/v1",     "apiKey": "ollama" },
 ///     { "name": "vllm",          "baseURL": "http://localhost:8000/v1",      "apiKey": "token-abc", "modelWhitelist": ["qwen2.5-7b"] }
-///   ]
+///   ],
+///   "fallbackProviders": ["openai"]
 /// }
 /// ```
 public struct GatewayConfig: Codable, Sendable, Equatable {
     public var activeProvider: String?
     public var providers: [ProviderConfig]
+    /// Tried in order when the active provider can't serve a request.
+    public var fallbackProviders: [String]?
 
-    public init(activeProvider: String? = nil, providers: [ProviderConfig] = []) {
+    public init(activeProvider: String? = nil, providers: [ProviderConfig] = [], fallbackProviders: [String]? = nil) {
         self.activeProvider = activeProvider
         self.providers = providers
+        self.fallbackProviders = fallbackProviders
     }
 
     /// Build the runnable gateway from the typed config.
@@ -38,6 +42,7 @@ public struct GatewayConfig: Codable, Sendable, Equatable {
         Gateway(
             providers: providers,
             activeProviderName: activeProvider,
+            fallbackProviderNames: fallbackProviders ?? [],
             apiKeyOverrides: apiKeyOverrides
         )
     }

@@ -168,6 +168,9 @@ public enum GatewayError: Error, Sendable {
     case workloadIdentity(String)
     /// A streamed reply ended without its final chunk.
     case incompleteStream
+    /// Every provider the gateway tried failed: one line per provider, in
+    /// the order tried.
+    case providersFailed([String])
 }
 
 extension GatewayError: CustomStringConvertible, LocalizedError {
@@ -189,6 +192,8 @@ extension GatewayError: CustomStringConvertible, LocalizedError {
             return "workload identity federation: \(detail)"
         case .incompleteStream:
             return "the model provider's reply ended before it was complete"
+        case .providersFailed(let failures):
+            return "every model provider failed: " + failures.joined(separator: "; ")
         }
     }
 

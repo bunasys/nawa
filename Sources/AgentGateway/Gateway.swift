@@ -1,5 +1,6 @@
 import AgentCore
 import Foundation
+import Synchronization
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -12,22 +13,35 @@ import FoundationNetworking
 /// provider, and performs *auto model discovery* — when no model is configured
 /// for the active provider it queries `GET /v1/models` and selects the first
 /// allowed model.
+///
+/// With `fallbackProviderNames`, a request the active provider can't serve
+/// (rate limit, exhausted quota, outage, network or credential failure; see
+/// `GatewayFailover.isProviderUnavailable`) goes to the next provider in that
+/// list. A provider that failed is skipped for `GatewayFailover.cooldown`, so
+/// a long review doesn't knock on a dead provider before every call.
 public struct Gateway: LanguageModel, Sendable {
     public var providers: [ProviderConfig]
     public var activeProviderName: String?
+    /// Providers to try, in order, when the active one can't serve a request.
+    public var fallbackProviderNames: [String]
     public var apiKeyOverrides: [String: String]
     public let session: URLSession
+    /// Shared by copies of this gateway, so they all skip a failed provider.
+    let failover: GatewayFailover
 
     public init(
         providers: [ProviderConfig] = [],
         activeProviderName: String? = nil,
+        fallbackProviderNames: [String] = [],
         apiKeyOverrides: [String: String] = [:],
         session: URLSession = .shared
     ) {
         self.providers = providers
         self.activeProviderName = activeProviderName
+        self.fallbackProviderNames = fallbackProviderNames
         self.apiKeyOverrides = apiKeyOverrides
         self.session = session
+        self.failover = GatewayFailover()
     }
 
     /// The provider the gateway routes to by default.
@@ -41,6 +55,10 @@ public struct Gateway: LanguageModel, Sendable {
     public func client(for providerName: String? = nil) throws -> any LanguageModel {
         let provider = providerName.flatMap { name in providers.first { $0.name == name } } ?? activeProvider
         guard let provider else { throw GatewayError.noProvider }
+        return client(for: provider)
+    }
+
+    private func client(for provider: ProviderConfig) -> any LanguageModel {
         let apiKey = apiKeyOverrides[provider.name] ?? provider.resolvedAPIKey
         switch provider.api ?? .openAI {
         case .openAI:
@@ -69,23 +87,23 @@ public struct Gateway: LanguageModel, Sendable {
     public var providerName: String { activeProvider?.name ?? "gateway" }
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
-        let client = try self.client(for: request.providerName)
-        let model = try await resolveModel(client: client, requested: request.model)
-        var adjusted = request
-        adjusted.model = model
-        return try await client.complete(adjusted)
+        try await withFailover(request) { provider, attempt in
+            try await client(for: provider).complete(attempt)
+        }
     }
 
+    /// Fails over like `complete`, but only until the first chunk: after
+    /// that the caller has seen part of a reply, so an error ends the stream.
     public func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let client = try self.client(for: request.providerName)
-                    let model = try await self.resolveModel(client: client, requested: request.model)
-                    var adjusted = request
-                    adjusted.model = model
-                    for try await chunk in client.stream(adjusted) {
-                        continuation.yield(chunk)
+                    var hasYielded = false
+                    try await self.withFailover(request, mayFailOver: { !hasYielded }) { provider, attempt in
+                        for try await chunk in self.client(for: provider).stream(attempt) {
+                            hasYielded = true
+                            continuation.yield(chunk)
+                        }
                     }
                     continuation.finish()
                 } catch {
@@ -94,6 +112,62 @@ public struct Gateway: LanguageModel, Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Runs `call` on each provider in the chain until one succeeds. It moves
+    /// on only when the provider is unavailable (not when the request itself
+    /// is bad) and `mayFailOver` agrees; then that provider cools down.
+    private func withFailover<T>(
+        _ request: ModelRequest,
+        mayFailOver: () -> Bool = { true },
+        _ call: (ProviderConfig, ModelRequest) async throws -> T
+    ) async throws -> T {
+        let preferred = try preferredProvider(for: request)
+        let chain = providerChain(for: request, preferred: preferred)
+        var failures: [String] = []
+        for provider in chain {
+            do {
+                // Model ids are per provider: the requested one is for the preferred provider only.
+                let isPreferred = provider.name == preferred.name
+                var attempt = request
+                attempt.model = try await model(for: provider, requested: isPreferred ? request.model : nil)
+                return try await call(provider, attempt)
+            } catch {
+                let isLast = provider.name == chain.last?.name
+                let canMoveOn = !isLast && GatewayFailover.isProviderUnavailable(error) && mayFailOver()
+                guard canMoveOn else {
+                    throw failures.isEmpty ? error : GatewayError.providersFailed(failures + ["\(provider.name): \(error)"])
+                }
+                failover.markFailed(provider.name)
+                failures.append("\(provider.name): \(error)")
+            }
+        }
+        // Not reached: the chain is never empty, and its last provider returns or throws.
+        throw GatewayError.noProvider
+    }
+
+    /// The provider a request is meant for: the one it names, else the
+    /// active one (an unknown name also means the active one, as in `client(for:)`).
+    private func preferredProvider(for request: ModelRequest) throws -> ProviderConfig {
+        let named = request.providerName.flatMap { name in providers.first { $0.name == name } }
+        guard let provider = named ?? activeProvider else { throw GatewayError.noProvider }
+        return provider
+    }
+
+    /// The providers to try, in order. A request that names a provider gets
+    /// only that one. Otherwise: the preferred provider, then the fallbacks,
+    /// with any still cooling down from a failure moved to the end (not
+    /// dropped: a provider that may have recovered beats none).
+    func providerChain(for request: ModelRequest, preferred: ProviderConfig) -> [ProviderConfig] {
+        guard request.providerName == nil else { return [preferred] }
+        var chain = [preferred]
+        for name in fallbackProviderNames where !chain.contains(where: { $0.name == name }) {
+            // A name with no provider behind it is skipped, like a fallback that is down.
+            if let fallback = providers.first(where: { $0.name == name }) { chain.append(fallback) }
+        }
+        let available = chain.filter { !failover.isCoolingDown($0.name) }
+        let coolingDown = chain.filter { failover.isCoolingDown($0.name) }
+        return available + coolingDown
     }
 
     public func listModels() async throws -> [ModelSummary] {
@@ -109,6 +183,19 @@ public struct Gateway: LanguageModel, Sendable {
         if let requested { return requested }
         if let configured = activeProvider?.model { return configured }
         return try await autoDiscover(client: client)
+    }
+
+    /// The same precedence as `resolveModel`, for any one provider.
+    private func model(for provider: ProviderConfig, requested: String?) async throws -> String {
+        if let requested { return requested }
+        if let configured = provider.model { return configured }
+        let models = try await client(for: provider).listModels()
+        let whitelist = provider.modelWhitelist
+        let candidates = models.filter { whitelist == nil || whitelist!.contains($0.id) }
+        guard let first = candidates.first ?? models.first else {
+            throw GatewayError.modelNotFound("no models advertised by \(provider.name)")
+        }
+        return first.id
     }
 
     /// Auto model discovery: list models, filter by whitelist, pick the first.
@@ -128,3 +215,41 @@ public struct Gateway: LanguageModel, Sendable {
     }
 }
 
+
+/// When the gateway moves a request to a fallback provider, and which
+/// providers it is avoiding for now.
+final class GatewayFailover: Sendable {
+    /// Long enough to ride out a rate limit window; short enough that the
+    /// preferred provider gets traffic back soon after it recovers.
+    static let cooldown: TimeInterval = 60
+
+    private let failedAt = Mutex<[String: Date]>([:])
+
+    func markFailed(_ providerName: String, now: Date = Date()) {
+        failedAt.withLock { $0[providerName] = now }
+    }
+
+    func isCoolingDown(_ providerName: String, now: Date = Date()) -> Bool {
+        guard let failed = failedAt.withLock({ $0[providerName] }) else { return false }
+        return now.timeIntervalSince(failed) < Self.cooldown
+    }
+
+    /// Whether `error` means this provider can't serve requests right now,
+    /// so another provider might. A request the provider rejected as
+    /// malformed (most 400s) would fail anywhere, so it doesn't fail over.
+    static func isProviderUnavailable(_ error: any Error) -> Bool {
+        if error is CancellationError { return false }
+        if let urlError = error as? URLError { return urlError.code != .cancelled }
+        guard let gatewayError = error as? GatewayError else { return false }
+        switch gatewayError {
+        case .httpError(let status, let body):
+            let isOutOfCredit = status == 400 && body.contains("credit balance")
+            let isUnavailable = [401, 402, 403, 404, 408, 409, 429].contains(status) || status >= 500
+            return isUnavailable || isOutOfCredit
+        case .network, .invalidResponse, .workloadIdentity, .incompleteStream:
+            return true
+        case .noProvider, .providerNotFound, .modelNotFound, .providersFailed:
+            return false
+        }
+    }
+}
