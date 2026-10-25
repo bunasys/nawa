@@ -132,7 +132,10 @@ public struct Gateway: LanguageModel, Sendable {
         let preferred = try preferredProvider(for: request)
         let chain = providerChain(for: request, preferred: preferred)
         var failures: [String] = []
+        let hasFallbacks = chain.count > 1
         for provider in chain {
+            // Cancellation never fails over, whatever the next client would do with it.
+            try Task.checkCancellation()
             do {
                 // Model ids are per provider: the requested one is for the preferred provider only.
                 let isPreferred = provider.name == preferred.name
@@ -141,7 +144,9 @@ public struct Gateway: LanguageModel, Sendable {
                 return try await call(provider, attempt)
             } catch {
                 let isUnavailable = GatewayFailover.isProviderUnavailable(error)
-                if isUnavailable {
+                // Only a request that could fail over starts a cooldown: one
+                // that stays on its provider doesn't reroute the others.
+                if isUnavailable && hasFallbacks {
                     failover.markFailed(provider.name)
                 }
                 let isLast = provider.name == chain.last?.name
@@ -255,6 +260,10 @@ final class GatewayFailover: Sendable {
         guard let gatewayError = error as? GatewayError else { return false }
         switch gatewayError {
         case .httpError(let status, let body):
+            // 404 included on purpose: a model this provider doesn't have
+            // (or no longer has) is one it can't serve, even when the caller
+            // named it. The fallback uses its own model, and the switch is
+            // reported (`ModelResponse.providerName`), so the mistake shows.
             let isOutOfCredit = status == 400 && body.contains("credit balance")
             let isUnavailable = [401, 402, 403, 404, 408, 409, 429].contains(status) || status >= 500
             return isUnavailable || isOutOfCredit

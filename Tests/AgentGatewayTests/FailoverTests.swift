@@ -164,12 +164,14 @@ struct FailoverTests {
     func aRequestThatMayNotFailOverStaysOnItsProvider() async throws {
         let (primary, fallback) = ("pinned.primary.test", "pinned.fallback.test")
         let session = StubURLProtocol.session(host: primary, replies: [.init(status: 429, pieces: ["slow down"])])
+        let gateway = gateway(primary: primary, fallback: fallback, session: session)
 
         await #expect(throws: GatewayError.self) {
-            try await gateway(primary: primary, fallback: fallback, session: session)
-                .complete(ModelRequest(messages: hello, mayFailOver: false))
+            try await gateway.complete(ModelRequest(messages: hello, mayFailOver: false))
         }
         #expect(StubURLProtocol.bodies(host: fallback).isEmpty)
+        // It stayed put, so it doesn't reroute other requests either.
+        #expect(!gateway.failover.isCoolingDown("primary"))
     }
 
     @Test
