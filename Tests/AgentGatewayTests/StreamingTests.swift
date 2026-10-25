@@ -334,6 +334,41 @@ struct ResponseByteStreamTests {
     }
 
     @Test
+    func aReleasedOwnersStreamingSessionServesTheNextOwnerWithTheSameSettings() {
+        // Unusual timeouts keep other tests, which run in parallel, from
+        // taking over the released entry first.
+        func session(timeout: TimeInterval) -> URLSession {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = timeout
+            return URLSession(configuration: configuration)
+        }
+        var first: URLSession? = session(timeout: 123.25)
+        let streaming = StreamingSession.for(first!)
+        first = nil
+
+        #expect(StreamingSession.for(session(timeout: 123.25)) === streaming)
+        #expect(StreamingSession.for(session(timeout: 456.75)) !== streaming)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aReaderCancelledBeforeTheRequestStartsEndsAtOnce() async throws {
+        let server = try HangingHTTPServer(firstBytes: "data: first\n")
+        defer { server.close() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 789.5
+        let owner = URLSession(configuration: configuration)
+
+        let reader = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await ResponseByteStream.open(
+                URLRequest(url: URL(string: "http://127.0.0.1:\(server.port)/x")!), on: owner
+            )
+        }
+        await #expect(throws: (any Error).self) { _ = try await reader.value }
+        #expect(StreamingSession.for(owner).pendingRequests == 0)
+    }
+
+    @Test
     func concurrentStreamsOnOneSessionEachGetTheirOwnBody() async throws {
         let session = StubURLProtocol.session(host: "shared-a.test", replies: [.init(pieces: ["a1\n", "a2\n"])])
         _ = StubURLProtocol.session(host: "shared-b.test", replies: [.init(pieces: ["b1\n", "b2\n"])])
