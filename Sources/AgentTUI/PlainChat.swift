@@ -40,9 +40,11 @@ public struct PlainChat {
             let promptBlocks = transcript.submit(prompt)
             if echoPrompts { emit(promptBlocks) }
 
+            var refusal: RefusalNotice?
             do {
                 for try await event in session.send(prompt) {
                     emit(transcript.reduce(event))
+                    if case .result(let result) = event { refusal = result.refusal }
                 }
                 // A stream that ends without a result was cut short.
                 emit(transcript.interrupt())
@@ -51,6 +53,14 @@ public struct PlainChat {
             }
             if transcript.stats.usage.total > 0 {
                 emit([layout.footer(transcript.stats, contextLimit: session.contextLimit)])
+            }
+            // Piped input holds prompts, not answers, so only a person is asked.
+            let someoneCanAnswer = !echoPrompts
+            if let refusal, someoneCanAnswer {
+                emit(layout.paragraph(DeclinedRequest.question(refusal), prefix: StyledSpan("? ")))
+                guard let answer = readLine() else { return }
+                let remove = DeclinedRequest.wantsRemoval(answer)
+                emit(DeclinedRequest.answer(remove: remove, notice: refusal, session: session))
             }
             if !echoPrompts { emit([StyledLine()]) }
         }

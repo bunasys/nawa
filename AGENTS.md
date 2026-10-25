@@ -29,7 +29,9 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   it), `AnthropicClient`
   (Messages API, streamed by `AnthropicStreamAssembler`, which rebuilds
   the blocks `complete` would get; keeps `thinking` blocks as
-  `ContentBlock.opaque` and sends them back unchanged; authenticates with an API key or Workload Identity
+  `ContentBlock.opaque` and sends them back unchanged; reads refusals
+  (`stop_details` → `ModelResponse.refusal`) and asks for server-side
+  fallback (see Refusals below); authenticates with an API key or Workload Identity
   Federation via `WorkloadIdentityTokenSource` in `WorkloadIdentity.swift`,
   one cached token per process), `Gateway` with multiple
   providers (each `ProviderConfig.api` is `openai` or `anthropic`) and auto model discovery (`GET /v1/models`), `ProviderConfig`,
@@ -60,7 +62,8 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   reasoning as `agent_thought_chunk`. A sub-agent's events are forwarded live as
   `AgentEvent.subAgent(SubAgentUpdate)`, tagged with the parent's `task`
   call id; ACP shows them as `tool_call_update`s of that call. A sub-agent
-  may only spend what is left of `maxBudgetUSD`.
+  may only spend what is left of `maxBudgetUSD`. A declined reply is
+  dropped and retried on `fallbackModel` (see Refusals below).
 - `Sources/AgentTUI` — the `nawa repl` chat UI (proposal 0003; depends on
   `AgentCore` only, gets the agent as a `ChatSession` of closures).
   `Transcript` reduces `AgentEvent`s to committed `Block`s (append-only
@@ -77,7 +80,8 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   of relative moves (no alternate screen); `LiveRegion.swift` lays out the
   status line and the prompt box. `SlashCommand` (`/help`, `/clear`,
   `/cost`, `/tools`, `/exit`) runs the same in both UIs; `/clear` calls
-  `ChatSession.reset`. `Terminal` is the only file touching
+  `ChatSession.reset`. After a refusal both UIs ask whether to keep the
+  declined prompt (`DeclinedRequest.swift`). `Terminal` is the only file touching
   termios, ioctl and signals. Tests replay frames on `VirtualTerminal`.
   `PlainChat` is line mode
   (pipes, `TERM=dumb`); it turns Shift-Enter
@@ -177,6 +181,30 @@ auto-discover models via `GET /v1/models` when none is configured. API keys
 may be literals or `env:NAME` references. `Gateway` only routes: environment
 fallbacks (`ANTHROPIC_WORKSPACE_ID`, the federation variables) are applied
 once at load time with `GatewayConfig.withEnvironmentDefaults()`.
+
+## Refusals
+
+A model may decline a prompt (Anthropic's safety classifiers, e.g. the
+`cyber` category, or OpenAI's `content_filter`): `StopReason.refusal`,
+an HTTP 200, not an error. The loop drops that reply, partial text and
+tool calls included, emits `AgentEvent.refusal(RefusalNotice)`, and asks
+another model:
+- On api.anthropic.com, `AnthropicClient` sends `fallbacks: "default"`
+  (beta `server-side-fallback-2026-07-01`), so the server retries on the
+  model Anthropic recommends for the category and the reply arrives with
+  a `fallback` block (kept and sent back where it was; the declined
+  model's tool calls and thinking before it are dropped). Set
+  `ProviderConfig.serverFallbacks` to change the default; a 400 naming
+  the field gets one retry without it.
+- Otherwise the loop retries once on `NAWA_FALLBACK_MODEL`
+  (`LoopOptions.fallbackModel`), or on the provider's
+  `recommended_model`, and the conversation stays on that model.
+  `reasoning_extraction` refusals are not retried: the prompt needs rewording.
+No answer ends the run as `AgentResultKind.refused` (ACP: `refusal`).
+`AgentResult.refusal` marks a run that had one; the repl then asks to keep
+the prompt or remove it with `AgentLoop.removeDeclinedRequest`, which also
+returns to the original model. A declined prompt left in the context is
+resent with every request and can get later prompts declined too.
 
 ## Token costs
 

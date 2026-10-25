@@ -84,6 +84,7 @@ public enum ACPStopReason: String, Sendable {
         case .errorMaxTurns: self = .maxTurnRequests
         case .errorMaxBudgetUSD: self = .maxTurnRequests
         case .errorDuringExecution: self = .refusal
+        case .refused: self = .refusal
         }
     }
 }

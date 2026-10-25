@@ -175,12 +175,31 @@ public actor ACPSession {
             }
         case .informational:
             break
+        case .refusal(let notice):
+            // ACP has no update for this, so the client sees it as text.
+            // Text streamed before a refusal has already gone out; this
+            // says it doesn't count.
+            let payload = ACPSessionUpdate.messageChunk(
+                kind: .agentMessageChunk,
+                messageID: messageID,
+                content: .text(Self.refusalText(notice))
+            )
+            await emitUpdate(payload)
         case .result:
             // Usage was already reported with each assistant update.
             break
         case .subAgent(let update):
             if let payload = Self.subAgentProgress(update) { await emitUpdate(payload) }
         }
+    }
+
+    /// `[claude-opus-5-5 declined this request (cyber). claude-opus-4-8 answers instead.]`
+    static func refusalText(_ notice: RefusalNotice) -> String {
+        var text = "\(notice.declinedBy ?? "The model") declined this request"
+        if let category = notice.category { text += " (\(category))" }
+        text += "."
+        if let fallback = notice.answeredBy { text += " \(fallback) answers instead." }
+        return "\n\n[\(text)]\n\n"
     }
 
     /// A sub-agent's progress as a `tool_call_update` of the parent's `task`

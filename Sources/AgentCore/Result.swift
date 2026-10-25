@@ -53,6 +53,29 @@ public enum AgentResultKind: String, Sendable, Hashable, Codable {
     case errorMaxTurns = "error_max_turns"
     case errorMaxBudgetUSD = "error_max_budget_usd"
     case errorDuringExecution = "error_during_execution"
+    /// The model declined the prompt and no fallback model answered it.
+    case refused
+}
+
+/// A model declined a request: a safety classifier stopped it, or the model
+/// itself refused. Anthropic's classifiers name the policy area (`"cyber"`,
+/// `"bio"`, ...); other providers usually say nothing beyond the refusal.
+public struct RefusalNotice: Sendable, Hashable, Codable {
+    /// The model that declined; nil when the provider didn't say.
+    public var declinedBy: String?
+    /// The policy area, e.g. `"cyber"`; nil when none applies.
+    public var category: String?
+    /// The provider's reason, for display only: its wording changes.
+    public var explanation: String?
+    /// The model answering instead; nil when no model will.
+    public var answeredBy: String?
+
+    public init(declinedBy: String? = nil, category: String? = nil, explanation: String? = nil, answeredBy: String? = nil) {
+        self.declinedBy = declinedBy
+        self.category = category
+        self.explanation = explanation
+        self.answeredBy = answeredBy
+    }
 }
 
 /// The final outcome of an agent run.
@@ -74,6 +97,9 @@ public struct AgentResult: Sendable, Hashable, Codable {
     /// What went wrong, present on `errorDuringExecution` (e.g. the provider's
     /// HTTP status and error body).
     public var errorMessage: String?
+    /// The last refusal of this run, whether or not another model then
+    /// answered. Clients use it to offer removing the declined prompt.
+    public var refusal: RefusalNotice?
 
     public init(
         kind: AgentResultKind,
@@ -83,7 +109,8 @@ public struct AgentResult: Sendable, Hashable, Codable {
         sessionID: String,
         stopReason: StopReason? = nil,
         costEstimate: Double? = nil,
-        errorMessage: String? = nil
+        errorMessage: String? = nil,
+        refusal: RefusalNotice? = nil
     ) {
         self.kind = kind
         self.text = text
@@ -93,6 +120,7 @@ public struct AgentResult: Sendable, Hashable, Codable {
         self.stopReason = stopReason
         self.costEstimate = costEstimate
         self.errorMessage = errorMessage
+        self.refusal = refusal
     }
 
     public var isSuccess: Bool { kind == .success }

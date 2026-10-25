@@ -99,6 +99,9 @@ final class InlineChat {
     private var quitArmed = false
     private var inputEnded = false
     private var quitting = false
+    /// A model declined the last prompt and the user hasn't yet said whether
+    /// to keep it (see `DeclinedRequest`). Queued prompts wait for the answer.
+    private var unansweredRefusal: RefusalNotice?
 
     private let clock = ContinuousClock()
     private var lastFrame: ContinuousClock.Instant?
@@ -150,6 +153,9 @@ final class InlineChat {
         case .agent(let id, let event):
             guard id == current?.id else { return }  // from a run already interrupted
             commit(transcript.reduce(event))
+            if case .result(let result) = event, let refusal = result.refusal {
+                unansweredRefusal = refusal
+            }
         case .runEnded(let id, let error):
             guard id == current?.id else { return }
             // A stream that ends without a result was cut short.
@@ -167,6 +173,10 @@ final class InlineChat {
     }
 
     private func handle(_ key: Key) {
+        if let refusal = unansweredRefusal {
+            answer(key, about: refusal)
+            return
+        }
         if key != .control("c") { quitArmed = false }
         switch key {
         case .control("c"):
@@ -200,6 +210,18 @@ final class InlineChat {
                 queued.append(text)
             }
         }
+    }
+
+    /// While the question about a declined prompt is up, only its answers
+    /// count: Enter (or Esc, Ctrl-C) keeps the prompt, `r` removes it.
+    /// Other keys are ignored so a prompt typed too early can't answer it.
+    private func answer(_ key: Key, about refusal: RefusalNotice) {
+        let remove = key == .text("r") || key == .text("R")
+        let keep = key == .enter || key == .escape || key == .control("c")
+        guard remove || keep else { return }
+        unansweredRefusal = nil
+        commit(DeclinedRequest.answer(remove: remove, notice: refusal, session: session))
+        if current == nil { startNext() }
     }
 
     /// Commands run at once, even during a turn; they are not queued.
@@ -252,6 +274,12 @@ final class InlineChat {
         current = nil
         ticker?.cancel()
         ticker = nil
+        startNext()
+    }
+
+    private func startNext() {
+        // Without input left there is no one to answer; the prompt stays.
+        if unansweredRefusal != nil, !inputEnded { return }
         if !queued.isEmpty {
             start(queued.removeFirst())
         } else if inputEnded {
@@ -290,6 +318,10 @@ final class InlineChat {
         }
         for prompt in queued {
             live.append(layout.row(prompt, style: .dim, prefix: StyledSpan(" ⏎ queued  ", .dim)))
+        }
+        if let unansweredRefusal {
+            let question = DeclinedRequest.question(unansweredRefusal)
+            live += layout.paragraph(question, style: .color(.yellow), prefix: StyledSpan(" ? ", .color(.yellow)))
         }
         live = Array(live.suffix(max(size.rows / 2, 1)))
 

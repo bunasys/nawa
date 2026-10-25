@@ -1,5 +1,6 @@
 import AgentCore
 import Foundation
+import Synchronization
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -20,6 +21,10 @@ public struct AnthropicClient: LanguageModel, Sendable {
     public let workspaceID: String?
     /// Used instead of `apiKey` when that is nil (see `WorkloadIdentity.swift`).
     public let workloadIdentity: WorkloadIdentityConfig?
+    /// Ask the server to retry a refused request on the model Anthropic
+    /// recommends for the refusal's category (`fallbacks: "default"`).
+    /// Only Anthropic's own API offers it; see `ProviderConfig.serverFallbacks`.
+    public let serverFallbacks: Bool
     public let session: URLSession
 
     static let apiVersion = "2023-06-01"
@@ -30,6 +35,8 @@ public struct AnthropicClient: LanguageModel, Sendable {
     /// bytes received, so for streams (which send `ping`s) it is an idle
     /// timeout and a long reply is never cut.
     static let requestTimeout: TimeInterval = 600
+    /// The beta that `fallbacks: "default"` needs.
+    static let serverFallbackBeta = "server-side-fallback-2026-07-01"
 
     public init(
         providerName: String,
@@ -37,6 +44,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
         apiKey: String? = nil,
         workspaceID: String? = nil,
         workloadIdentity: WorkloadIdentityConfig? = nil,
+        serverFallbacks: Bool = false,
         session: URLSession = .shared
     ) {
         self.providerName = providerName
@@ -44,14 +52,17 @@ public struct AnthropicClient: LanguageModel, Sendable {
         self.apiKey = apiKey
         self.workspaceID = workspaceID
         self.workloadIdentity = workloadIdentity
+        self.serverFallbacks = serverFallbacks
         self.session = session
     }
 
     // MARK: LanguageModel
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
-        let body = try Self.requestBody(request)
-        let data = try await send(method: "POST", url: baseURL.appendingPathComponent("messages"), body: body)
+        let data = try await withServerFallbacks(request) { fallbacks in
+            let body = try Self.requestBody(request, serverFallbacks: fallbacks)
+            return try await send(method: "POST", url: messagesURL, body: body, serverFallbacks: fallbacks)
+        }
         let reply: JSON
         do {
             reply = try JSONDecoder().decode(JSON.self, from: data)
@@ -68,12 +79,8 @@ public struct AnthropicClient: LanguageModel, Sendable {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    var body = try Self.requestBody(request).objectValue ?? [:]
-                    body["stream"] = .bool(true)
-                    let urlRequest = try await makeRequest(method: "POST", url: baseURL.appendingPathComponent("messages"), body: .object(body))
-                    let (bytes, response) = try await session.streamBytes(for: urlRequest)
-                    if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                        throw GatewayError.httpError(statusCode: http.statusCode, body: try await collectText(bytes))
+                    let bytes = try await withServerFallbacks(request) { fallbacks in
+                        try await openStream(request, serverFallbacks: fallbacks)
                     }
                     var assembler = AnthropicStreamAssembler(providerName: providerName)
                     try await ServerSentEvents.forEachData(in: bytes) { payload in
@@ -88,6 +95,39 @@ public struct AnthropicClient: LanguageModel, Sendable {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
+
+    private func openStream(_ request: ModelRequest, serverFallbacks: Bool) async throws -> HTTPResponseBytes {
+        var body = try Self.requestBody(request, serverFallbacks: serverFallbacks).objectValue ?? [:]
+        body["stream"] = .bool(true)
+        let urlRequest = try await makeRequest(method: "POST", url: messagesURL, body: .object(body), serverFallbacks: serverFallbacks)
+        let (bytes, response) = try await session.streamBytes(for: urlRequest)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw GatewayError.httpError(statusCode: http.statusCode, body: try await collectText(bytes))
+        }
+        return bytes
+    }
+
+    /// Endpoint-and-model pairs that answered `fallbacks` with a 400:
+    /// asked once per process, then sent without it.
+    private static let rejectsServerFallbacks = Mutex<Set<String>>([])
+
+    /// Runs `call` with server-side fallbacks on when this client wants them
+    /// and the model hasn't rejected them before. Older models and
+    /// Anthropic-compatible proxies may refuse the field or its beta header;
+    /// a 400 that names it gets one retry without, like `stream_options`
+    /// in `OpenAICompatibleClient`.
+    private func withServerFallbacks<T>(_ request: ModelRequest, _ call: (Bool) async throws -> T) async throws -> T {
+        let key = "\(baseURL.absoluteString) \(request.model ?? "")"
+        let askForFallbacks = serverFallbacks && !Self.rejectsServerFallbacks.withLock { $0.contains(key) }
+        do {
+            return try await call(askForFallbacks)
+        } catch GatewayError.httpError(statusCode: 400, let body) where askForFallbacks && body.contains("fallback") {
+            Self.rejectsServerFallbacks.withLock { _ = $0.insert(key) }
+            return try await call(false)
+        }
+    }
+
+    var messagesURL: URL { baseURL.appendingPathComponent("messages") }
 
     public func listModels() async throws -> [ModelSummary] {
         var components = URLComponents(url: baseURL.appendingPathComponent("models"), resolvingAgainstBaseURL: false)!
@@ -108,7 +148,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     /// caches the whole prefix up to each breakpoint, so a turn pays full
     /// price only for what changed since the previous one; cache reads cost
     /// about a tenth of fresh input. (The API allows four breakpoints.)
-    static func requestBody(_ request: ModelRequest) throws -> JSON {
+    static func requestBody(_ request: ModelRequest, serverFallbacks: Bool = false) throws -> JSON {
         var body: [String: JSON] = [
             "model": .string(try request.requiredModel()),
             "max_tokens": .int(request.maxOutputTokens ?? defaultMaxTokens),
@@ -133,6 +173,9 @@ public struct AnthropicClient: LanguageModel, Sendable {
             }
             wireTools[wireTools.count - 1] = withCacheControl(wireTools[wireTools.count - 1])
             body["tools"] = .array(wireTools)
+        }
+        if serverFallbacks {
+            body["fallbacks"] = .string("default")
         }
         // Current Claude models reject sampling parameters, so only send one
         // when the caller explicitly asked for it.
@@ -238,10 +281,20 @@ public struct AnthropicClient: LanguageModel, Sendable {
         guard let object = reply.objectValue, let content = object["content"]?.arrayValue else {
             throw GatewayError.invalidResponse("no content in /messages response from \(providerName)")
         }
+        // After a server-side fallback, what the declining model wrote before
+        // the last `fallback` marker is not part of the answer: its tool
+        // calls must not run, and its thinking must not be sent back. Its
+        // text stays, because the fallback model continued from it.
+        let lastFallback = content.lastIndex { $0.objectValue?["type"]?.stringValue == "fallback" }
+        let droppedBeforeFallback: Set<String> = ["thinking", "redacted_thinking", "connector_text", "tool_use"]
         var blocks: [ContentBlock] = []
-        for block in content {
+        var declinedBy: [String] = []
+        for (index, block) in content.enumerated() {
             let fields = block.objectValue ?? [:]
-            switch fields["type"]?.stringValue {
+            let type = fields["type"]?.stringValue ?? ""
+            let isBeforeFallback = lastFallback.map { index < $0 } ?? false
+            if isBeforeFallback && droppedBeforeFallback.contains(type) { continue }
+            switch type {
             case "text":
                 blocks.append(.text(fields["text"]?.stringValue ?? ""))
             case "tool_use":
@@ -251,23 +304,52 @@ public struct AnthropicClient: LanguageModel, Sendable {
                     arguments: fields["input"] ?? .object([:])
                 )
                 blocks.append(.toolCall(call))
+            case "fallback":
+                if let model = fields["from"]?.objectValue?["model"]?.stringValue { declinedBy.append(model) }
+                // Sent back where it was: the API checks the thinking blocks
+                // around it against its position.
+                blocks.append(.opaque(provider: providerKind, payload: block))
             default:
                 // thinking, redacted_thinking and anything newer: keep it so
                 // it goes back to the model untouched on the next request.
                 blocks.append(.opaque(provider: providerKind, payload: block))
             }
         }
+        let finishReason = stopReason(from: object["stop_reason"]?.stringValue)
         return ModelResponse(
             message: Message(role: .assistant, content: blocks),
-            finishReason: stopReason(from: object["stop_reason"]?.stringValue),
-            usage: usage(from: object["usage"])
+            finishReason: finishReason,
+            usage: usage(from: object["usage"]),
+            model: object["model"]?.stringValue,
+            refusal: finishReason == .refusal ? refusalDetails(from: object["stop_details"]) : nil,
+            declinedBy: declinedBy
+        )
+    }
+
+    static func refusalDetails(from wire: JSON?) -> RefusalDetails {
+        let fields = wire?.objectValue ?? [:]
+        return RefusalDetails(
+            category: fields["category"]?.stringValue,
+            explanation: fields["explanation"]?.stringValue,
+            recommendedModel: fields["recommended_model"]?.stringValue
         )
     }
 
     /// Anthropic reports prompt-cache reads and writes apart from
     /// `input_tokens`, which matches how `Usage` keeps them.
+    ///
+    /// After a server-side fallback the top-level counts cover only the
+    /// model that answered; `iterations` has one entry per attempt, the
+    /// declined ones included, so their sum is what the request cost.
     static func usage(from wire: JSON?) -> Usage {
         let fields = wire?.objectValue ?? [:]
+        if let iterations = fields["iterations"]?.arrayValue, !iterations.isEmpty {
+            var total = Usage.zero
+            for iteration in iterations {
+                total.accumulate(usage(from: iteration))
+            }
+            return total
+        }
         return Usage(
             inputTokens: fields["input_tokens"]?.intValue ?? 0,
             outputTokens: fields["output_tokens"]?.intValue ?? 0,
@@ -294,8 +376,8 @@ public struct AnthropicClient: LanguageModel, Sendable {
         return url.appendingPathComponent("v1")
     }
 
-    private func send(method: String, url: URL, body: JSON?) async throws -> Data {
-        let urlRequest = try await makeRequest(method: method, url: url, body: body)
+    private func send(method: String, url: URL, body: JSON?, serverFallbacks: Bool = false) async throws -> Data {
+        let urlRequest = try await makeRequest(method: method, url: url, body: body, serverFallbacks: serverFallbacks)
         let (data, response) = try await session.data(for: urlRequest)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw GatewayError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
@@ -304,10 +386,13 @@ public struct AnthropicClient: LanguageModel, Sendable {
     }
 
     /// A request with the version and auth headers.
-    private func makeRequest(method: String, url: URL, body: JSON?) async throws -> URLRequest {
+    private func makeRequest(method: String, url: URL, body: JSON?, serverFallbacks: Bool = false) async throws -> URLRequest {
         var urlRequest = URLRequest(url: url, timeoutInterval: Self.requestTimeout)
         urlRequest.httpMethod = method
         urlRequest.setValue(Self.apiVersion, forHTTPHeaderField: "anthropic-version")
+        if serverFallbacks {
+            urlRequest.setValue(Self.serverFallbackBeta, forHTTPHeaderField: "anthropic-beta")
+        }
         if let apiKey {
             urlRequest.setValue(apiKey, forHTTPHeaderField: "x-api-key")
             if let workspaceID {
@@ -344,6 +429,8 @@ struct AnthropicStreamAssembler {
     private var toolInput: [Int: String] = [:]
     private var usage: [String: JSON] = [:]
     private var stopReason: String?
+    private var stopDetails: JSON?
+    private var model: String?
     private var stopped = false
 
     init(providerName: String) { self.providerName = providerName }
@@ -353,6 +440,9 @@ struct AnthropicStreamAssembler {
         let index = event["index"]?.intValue ?? 0
         switch event["type"]?.stringValue {
         case "message_start":
+            // With a fallback before any output, this already names the
+            // fallback model; after a mid-output one, the `fallback` block does.
+            model = event["message"]?.objectValue?["model"]?.stringValue
             mergeUsage(event["message"]?.objectValue?["usage"])
         case "content_block_start":
             guard let block = event["content_block"]?.objectValue else { return [] }
@@ -391,7 +481,9 @@ struct AnthropicStreamAssembler {
                 blocks[index]?["input"] = input
             }
         case "message_delta":
-            if let reason = event["delta"]?.objectValue?["stop_reason"]?.stringValue { stopReason = reason }
+            let delta = event["delta"]?.objectValue
+            if let reason = delta?["stop_reason"]?.stringValue { stopReason = reason }
+            if let details = delta?["stop_details"], details != .null { stopDetails = details }
             mergeUsage(event["usage"])
         case "message_stop":
             stopped = true
@@ -416,6 +508,8 @@ struct AnthropicStreamAssembler {
             "usage": .object(usage),
         ]
         if let stopReason { reply["stop_reason"] = .string(stopReason) }
+        if let stopDetails { reply["stop_details"] = stopDetails }
+        if let model { reply["model"] = .string(model) }
         return try AnthropicClient.modelResponse(from: .object(reply), providerName: providerName)
     }
 

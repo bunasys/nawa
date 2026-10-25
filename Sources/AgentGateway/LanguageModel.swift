@@ -84,11 +84,48 @@ public struct ModelResponse: Sendable {
     public var message: Message
     public var finishReason: StopReason?
     public var usage: Usage
+    /// The model that wrote the reply, when the provider reports it. With
+    /// a fallback it differs from the model that was asked.
+    public var model: String?
+    /// Why the model declined; set only when `finishReason` is `.refusal`,
+    /// and then the message holds no usable reply.
+    public var refusal: RefusalDetails?
+    /// Models that declined this request before `model` answered it
+    /// (Anthropic's server-side fallback), in order.
+    public var declinedBy: [String]
 
-    public init(message: Message, finishReason: StopReason? = nil, usage: Usage = .zero) {
+    public init(
+        message: Message,
+        finishReason: StopReason? = nil,
+        usage: Usage = .zero,
+        model: String? = nil,
+        refusal: RefusalDetails? = nil,
+        declinedBy: [String] = []
+    ) {
         self.message = message
         self.finishReason = finishReason
         self.usage = usage
+        self.model = model
+        self.refusal = refusal
+        self.declinedBy = declinedBy
+    }
+}
+
+/// Anthropic's `stop_details` for a refusal. Every field may be nil, also
+/// on a refusal, so branch on `finishReason`, never on these.
+public struct RefusalDetails: Sendable, Hashable {
+    /// The policy area, e.g. `"cyber"`, `"bio"`, `"reasoning_extraction"`.
+    public var category: String?
+    /// For display only: the wording is not stable.
+    public var explanation: String?
+    /// A model to retry on, sent when the server's own fallback couldn't run
+    /// (e.g. the fallback model was rate limited). A hint, not a promise.
+    public var recommendedModel: String?
+
+    public init(category: String? = nil, explanation: String? = nil, recommendedModel: String? = nil) {
+        self.category = category
+        self.explanation = explanation
+        self.recommendedModel = recommendedModel
     }
 }
 

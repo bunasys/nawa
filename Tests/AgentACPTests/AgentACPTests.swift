@@ -31,6 +31,9 @@ struct AgentACPTests {
         #expect(ACPStopReason(resultKind: .success) == .endTurn)
         #expect(ACPStopReason(resultKind: .errorMaxTurns) == .maxTurnRequests)
         #expect(ACPStopReason(resultKind: .errorDuringExecution) == .refusal)
+        #expect(ACPStopReason(resultKind: .refused) == .refusal)
+        let notice = RefusalNotice(declinedBy: "big", category: "cyber", answeredBy: "small")
+        #expect(ACPSession.refusalText(notice) == "\n\n[big declined this request (cyber). small answers instead.]\n\n")
     }
 
     @Test

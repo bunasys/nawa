@@ -34,6 +34,12 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
     /// of an API key. When neither is set, the standard `ANTHROPIC_*`
     /// federation environment variables are used if present.
     public var workloadIdentity: WorkloadIdentityConfig?
+    /// Anthropic only: when a model declines a request (`stop_reason:
+    /// "refusal"`), have the server retry it on the model Anthropic
+    /// recommends for that refusal (`fallbacks: "default"`). Nil means on
+    /// for api.anthropic.com, the only endpoint known to support it; set it
+    /// to true for others that do (Claude Platform on AWS, Google Cloud).
+    public var serverFallbacks: Bool?
 
     public init(
         name: String,
@@ -44,7 +50,8 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
         modelWhitelist: [String]? = nil,
         headers: [String: String]? = nil,
         workspaceID: String? = nil,
-        workloadIdentity: WorkloadIdentityConfig? = nil
+        workloadIdentity: WorkloadIdentityConfig? = nil,
+        serverFallbacks: Bool? = nil
     ) {
         self.name = name
         self.api = api
@@ -55,6 +62,13 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
         self.headers = headers
         self.workspaceID = workspaceID
         self.workloadIdentity = workloadIdentity
+        self.serverFallbacks = serverFallbacks
+    }
+
+    /// Whether requests to this provider ask for server-side fallbacks.
+    public var usesServerFallbacks: Bool {
+        guard api == .anthropic else { return false }
+        return serverFallbacks ?? (baseURL.host == "api.anthropic.com")
     }
 
     /// Resolve the api key, expanding an `env:NAME` reference.

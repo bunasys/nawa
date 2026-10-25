@@ -225,6 +225,12 @@ public struct Transcript: Sendable {
         case .informational(let text):
             return [.note(text)]
 
+        case .refusal(let notice):
+            // The declined reply is not kept, so its preview goes too.
+            live.inFlight = LiveState.InFlight()
+            live.phase = .waiting
+            return DeclinedRequest.blocks(for: notice)
+
         case .result(let result):
             var blocks = flushRunning()
             live.phase = .idle
@@ -238,6 +244,10 @@ public struct Transcript: Sendable {
                 blocks.append(.warning("stopped: the budget is spent\(spent)"))
             case .errorDuringExecution:
                 blocks.append(.warning("\(result.kind.rawValue): \(result.errorMessage ?? "unknown error")"))
+            case .refused:
+                stats.usage = result.usage
+                stats.cost = result.costEstimate
+                blocks.append(DeclinedRequest.unansweredNote(result.refusal))
             }
             return blocks
         }

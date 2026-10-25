@@ -8,6 +8,9 @@ public struct ChatSession: Sendable {
     public var send: @Sendable (String) -> AsyncThrowingStream<AgentEvent, any Error>
     /// Starts a fresh conversation (`/clear`).
     public var reset: @Sendable () -> Void
+    /// Takes the prompt a model declined in the last run out of the
+    /// conversation; false when there is none (`AgentLoop.removeDeclinedRequest`).
+    public var removeDeclinedRequest: @Sendable () -> Bool
     /// Facts shown once at startup.
     public var header: SessionHeader
     /// Context-fill denominator (the compaction threshold), if any.
@@ -20,12 +23,14 @@ public struct ChatSession: Sendable {
         contextLimit: Int? = nil,
         tools: [String] = [],
         send: @escaping @Sendable (String) -> AsyncThrowingStream<AgentEvent, any Error>,
-        reset: @escaping @Sendable () -> Void = {}
+        reset: @escaping @Sendable () -> Void = {},
+        removeDeclinedRequest: @escaping @Sendable () -> Bool = { false }
     ) {
         self.header = header
         self.contextLimit = contextLimit
         self.tools = tools
         self.send = send
         self.reset = reset
+        self.removeDeclinedRequest = removeDeclinedRequest
     }
 }

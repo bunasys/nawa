@@ -58,6 +58,7 @@ public struct Gateway: LanguageModel, Sendable {
                 apiKey: apiKey,
                 workspaceID: provider.workspaceID,
                 workloadIdentity: workloadIdentity,
+                serverFallbacks: provider.usesServerFallbacks,
                 session: session
             )
         }

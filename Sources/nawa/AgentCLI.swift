@@ -173,6 +173,8 @@ struct AgentCLI {
     /// cost estimates. `NAWA_MAX_BUDGET_USD` stops a prompt once the session's
     /// estimated cost reaches it, so it needs `NAWA_PRICE`. Replies stream
     /// (progress while the model thinks) unless `NAWA_STREAM=0`.
+    /// `NAWA_FALLBACK_MODEL` names the model to retry on when the session's
+    /// model declines a prompt (same provider).
     static func defaultLoopOptions(env: [String: String] = ProcessInfo.processInfo.environment) -> LoopOptions {
         LoopOptions(
             maxBudgetUSD: maxBudget(env),
@@ -182,7 +184,8 @@ struct AgentCLI {
             subAgents: true,
             helperModel: env["NAWA_HELPER_MODEL"],
             helperPricing: pricing(env, "NAWA_HELPER_PRICE"),
-            streamReplies: env["NAWA_STREAM"] != "0"
+            streamReplies: env["NAWA_STREAM"] != "0",
+            fallbackModel: env["NAWA_FALLBACK_MODEL"]
         )
     }
 
@@ -282,7 +285,8 @@ struct AgentCLI {
             contextLimit: options.compaction?.atContextTokens,
             tools: loop.withLock { $0.toolDefinitions.map(\.name) },
             send: { prompt in loop.withLock { $0 }.run(prompt: prompt, continuing: true) },
-            reset: { loop.withLock { $0 = makeLoop() } }
+            reset: { loop.withLock { $0 = makeLoop() } },
+            removeDeclinedRequest: { loop.withLock { $0 }.removeDeclinedRequest() }
         )
         try await ChatApp.run(session, mode: mode, maxTurns: options.maxTurns)
     }

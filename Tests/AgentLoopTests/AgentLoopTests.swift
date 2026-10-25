@@ -379,6 +379,7 @@ func kind(_ event: AgentEvent) -> String {
     case .toolResults: "toolResults"
     case .stream: "stream"
     case .informational: "informational"
+    case .refusal: "refusal"
     case .result: "result"
     case .subAgent: "subAgent"
     }

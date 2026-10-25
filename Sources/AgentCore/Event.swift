@@ -20,6 +20,9 @@ public enum AgentEvent: Sendable {
     case stream(AgentStreamUpdate)
     /// A human-readable status banner.
     case informational(String)
+    /// A model declined the request. A reply streamed before the refusal is
+    /// discarded, not kept in the session; `answeredBy` says who takes over.
+    case refusal(RefusalNotice)
     /// Marks the end of the agent loop.
     case result(AgentResult)
     /// An event from a sub-agent running one of this loop's `task` calls,

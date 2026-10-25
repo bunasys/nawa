@@ -61,6 +61,19 @@ public final class AgentLoop: @unchecked Sendable {
     /// The part of `_usage` spent on `options.helperModel` (sub-agents and
     /// summaries), priced with `options.helperPricing`.
     private var _helperUsage: Usage = .zero
+    /// Where the current run's prompt sits in `_session.messages`.
+    private var _runPromptIndex = 0
+    /// The last refusal of the current run, reported with its result.
+    private var _lastRefusal: RefusalNotice?
+    /// The prompt a model declined in the last run, kept until the next run
+    /// or a compaction so `removeDeclinedRequest` can take it out.
+    private var _declined: DeclinedRequest?
+
+    private struct DeclinedRequest {
+        var promptIndex: Int
+        /// The model the run started on, restored when the prompt is removed.
+        var modelBefore: String?
+    }
 
     /// The model id sent with each request; `nil` lets the gateway pick its
     /// configured or discovered default. Clients may switch it between turns
@@ -164,6 +177,25 @@ public final class AgentLoop: @unchecked Sendable {
                             return
                         }
 
+                        // A declined reply is dropped, partial text included:
+                        // it is not an answer. Ask the fallback model, if any.
+                        if response.finishReason == .refusal {
+                            let notice = self.recordRefusal(response)
+                            self.emit(.refusal(notice))
+                            continuation.yield(.refusal(notice))
+                            if notice.answeredBy != nil { continue }
+                            self.finish(continuation, self.result(.refused))
+                            return
+                        }
+                        // Anthropic's server-side fallback already answered
+                        // in the model's place; say so, and keep the answer.
+                        if let declinedModel = response.declinedBy.first {
+                            let notice = RefusalNotice(declinedBy: declinedModel, answeredBy: response.model)
+                            self.rememberDeclinedPrompt(notice)
+                            self.emit(.refusal(notice))
+                            continuation.yield(.refusal(notice))
+                        }
+
                         // 2. Persist the assistant turn and emit it.
                         let update = AssistantUpdate(
                             text: response.message.text,
@@ -228,8 +260,66 @@ public final class AgentLoop: @unchecked Sendable {
             }
         }
         _session.append(Message(role: .user, text: prompt))
+        _runPromptIndex = _session.messages.count - 1
         _turnCounter = 0
         _loopDetector.reset()
+        _lastRefusal = nil
+        _declined = nil
+    }
+
+    // MARK: Refusals
+
+    /// Notes a declined reply and picks the model to ask next: the
+    /// configured `fallbackModel`, else the one the provider recommends.
+    /// There is one retry per run: a refusal from the fallback is final.
+    private func recordRefusal(_ response: ModelResponse) -> RefusalNotice {
+        let declinedModel = response.model ?? model
+        let category = response.refusal?.category
+        // These come from a prompt asking the model to write out its
+        // reasoning; Anthropic recommends rewording, not another model.
+        let anotherModelWontHelp = category == "reasoning_extraction"
+        let candidate = options.fallbackModel ?? response.refusal?.recommendedModel
+        let alreadyTried = candidate == model || candidate == declinedModel
+        let shouldRetry = !anotherModelWontHelp && !alreadyTried
+        let fallback = shouldRetry ? candidate : nil
+
+        let notice = RefusalNotice(
+            declinedBy: declinedModel,
+            category: category,
+            explanation: response.refusal?.explanation,
+            answeredBy: fallback
+        )
+        rememberDeclinedPrompt(notice)
+        if let fallback { model = fallback }
+        return notice
+    }
+
+    private func rememberDeclinedPrompt(_ notice: RefusalNotice) {
+        lock.lock(); defer { lock.unlock() }
+        _lastRefusal = notice
+        if _declined == nil {
+            _declined = DeclinedRequest(promptIndex: _runPromptIndex, modelBefore: _model)
+        }
+    }
+
+    /// Takes the prompt a model declined in the last run out of the
+    /// conversation, with everything after it, and goes back to the model
+    /// the run started on. Every request resends the whole conversation, so
+    /// a declined prompt left in it can get later prompts declined too.
+    ///
+    /// Returns false when there is nothing to remove: no model declined in
+    /// the last run, a new run has started, or a compaction has since
+    /// folded the prompt into a summary.
+    public func removeDeclinedRequest() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let declined = _declined, declined.promptIndex < _session.messages.count else { return false }
+        _session.messages.removeSubrange(declined.promptIndex...)
+        _model = declined.modelBefore
+        _declined = nil
+        _lastRefusal = nil
+        // The next model call reports the new size.
+        _contextTokens = 0
+        return true
     }
 
     private func result(
@@ -246,7 +336,8 @@ public final class AgentLoop: @unchecked Sendable {
             sessionID: _session.id,
             stopReason: stopReason,
             costEstimate: totalCost,
-            errorMessage: errorMessage
+            errorMessage: errorMessage,
+            refusal: _lastRefusal
         )
     }
 
@@ -455,6 +546,8 @@ public final class AgentLoop: @unchecked Sendable {
             summary += "\n\nNotes you saved with remember:\n" + _notes.map { "- \($0)" }.joined(separator: "\n")
         }
         _session.messages = Array(systemMessages) + [Message(role: .user, text: summary)] + messages[cut...]
+        // Message positions moved, and the declined prompt may be in the summary.
+        _declined = nil
         // The next model call reports the new size; until then, don't compact again.
         _contextTokens = 0
         return older.count
@@ -561,6 +654,11 @@ public struct LoopOptions: Sendable {
     /// Stream the main turn's reply, yielding `.stream` events as it
     /// arrives. Summaries and sub-agents never stream.
     public var streamReplies: Bool
+    /// The model to ask when the session's model declines a request
+    /// (`StopReason.refusal`); the session then stays on it. Nil = the
+    /// provider's recommendation, if it sends one, else stop. Anthropic's
+    /// API can do this itself (`ProviderConfig.serverFallbacks`).
+    public var fallbackModel: String?
 
     public init(
         maxTurns: Int? = nil,
@@ -575,7 +673,8 @@ public struct LoopOptions: Sendable {
         subAgents: Bool = false,
         helperModel: String? = nil,
         helperPricing: Pricing? = nil,
-        streamReplies: Bool = true
+        streamReplies: Bool = true,
+        fallbackModel: String? = nil
     ) {
         self.maxTurns = maxTurns
         self.loopCheckAfterTurns = loopCheckAfterTurns
@@ -590,5 +689,6 @@ public struct LoopOptions: Sendable {
         self.helperModel = helperModel
         self.helperPricing = helperPricing
         self.streamReplies = streamReplies
+        self.fallbackModel = fallbackModel
     }
 }
