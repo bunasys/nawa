@@ -158,6 +158,42 @@ struct FailoverTests {
         } catch {
             #expect(!GatewayFailover.isProviderUnavailable(error), "\(error)")
         }
+        // The user stopped it; the fallback didn't fail.
+        #expect(!gateway.failover.isCoolingDown("fallback"))
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aFallbackStreamCutOffMidReplyKeepsItsOwnError() async throws {
+        let server = try HangingHTTPServer(firstBytes: sse([#"{"choices":[{"delta":{"content":"Hel"}}]}"#]))
+        let gateway = socketGateway(primary: "http://127.0.0.1:1", fallback: "http://127.0.0.1:\(server.port)")
+
+        do {
+            for try await chunk in gateway.stream(ModelRequest(messages: hello)) {
+                if case .textDelta = chunk { server.close() }
+            }
+            Issue.record("expected the cut-off stream to fail")
+        } catch GatewayError.providersFailed(let failures) {
+            Issue.record("the fallback answered, yet the error says every provider failed: \(failures)")
+        } catch {
+            // The fallback's own error.
+        }
+    }
+
+    @Test
+    func aMissingModelFailsOverWithoutTakingTheProviderOut() async throws {
+        let (primary, fallback) = ("missing-model.primary.test", "missing-model.fallback.test")
+        _ = StubURLProtocol.session(host: primary, replies: [
+            .init(status: 404, pieces: [#"{"error":{"message":"model not found"}}"#]),
+            reply("primary is fine", model: "primary-model"),
+        ])
+        let session = StubURLProtocol.session(host: fallback, replies: [reply("from fallback", model: "f")])
+        let gateway = gateway(primary: primary, fallback: fallback, session: session)
+
+        let typo = try await gateway.complete(ModelRequest(model: "primary-modle", messages: hello))
+        let next = try await gateway.complete(ModelRequest(messages: hello))
+
+        #expect(typo.providerName == "fallback")
+        #expect(next.providerName == "primary" && next.message.text == "primary is fine")
     }
 
     @Test
@@ -212,6 +248,7 @@ struct FailoverTests {
         let final: [any Error] = [
             GatewayError.httpError(statusCode: 400, body: "messages: field required"),
             GatewayError.httpError(statusCode: 413, body: ""),
+            GatewayError.httpError(statusCode: 409, body: ""),
             CancellationError(),
             URLError(.cancelled),
         ]

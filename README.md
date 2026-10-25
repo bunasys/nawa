@@ -167,7 +167,9 @@ anywhere.
 
 Each provider uses its own `model`, since model ids differ between providers.
 A provider that failed is skipped for a minute, so a long run doesn't wait on
-it before every call. A streamed reply fails over only before its first
+it before every call. A 404 (a model the provider doesn't have, often a
+typo) still fails over but doesn't take the provider out for the others,
+and a cancelled call never counts as a failure. A streamed reply fails over only before its first
 chunk. A request that names a provider (`ModelRequest.providerName`) never
 fails over. In code, pass `fallbackProviderNames` to `Gateway`.
 

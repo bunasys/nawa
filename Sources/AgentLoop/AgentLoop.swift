@@ -520,7 +520,7 @@ public final class AgentLoop: @unchecked Sendable {
             _session.messages = ContextShrinking.clearingOldToolResults(_session.messages, keep: keep)
         }
         guard let compaction = options.compaction, _contextTokens >= compaction.atContextTokens else { return }
-        let compacted = try await compact(keepRecent: compaction.keepRecentMessages)
+        let compacted = try await compact(keepRecent: compaction.keepRecentMessages, report: report)
         if compacted > 0 {
             report(.informational("Compacted \(compacted) older messages into a summary."))
         }
@@ -530,7 +530,7 @@ public final class AgentLoop: @unchecked Sendable {
     /// summary, keeping the recent messages word for word.
     /// Returns how many messages were folded into the summary (0 when there
     /// was nothing old enough to compact).
-    private func compact(keepRecent: Int) async throws -> Int {
+    private func compact(keepRecent: Int, report: (AgentEvent) -> Void) async throws -> Int {
         let messages = _session.messages
         guard let cut = ContextShrinking.compactionCut(messages, keepRecent: keepRecent) else { return 0 }
         let systemMessages = messages.prefix { $0.role == .system }
@@ -548,7 +548,7 @@ public final class AgentLoop: @unchecked Sendable {
         )
         let response = try await gateway.complete(request)
         recordUsage(response.usage, helper: true)
-        try checkAnsweringProvider(response, for: request) { note in emit(note) }
+        try checkAnsweringProvider(response, for: request, report: report)
 
         var summary = "Summary of the conversation so far (older messages were compacted):\n\n\(response.message.text)"
         if !_notes.isEmpty {

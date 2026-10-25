@@ -464,6 +464,22 @@ struct FallbackProviderLoopTests {
     }
 
     @Test
+    func aSwitchFirstSeenDuringCompactionReachesTheStream() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("x")])))]), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("y")])))]), usage: Usage(inputTokens: 500)),
+            reply(from: "fallback", text: "SUMMARY"),
+            reply(from: "fallback"),
+        ])
+        let options = LoopOptions(compaction: Compaction(atContextTokens: 400, keepRecentMessages: 2))
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+
+        let (notes, _) = try await run(loop, "go")
+
+        #expect(notes.filter { $0.contains("answered instead of") } == ["Model provider fallback (fallback-model) answered instead of scripted."])
+    }
+
+    @Test
     func aFallbackReplyIsFineWithoutABudgetCap() async throws {
         let model = ScriptedModel(responses: [reply(from: "fallback")])
         let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: LoopOptions(pricing: Pricing(inputPer1K: 1)))

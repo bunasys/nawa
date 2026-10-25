@@ -143,17 +143,19 @@ public struct Gateway: LanguageModel, Sendable {
                 attempt.model = try await model(for: provider, client: client(for: provider), requested: isPreferred ? request.model : nil)
                 return try await call(provider, attempt)
             } catch {
-                let isUnavailable = GatewayFailover.isProviderUnavailable(error)
+                // A cancelled call may surface as a network error; it says nothing about the provider.
+                let isUnavailable = !Task.isCancelled && GatewayFailover.isProviderUnavailable(error)
                 // Only a request that could fail over starts a cooldown: one
                 // that stays on its provider doesn't reroute the others.
-                if isUnavailable && hasFallbacks {
+                if isUnavailable && hasFallbacks && GatewayFailover.startsCooldown(error) {
                     failover.markFailed(provider.name)
                 }
                 let isLast = provider.name == chain.last?.name
-                guard isUnavailable && !isLast && mayFailOver() else {
-                    // Only a run of unavailable providers is summed up: a
-                    // cancellation or a bad request must keep its own type.
-                    let isWholeChainDown = !failures.isEmpty && isUnavailable
+                let mayMoveOn = isUnavailable && mayFailOver()
+                guard mayMoveOn && !isLast else {
+                    // Summed up only when the chain ran out. A cancellation, a
+                    // bad request or a stream cut off mid-reply keeps its own type.
+                    let isWholeChainDown = !failures.isEmpty && mayMoveOn
                     throw isWholeChainDown ? GatewayError.providersFailed(failures + ["\(provider.name): \(error)"]) : error
                 }
                 failures.append("\(provider.name): \(error)")
@@ -251,6 +253,14 @@ final class GatewayFailover: Sendable {
         return now.timeIntervalSince(failed) < Self.cooldown
     }
 
+    /// Whether a failure takes the whole provider out for `cooldown`. A 404
+    /// is about one model, often a mistyped one: the request still fails
+    /// over, but other requests keep going to the provider.
+    static func startsCooldown(_ error: any Error) -> Bool {
+        if case GatewayError.httpError(statusCode: 404, _) = error { return false }
+        return true
+    }
+
     /// Whether `error` means this provider can't serve requests right now,
     /// so another provider might. A request the provider rejected as
     /// malformed (most 400s) would fail anywhere, so it doesn't fail over.
@@ -265,7 +275,7 @@ final class GatewayFailover: Sendable {
             // named it. The fallback uses its own model, and the switch is
             // reported (`ModelResponse.providerName`), so the mistake shows.
             let isOutOfCredit = status == 400 && body.contains("credit balance")
-            let isUnavailable = [401, 402, 403, 404, 408, 409, 429].contains(status) || status >= 500
+            let isUnavailable = [401, 402, 403, 404, 408, 429].contains(status) || status >= 500
             return isUnavailable || isOutOfCredit
         case .network, .invalidResponse, .workloadIdentity, .incompleteStream:
             return true
