@@ -171,7 +171,10 @@ it before every call. A 404 (a model the provider doesn't have, often a
 typo) still fails over but doesn't take the provider out for the others,
 and a cancelled call never counts as a failure. A streamed reply fails over only before its first
 chunk. A request that names a provider (`ModelRequest.providerName`) never
-fails over. In code, pass `fallbackProviderNames` to `Gateway`.
+fails over. In code, pass `fallbackProviderNames` to `Gateway`. When every
+provider fails, the error is `GatewayError.providersFailed`, one line per
+provider in the order tried (new in 0.3.0: an exhaustive `switch` over
+`GatewayError` needs a case for it).
 
 A switch is never silent: each reply carries the provider that wrote it
 (`ModelResponse.providerName`), and the agent loop reports every change as
