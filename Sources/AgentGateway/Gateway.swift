@@ -160,9 +160,9 @@ public struct Gateway: LanguageModel, Sendable {
                     // Summed up only when the chain ran out. A cancellation, a
                     // bad request or a stream cut off mid-reply keeps its own type.
                     let isWholeChainDown = !failures.isEmpty && mayMoveOn
-                    throw isWholeChainDown ? GatewayError.providersFailed(failures + ["\(provider.name): \(error)"]) : error
+                    throw isWholeChainDown ? GatewayError.providersFailed(failures + [GatewayFailover.failureLine(provider.name, error)]) : error
                 }
-                failures.append("\(provider.name): \(error)")
+                failures.append(GatewayFailover.failureLine(provider.name, error))
             }
         }
         // Not reached: the chain is never empty, and its last provider returns or throws.
@@ -255,6 +255,17 @@ final class GatewayFailover: Sendable {
     func isCoolingDown(_ providerName: String, now: Date = Date()) -> Bool {
         guard let failed = failedAt.withLock({ $0[providerName] }) else { return false }
         return now.timeIntervalSince(failed) < Self.cooldown
+    }
+
+    /// Longest error text kept per provider in `providersFailed`: a proxy's
+    /// 502 is often a whole HTML page.
+    static let maxFailureLength = 300
+
+    /// "name: error", the error cut short.
+    static func failureLine(_ providerName: String, _ error: any Error) -> String {
+        let text = String(describing: error)
+        let shortened = text.count > maxFailureLength ? text.prefix(maxFailureLength) + "…" : Substring(text)
+        return "\(providerName): \(shortened)"
     }
 
     /// Whether a failure takes the whole provider out for `cooldown`. A 404

@@ -270,6 +270,15 @@ struct FailoverTests {
     }
 
     @Test
+    func aFailureLineIsCutShort() {
+        let page = String(repeating: "<html>", count: 200)
+        let line = GatewayFailover.failureLine("proxy", GatewayError.httpError(statusCode: 502, body: page))
+        #expect(line.hasPrefix("proxy: HTTP 502"))
+        #expect(line.count <= "proxy: ".count + GatewayFailover.maxFailureLength + 1)
+        #expect(GatewayFailover.failureLine("p", GatewayError.network("reset")) == "p: network error: reset")
+    }
+
+    @Test
     func aCooldownEnds() {
         let failover = GatewayFailover()
         let failedAt = Date(timeIntervalSince1970: 1000)
