@@ -119,6 +119,9 @@ so a couple of spots pick their implementation per platform; keep any new
 platform-specific code just as small:
 - `URLSession.streamBytes(for:)` (`AgentGateway/StreamingHTTP.swift`) is
   `bytes(for:)` on macOS and `ResponseByteStream` (delegate-based) on Linux.
+  Its requests share one long-lived `StreamingSession` per owning session.
+  Never create and release a `URLSession` per request on Linux: releasing
+  one after HTTPS aborts the process (swift-corelibs-foundation#5203).
 - stdin in `ACPStdioTransport` is `FileHandle.bytes.lines` on macOS and
   `InputLines` (`DispatchIO`) on Linux.
 Both Linux types build everywhere and are tested on macOS too. To run the
