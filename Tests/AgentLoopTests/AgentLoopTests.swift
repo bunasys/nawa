@@ -396,10 +396,12 @@ func finalResult(_ stream: AsyncThrowingStream<AgentEvent, any Error>) async thr
 /// Replies from a fallback provider (`ModelResponse.providerName` other than
 /// the gateway's own) are reported, and end a run that has a budget cap.
 struct FallbackProviderLoopTests {
+    /// A reply as `Gateway` stamps it, with "scripted" as the preferred provider.
     private func reply(from provider: String, text: String = "done") -> ModelResponse {
         ModelResponse(
             message: Message(role: .assistant, text: text), finishReason: .endTurn,
-            usage: Usage(inputTokens: 10, outputTokens: 2), model: "\(provider)-model", providerName: provider
+            usage: Usage(inputTokens: 10, outputTokens: 2), model: "\(provider)-model", providerName: provider,
+            replacedProvider: provider == "scripted" ? nil : "scripted"
         )
     }
 
@@ -477,6 +479,23 @@ struct FallbackProviderLoopTests {
         let (notes, _) = try await run(loop, "go")
 
         #expect(notes.filter { $0.contains("answered instead of") } == ["Model provider fallback (fallback-model) answered instead of scripted."])
+    }
+
+    /// The gateway decides what was preferred: a reply it didn't mark as a
+    /// fallback is never one, whatever the loop's model calls itself (an
+    /// unknown provider name, a wrapper around a gateway).
+    @Test
+    func aReplyTheGatewayDidNotMarkIsNoSwitchEvenWithABudgetCap() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, text: "done"), finishReason: .endTurn, model: "m", providerName: "inner-name"),
+        ])
+        let options = LoopOptions(maxBudgetUSD: 100, pricing: Pricing(inputPer1K: 1))
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: options)
+
+        let (notes, result) = try await run(loop, "hi")
+
+        #expect(notes.isEmpty)
+        #expect(result?.isSuccess == true)
     }
 
     @Test

@@ -101,6 +101,9 @@ public struct ModelResponse: Sendable {
     /// The configured provider that answered, set by `Gateway`. With
     /// fallback providers it can differ from the active one.
     public var providerName: String?
+    /// Set by `Gateway` when a fallback answered: the provider the request
+    /// was meant for. Nil when that provider answered itself.
+    public var replacedProvider: String?
 
     public init(
         message: Message,
@@ -109,7 +112,8 @@ public struct ModelResponse: Sendable {
         model: String? = nil,
         refusal: RefusalDetails? = nil,
         declinedBy: [String] = [],
-        providerName: String? = nil
+        providerName: String? = nil,
+        replacedProvider: String? = nil
     ) {
         self.message = message
         self.finishReason = finishReason
@@ -118,6 +122,7 @@ public struct ModelResponse: Sendable {
         self.refusal = refusal
         self.declinedBy = declinedBy
         self.providerName = providerName
+        self.replacedProvider = replacedProvider
     }
 }
 

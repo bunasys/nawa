@@ -27,6 +27,8 @@ public struct Gateway: LanguageModel, Sendable {
     public var apiKeyOverrides: [String: String]
     public let session: URLSession
     /// Shared by copies of this gateway, so they all skip a failed provider.
+    /// A new `Gateway` starts with no cooldowns: keep one for as long as the
+    /// process (or the session) runs, rather than one per request.
     let failover: GatewayFailover
 
     public init(
@@ -87,9 +89,10 @@ public struct Gateway: LanguageModel, Sendable {
     public var providerName: String { activeProvider?.name ?? "gateway" }
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
-        try await withFailover(request) { provider, attempt in
+        try await withFailover(request) { provider, preferred, attempt in
             var response = try await client(for: provider).complete(attempt)
             response.providerName = provider.name
+            response.replacedProvider = provider.name == preferred.name ? nil : preferred.name
             return response
         }
     }
@@ -101,7 +104,7 @@ public struct Gateway: LanguageModel, Sendable {
             let task = Task {
                 do {
                     var hasYielded = false
-                    try await self.withFailover(request, mayFailOver: { !hasYielded }) { provider, attempt in
+                    try await self.withFailover(request, mayFailOver: { !hasYielded }) { provider, preferred, attempt in
                         for try await chunk in self.client(for: provider).stream(attempt) {
                             hasYielded = true
                             guard case .finished(var response) = chunk else {
@@ -109,6 +112,7 @@ public struct Gateway: LanguageModel, Sendable {
                                 continue
                             }
                             response.providerName = provider.name
+                            response.replacedProvider = provider.name == preferred.name ? nil : preferred.name
                             continuation.yield(.finished(response))
                         }
                     }
@@ -127,7 +131,7 @@ public struct Gateway: LanguageModel, Sendable {
     private func withFailover<T>(
         _ request: ModelRequest,
         mayFailOver: () -> Bool = { true },
-        _ call: (ProviderConfig, ModelRequest) async throws -> T
+        _ call: (_ provider: ProviderConfig, _ preferred: ProviderConfig, ModelRequest) async throws -> T
     ) async throws -> T {
         let preferred = try preferredProvider(for: request)
         let chain = providerChain(for: request, preferred: preferred)
@@ -141,7 +145,7 @@ public struct Gateway: LanguageModel, Sendable {
                 let isPreferred = provider.name == preferred.name
                 var attempt = request
                 attempt.model = try await model(for: provider, client: client(for: provider), requested: isPreferred ? request.model : nil)
-                return try await call(provider, attempt)
+                return try await call(provider, preferred, attempt)
             } catch {
                 // A cancelled call may surface as a network error; it says nothing about the provider.
                 let isUnavailable = !Task.isCancelled && GatewayFailover.isProviderUnavailable(error)

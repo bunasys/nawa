@@ -171,7 +171,7 @@ public final class AgentLoop: @unchecked Sendable {
                         }
                         self._usage.accumulate(response.usage)
                         self._contextTokens = response.usage.total
-                        try self.checkAnsweringProvider(response, for: request) { note in
+                        try self.checkAnsweringProvider(response) { note in
                             self.emit(note)
                             continuation.yield(note)
                         }
@@ -548,7 +548,7 @@ public final class AgentLoop: @unchecked Sendable {
         )
         let response = try await gateway.complete(request)
         recordUsage(response.usage, helper: true)
-        try checkAnsweringProvider(response, for: request, report: report)
+        try checkAnsweringProvider(response, report: report)
 
         var summary = "Summary of the conversation so far (older messages were compacted):\n\n\(response.message.text)"
         if !_notes.isEmpty {
@@ -576,17 +576,18 @@ public final class AgentLoop: @unchecked Sendable {
     /// answered (see `Gateway.fallbackProviderNames`), or the preferred
     /// provider is back. A fallback's reply also ends a run with a budget
     /// cap, for a model that fails over despite `mayFailOver`.
-    private func checkAnsweringProvider(_ response: ModelResponse, for request: ModelRequest, report: (AgentEvent) -> Void) throws {
-        let preferred = request.providerName ?? gateway.providerName
-        let answering = response.providerName ?? preferred
-        let previous = _answeringProvider ?? preferred
+    ///
+    /// Which provider was meant is the gateway's word (`replacedProvider`),
+    /// not worked out again here: it knows how it resolved the request.
+    private func checkAnsweringProvider(_ response: ModelResponse, report: (AgentEvent) -> Void) throws {
+        guard let answering = response.providerName else { return }
+        let previous = _answeringProvider ?? response.replacedProvider ?? answering
         _answeringProvider = answering
         if answering != previous {
             let model = response.model.map { " (\($0))" } ?? ""
             report(.informational("Model provider \(answering)\(model) answered instead of \(previous)."))
         }
-        let isFallback = answering != preferred
-        if isFallback && !mayFailOver {
+        if let preferred = response.replacedProvider, !mayFailOver {
             throw UnpricedFallbackError(provider: answering, preferred: preferred)
         }
     }

@@ -40,6 +40,7 @@ struct FailoverTests {
 
         #expect(response.message.text == "from fallback")
         #expect(response.providerName == "fallback")
+        #expect(response.replacedProvider == "primary")
         let sentToFallback = StubURLProtocol.bodies(host: fallback)
         #expect(sentToFallback.count == 1)
         #expect(sentToFallback[0].contains(#""model":"fallback-model""#))
@@ -221,6 +222,18 @@ struct FailoverTests {
 
         #expect(gateway.failover.isCoolingDown("primary"))
         #expect(gateway.failover.isCoolingDown("fallback"))
+    }
+
+    @Test
+    func anUnknownProviderNameMeansTheActiveOneAndIsNotAFallback() async throws {
+        let (primary, fallback) = ("unknown-name.primary.test", "unknown-name.fallback.test")
+        let session = StubURLProtocol.session(host: primary, replies: [reply("ok", model: "primary-model")])
+
+        let response = try await gateway(primary: primary, fallback: fallback, session: session)
+            .complete(ModelRequest(providerName: "no-such-provider", messages: hello))
+
+        #expect(response.providerName == "primary")
+        #expect(response.replacedProvider == nil)
     }
 
     @Test
