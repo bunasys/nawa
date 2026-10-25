@@ -342,12 +342,37 @@ struct ResponseByteStreamTests {
             configuration.timeoutIntervalForRequest = timeout
             return URLSession(configuration: configuration)
         }
+        // A released URLSession is freed at once (checked on macOS and Linux),
+        // which clears the streaming session's weak reference to it.
         var first: URLSession? = session(timeout: 123.25)
         let streaming = StreamingSession.for(first!)
         first = nil
 
         #expect(StreamingSession.for(session(timeout: 123.25)) === streaming)
         #expect(StreamingSession.for(session(timeout: 456.75)) !== streaming)
+    }
+
+    @Test
+    func sharedStreamingSessionsKeepNoCookiesCredentialsOrCache() {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 321.5
+        let stateless = StreamingSession.stateless(configuration)
+        #expect(stateless.httpCookieStorage == nil)
+        #expect(stateless.httpShouldSetCookies == false)
+        #expect(stateless.urlCredentialStorage == nil)
+        #expect(stateless.urlCache == nil)
+        #expect(stateless.timeoutIntervalForRequest == 321.5)
+        // The caller's configuration is left as it was.
+        #expect(configuration.httpCookieStorage != nil)
+    }
+
+    @Test
+    func differentProxiesDoNotShareAStreamingSession() {
+        let direct = URLSessionConfiguration.ephemeral
+        let proxied = URLSessionConfiguration.ephemeral
+        proxied.connectionProxyDictionary = ["HTTPSProxy": "proxy.example", "HTTPSPort": 8080]
+        #expect(!StreamingSession.sameSettings(direct, proxied))
+        #expect(StreamingSession.sameSettings(direct, URLSessionConfiguration.ephemeral))
     }
 
     @Test(.timeLimit(.minutes(1)))

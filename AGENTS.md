@@ -122,6 +122,9 @@ platform-specific code just as small:
   Its requests share one long-lived `StreamingSession` per owning session.
   Never create and release a `URLSession` per request on Linux: releasing
   one after HTTPS aborts the process (swift-corelibs-foundation#5203).
+  That covers streaming only. A non-streaming HTTPS call made directly on
+  a short-lived session still hits the bug, so keep the sessions that
+  `complete` and model discovery use long-lived (`URLSession.shared` is).
 - stdin in `ACPStdioTransport` is `FileHandle.bytes.lines` on macOS and
   `InputLines` (`DispatchIO`) on Linux.
 Both Linux types build everywhere and are tested on macOS too. To run the

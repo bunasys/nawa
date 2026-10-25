@@ -52,19 +52,43 @@ struct ResponseByteStream: AsyncSequence, Sendable {
         let (chunks, continuation) = AsyncThrowingStream<Data, any Error>.makeStream()
         let handler = RequestHandler(chunks: continuation)
         let streaming = StreamingSession.for(owner)
-        let task = streaming.dataTask(with: request, handler: handler)
+        // The task is made only when the request starts, so a request cancelled
+        // before that leaves nothing behind in the long-lived session. Starting
+        // and cancelling decide under this lock, so neither can slip in between.
+        let phase = Mutex(RequestPhase.waiting)
+        @Sendable func cancel() {
+            let before = phase.withLock { phase in
+                defer { phase = .cancelled }
+                return phase
+            }
+            // Act outside the lock: ending the stream runs `onTermination`,
+            // which calls this again (and then finds `.cancelled`).
+            switch before {
+            case .waiting:
+                handler.completed(error: URLError(.cancelled), response: nil)
+            case .started(let task):
+                streaming.cancel(task)
+            case .cancelled:
+                break
+            }
+        }
         // Stopping the reader (or dropping the stream) stops the download.
-        continuation.onTermination = { _ in streaming.cancel(task) }
+        continuation.onTermination = { _ in cancel() }
 
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (waiter: CheckedContinuation<URLResponse, any Error>) in
                 // Already cancelled: the waiter has its answer, don't start the request.
-                if handler.awaitResponse(waiter) {
-                    task.resume()
+                guard handler.awaitResponse(waiter) else { return }
+                let task = phase.withLock { phase -> URLSessionDataTask? in
+                    guard case .waiting = phase else { return nil }
+                    let task = streaming.dataTask(with: request, handler: handler)
+                    phase = .started(task)
+                    return task
                 }
+                task?.resume()
             }
         } onCancel: {
-            streaming.cancel(task)
+            cancel()
         }
         return (ResponseByteStream(chunks: chunks), response)
     }
@@ -89,6 +113,13 @@ struct ResponseByteStream: AsyncSequence, Sendable {
         }
     }
 
+}
+
+/// Where one streamed request is: not started yet, running, or cancelled.
+private enum RequestPhase: @unchecked Sendable {
+    case waiting
+    case started(URLSessionDataTask)
+    case cancelled
 }
 
 /// Hands one request's response over once, then its body chunks, then the end.
@@ -169,6 +200,8 @@ private final class RequestHandler: Sendable {
 /// So that callers who make a URLSession per client don't grow the list
 /// without bound, a released owner's streaming session serves the next
 /// owner with the same settings. Distinct settings still add one each.
+/// Sharing is safe because these sessions keep no per-client state: no
+/// cookies, credentials or cache (see `stateless(_:)`).
 final class StreamingSession: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     /// Every streaming session made so far. Entries are never removed:
     /// removing one would release its session.
@@ -192,16 +225,28 @@ final class StreamingSession: NSObject, URLSessionDataDelegate, @unchecked Senda
                 reusable.owner = owner
                 return reusable
             }
-            let created = StreamingSession(owner: owner, configuration: configuration)
+            let created = StreamingSession(owner: owner, configuration: stateless(configuration))
             all.append(created)
             return created
         }
     }
 
-    /// The settings that change how a streamed API call behaves. Caches and
-    /// cookie stores are left out: streamed calls are uncached POSTs, and an
-    /// ephemeral configuration gets new stores every time, so comparing them
-    /// would never match.
+    /// `configuration` without anything that remembers one client for the
+    /// next: cookies, stored credentials and cached responses. Streamed calls
+    /// are API POSTs authenticated per request, so they need none of it.
+    static func stateless(_ configuration: URLSessionConfiguration) -> URLSessionConfiguration {
+        let copy = configuration.copy() as! URLSessionConfiguration
+        copy.httpCookieStorage = nil
+        copy.httpShouldSetCookies = false
+        copy.urlCredentialStorage = nil
+        copy.urlCache = nil
+        copy.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return copy
+    }
+
+    /// The settings that change how a streamed API call behaves. Cookies,
+    /// credentials and caches are left out because `stateless(_:)` removes
+    /// them from every streaming session.
     static func sameSettings(_ a: URLSessionConfiguration, _ b: URLSessionConfiguration) -> Bool {
         func protocolNames(_ configuration: URLSessionConfiguration) -> [String] {
             (configuration.protocolClasses ?? []).map { String(reflecting: $0) }
@@ -214,7 +259,23 @@ final class StreamingSession: NSObject, URLSessionDataDelegate, @unchecked Senda
         let sameConnections = a.httpMaximumConnectionsPerHost == b.httpMaximumConnectionsPerHost
         let sameProtocols = protocolNames(a) == protocolNames(b)
         let sameHeaders = headers(a) == headers(b)
-        return sameTimeouts && sameConnections && sameProtocols && sameHeaders
+        let sameProxy = proxy(a) == proxy(b)
+        return sameTimeouts && sameConnections && sameProtocols && sameHeaders && sameProxy && samePlatformSettings(a, b)
+    }
+
+    private static func proxy(_ configuration: URLSessionConfiguration) -> [String] {
+        (configuration.connectionProxyDictionary ?? [:]).map { "\($0.key): \($0.value)" }.sorted()
+    }
+
+    /// Settings only Apple's Foundation has.
+    private static func samePlatformSettings(_ a: URLSessionConfiguration, _ b: URLSessionConfiguration) -> Bool {
+        #if canImport(FoundationNetworking)
+        return true
+        #else
+        return a.waitsForConnectivity == b.waitsForConnectivity
+            && a.tlsMinimumSupportedProtocolVersion == b.tlsMinimumSupportedProtocolVersion
+            && a.tlsMaximumSupportedProtocolVersion == b.tlsMaximumSupportedProtocolVersion
+        #endif
     }
 
     private init(owner: URLSession, configuration: URLSessionConfiguration) {
