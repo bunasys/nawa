@@ -39,6 +39,7 @@ struct FailoverTests {
             .complete(ModelRequest(model: "primary-model", messages: hello))
 
         #expect(response.message.text == "from fallback")
+        #expect(response.providerName == "fallback")
         let sentToFallback = StubURLProtocol.bodies(host: fallback)
         #expect(sentToFallback.count == 1)
         #expect(sentToFallback[0].contains(#""model":"fallback-model""#))
@@ -102,6 +103,61 @@ struct FailoverTests {
 
         #expect(deltas == ["text:streamed"])
         #expect(response?.message.text == "streamed")
+    }
+
+    /// Real sockets from here on: the stub answers at once, and these need a
+    /// reply that is cut off or never ends. Port 1 refuses connections.
+    private func socketGateway(primary: String, fallback: String) -> Gateway {
+        Gateway(
+            providers: [
+                ProviderConfig(name: "primary", baseURL: URL(string: "\(primary)/v1")!, model: "m"),
+                ProviderConfig(name: "fallback", baseURL: URL(string: "\(fallback)/v1")!, model: "m"),
+            ],
+            activeProviderName: "primary",
+            fallbackProviderNames: ["fallback"]
+        )
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aStreamThatBreaksAfterItsFirstChunkDoesNotFailOver() async throws {
+        let server = try HangingHTTPServer(firstBytes: sse([#"{"choices":[{"delta":{"content":"Hel"}}]}"#]))
+        let gateway = socketGateway(primary: "http://127.0.0.1:\(server.port)", fallback: "http://127.0.0.1:1")
+
+        var deltas: [String] = []
+        do {
+            for try await chunk in gateway.stream(ModelRequest(messages: hello)) {
+                guard case .textDelta(let text) = chunk else { continue }
+                deltas.append(text)
+                server.close()
+            }
+            Issue.record("expected the cut-off stream to fail")
+        } catch GatewayError.providersFailed(let failures) {
+            Issue.record("failed over after the first chunk: \(failures)")
+        } catch {
+            // The primary's own error: nothing went to the fallback.
+        }
+        #expect(deltas == ["Hel"])
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func cancellingDuringAFailoverIsReportedAsACancellation() async throws {
+        // Not empty: an empty chunk would end the chunked body.
+        let server = try HangingHTTPServer(firstBytes: "{")
+        defer { server.close() }
+        let gateway = socketGateway(primary: "http://127.0.0.1:1", fallback: "http://127.0.0.1:\(server.port)")
+
+        let call = Task { try await gateway.complete(ModelRequest(messages: hello)) }
+        while !server.hasAccepted { try await Task.sleep(for: .milliseconds(10)) }
+        call.cancel()
+
+        do {
+            _ = try await call.value
+            Issue.record("expected the cancelled call to fail")
+        } catch GatewayError.providersFailed(let failures) {
+            Issue.record("a cancellation came back as a provider failure: \(failures)")
+        } catch {
+            #expect(!GatewayFailover.isProviderUnavailable(error), "\(error)")
+        }
     }
 
     @Test

@@ -88,7 +88,9 @@ public struct Gateway: LanguageModel, Sendable {
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
         try await withFailover(request) { provider, attempt in
-            try await client(for: provider).complete(attempt)
+            var response = try await client(for: provider).complete(attempt)
+            response.providerName = provider.name
+            return response
         }
     }
 
@@ -102,7 +104,12 @@ public struct Gateway: LanguageModel, Sendable {
                     try await self.withFailover(request, mayFailOver: { !hasYielded }) { provider, attempt in
                         for try await chunk in self.client(for: provider).stream(attempt) {
                             hasYielded = true
-                            continuation.yield(chunk)
+                            guard case .finished(var response) = chunk else {
+                                continuation.yield(chunk)
+                                continue
+                            }
+                            response.providerName = provider.name
+                            continuation.yield(.finished(response))
                         }
                     }
                     continuation.finish()
@@ -130,13 +137,16 @@ public struct Gateway: LanguageModel, Sendable {
                 // Model ids are per provider: the requested one is for the preferred provider only.
                 let isPreferred = provider.name == preferred.name
                 var attempt = request
-                attempt.model = try await model(for: provider, requested: isPreferred ? request.model : nil)
+                attempt.model = try await model(for: provider, client: client(for: provider), requested: isPreferred ? request.model : nil)
                 return try await call(provider, attempt)
             } catch {
                 let isLast = provider.name == chain.last?.name
                 let canMoveOn = !isLast && GatewayFailover.isProviderUnavailable(error) && mayFailOver()
                 guard canMoveOn else {
-                    throw failures.isEmpty ? error : GatewayError.providersFailed(failures + ["\(provider.name): \(error)"])
+                    // Only a run of unavailable providers is summed up: a
+                    // cancellation or a bad request must keep its own type.
+                    let isWholeChainDown = !failures.isEmpty && GatewayFailover.isProviderUnavailable(error)
+                    throw isWholeChainDown ? GatewayError.providersFailed(failures + ["\(provider.name): \(error)"]) : error
                 }
                 failover.markFailed(provider.name)
                 failures.append("\(provider.name): \(error)")
@@ -180,22 +190,7 @@ public struct Gateway: LanguageModel, Sendable {
     /// Precedence: explicit request model → active provider's configured model
     /// → auto model discovery (`GET /v1/models`, filtered by whitelist).
     public func resolveModel(client: any LanguageModel, requested: String?) async throws -> String {
-        if let requested { return requested }
-        if let configured = activeProvider?.model { return configured }
-        return try await autoDiscover(client: client)
-    }
-
-    /// The same precedence as `resolveModel`, for any one provider.
-    private func model(for provider: ProviderConfig, requested: String?) async throws -> String {
-        if let requested { return requested }
-        if let configured = provider.model { return configured }
-        let models = try await client(for: provider).listModels()
-        let whitelist = provider.modelWhitelist
-        let candidates = models.filter { whitelist == nil || whitelist!.contains($0.id) }
-        guard let first = candidates.first ?? models.first else {
-            throw GatewayError.modelNotFound("no models advertised by \(provider.name)")
-        }
-        return first.id
+        try await model(for: activeProvider, client: client, requested: requested)
     }
 
     /// Auto model discovery: list models, filter by whitelist, pick the first.
@@ -205,8 +200,21 @@ public struct Gateway: LanguageModel, Sendable {
 
     /// Auto model discovery: list models, filter by whitelist, pick the first.
     public func autoDiscover(client: any LanguageModel) async throws -> String {
+        try await model(for: activeProvider, client: client, requested: nil, ignoringConfigured: true)
+    }
+
+    /// The model for a request to `provider` (nil: none configured), with
+    /// the precedence `resolveModel` describes.
+    private func model(
+        for provider: ProviderConfig?,
+        client: any LanguageModel,
+        requested: String?,
+        ignoringConfigured: Bool = false
+    ) async throws -> String {
+        if let requested { return requested }
+        if !ignoringConfigured, let configured = provider?.model { return configured }
         let models = try await client.listModels()
-        let whitelist = activeProvider?.modelWhitelist
+        let whitelist = provider?.modelWhitelist
         let candidates = models.filter { whitelist == nil || whitelist!.contains($0.id) }
         guard let first = candidates.first ?? models.first else {
             throw GatewayError.modelNotFound("no models advertised by \(client.providerName)")

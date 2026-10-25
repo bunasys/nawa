@@ -105,6 +105,9 @@ final class HangingHTTPServer: @unchecked Sendable {
         }.start()
     }
 
+    /// Whether a client has connected yet.
+    var hasAccepted: Bool { accepted.withLock { $0 >= 0 } }
+
     func close() {
         shutdown(listener, Int32(SHUT_RDWR))
         Foundation.close(listener)

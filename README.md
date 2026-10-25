@@ -171,6 +171,12 @@ it before every call. A streamed reply fails over only before its first
 chunk. A request that names a provider (`ModelRequest.providerName`) never
 fails over. In code, pass `fallbackProviderNames` to `Gateway`.
 
+A switch is never silent: each reply carries the provider that wrote it
+(`ModelResponse.providerName`), and the agent loop reports every change as
+an informational event. A cost estimate uses one `pricing` for the run, so
+it can't price a fallback's tokens: a run with `maxBudgetUSD` stops when a
+fallback answers, rather than spend past a cap it can no longer enforce.
+
 ## Anthropic
 
 Anthropic (and Anthropic-compatible gateways) use the Messages API rather

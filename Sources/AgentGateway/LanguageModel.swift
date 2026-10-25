@@ -93,6 +93,9 @@ public struct ModelResponse: Sendable {
     /// Models that declined this request before `model` answered it
     /// (Anthropic's server-side fallback), in order.
     public var declinedBy: [String]
+    /// The configured provider that answered, set by `Gateway`. With
+    /// fallback providers it can differ from the active one.
+    public var providerName: String?
 
     public init(
         message: Message,
@@ -100,7 +103,8 @@ public struct ModelResponse: Sendable {
         usage: Usage = .zero,
         model: String? = nil,
         refusal: RefusalDetails? = nil,
-        declinedBy: [String] = []
+        declinedBy: [String] = [],
+        providerName: String? = nil
     ) {
         self.message = message
         self.finishReason = finishReason
@@ -108,6 +112,7 @@ public struct ModelResponse: Sendable {
         self.model = model
         self.refusal = refusal
         self.declinedBy = declinedBy
+        self.providerName = providerName
     }
 }
 

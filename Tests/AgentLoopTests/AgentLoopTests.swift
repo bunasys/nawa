@@ -392,3 +392,62 @@ func finalResult(_ stream: AsyncThrowingStream<AgentEvent, any Error>) async thr
     }
     return try #require(final)
 }
+
+/// Replies from a fallback provider (`ModelResponse.providerName` other than
+/// the gateway's own) are reported, and end a run that has a budget cap.
+struct FallbackProviderLoopTests {
+    private func reply(from provider: String, text: String = "done") -> ModelResponse {
+        ModelResponse(
+            message: Message(role: .assistant, text: text), finishReason: .endTurn,
+            usage: Usage(inputTokens: 10, outputTokens: 2), model: "\(provider)-model", providerName: provider
+        )
+    }
+
+    private func run(_ loop: AgentLoop, _ prompt: String) async throws -> (notes: [String], result: AgentResult?) {
+        var notes: [String] = []
+        var result: AgentResult?
+        for try await event in loop.run(prompt: prompt, continuing: true) {
+            if case .informational(let note) = event { notes.append(note) }
+            if case .result(let final) = event { result = final }
+        }
+        return (notes, result)
+    }
+
+    @Test
+    func aSwitchToAFallbackAndBackIsReportedOnce() async throws {
+        // ScriptedModel's providerName is "scripted": that is the preferred provider.
+        let model = ScriptedModel(responses: [reply(from: "fallback"), reply(from: "fallback"), reply(from: "scripted")])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+
+        let first = try await run(loop, "one")
+        let second = try await run(loop, "two")
+        let third = try await run(loop, "three")
+
+        #expect(first.notes == ["Model provider fallback (fallback-model) answered instead of scripted."])
+        #expect(second.notes.isEmpty)
+        #expect(third.notes == ["Model provider scripted (scripted-model) answered instead of fallback."])
+        #expect(third.result?.isSuccess == true)
+    }
+
+    @Test
+    func aFallbackReplyEndsARunWithABudgetCap() async throws {
+        let model = ScriptedModel(responses: [reply(from: "fallback")])
+        let options = LoopOptions(maxBudgetUSD: 100, pricing: Pricing(inputPer1K: 1))
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: options)
+
+        let (_, result) = try await run(loop, "hi")
+
+        #expect(result?.isSuccess == false)
+        #expect(result?.errorMessage?.contains("budget cap can't be enforced") == true)
+    }
+
+    @Test
+    func aFallbackReplyIsFineWithoutABudgetCap() async throws {
+        let model = ScriptedModel(responses: [reply(from: "fallback")])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: LoopOptions(pricing: Pricing(inputPer1K: 1)))
+
+        let (_, result) = try await run(loop, "hi")
+
+        #expect(result?.isSuccess == true)
+    }
+}

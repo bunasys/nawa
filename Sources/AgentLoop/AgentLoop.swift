@@ -65,6 +65,8 @@ public final class AgentLoop: @unchecked Sendable {
     private var _runPromptIndex = 0
     /// The last refusal of the current run, reported with its result.
     private var _lastRefusal: RefusalNotice?
+    /// The provider that wrote the last reply, when the gateway said so.
+    private var _answeringProvider: String?
     /// The prompt a model declined in the last run, kept until the next run
     /// or a compaction so `removeDeclinedRequest` can take it out.
     private var _declined: DeclinedRequest?
@@ -168,6 +170,10 @@ public final class AgentLoop: @unchecked Sendable {
                         }
                         self._usage.accumulate(response.usage)
                         self._contextTokens = response.usage.total
+                        try self.checkAnsweringProvider(response) { note in
+                            self.emit(note)
+                            continuation.yield(note)
+                        }
 
                         // Enforce the spend cap, if any.
                         if let maxBudget = self.options.maxBudgetUSD,
@@ -540,6 +546,7 @@ public final class AgentLoop: @unchecked Sendable {
         )
         let response = try await gateway.complete(request)
         recordUsage(response.usage, helper: true)
+        try checkAnsweringProvider(response) { note in emit(note) }
 
         var summary = "Summary of the conversation so far (older messages were compacted):\n\n\(response.message.text)"
         if !_notes.isEmpty {
@@ -555,6 +562,27 @@ public final class AgentLoop: @unchecked Sendable {
 
     // MARK: Cost
 
+    /// Reports a reply from another provider than the last one: a fallback
+    /// answered (see `Gateway.fallbackProviderNames`), or the preferred
+    /// provider is back. A fallback's reply ends the run when it has a
+    /// budget cap: `options.pricing` is for the preferred provider's model,
+    /// so the cap could no longer be enforced.
+    private func checkAnsweringProvider(_ response: ModelResponse, report: (AgentEvent) -> Void) throws {
+        let preferred = gateway.providerName
+        let answering = response.providerName ?? preferred
+        let previous = _answeringProvider ?? preferred
+        _answeringProvider = answering
+        if answering != previous {
+            let model = response.model.map { " (\($0))" } ?? ""
+            report(.informational("Model provider \(answering)\(model) answered instead of \(previous)."))
+        }
+        let isFallback = answering != preferred
+        let hasBudgetCap = options.maxBudgetUSD != nil && options.pricing != nil
+        if isFallback && hasBudgetCap {
+            throw UnpricedFallbackError(provider: answering, preferred: preferred)
+        }
+    }
+
     /// Approximate US-dollar cost of the conversation so far, from per-token
     /// pricing if configured (nil otherwise). Helper-model usage is priced
     /// with `helperPricing` when that is set.
@@ -568,6 +596,17 @@ public final class AgentLoop: @unchecked Sendable {
 
     private func emit(_ event: AgentEvent) {
         onEvent?(event)
+    }
+}
+
+/// A fallback provider answered a run that has a budget cap.
+struct UnpricedFallbackError: Error, LocalizedError {
+    var provider: String
+    var preferred: String
+
+    var errorDescription: String? {
+        "\(preferred) couldn't serve the request and fallback provider \(provider) answered, "
+            + "but the run's pricing is for \(preferred): stopped, since its budget cap can't be enforced"
     }
 }
 
