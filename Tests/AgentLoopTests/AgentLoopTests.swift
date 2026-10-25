@@ -442,6 +442,28 @@ struct FallbackProviderLoopTests {
     }
 
     @Test
+    func aRunWithABudgetCapAsksNotToFailOverIncludingForCompaction() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("x")])))]), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("y")])))]), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, text: "SUMMARY")),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let options = LoopOptions(
+            maxBudgetUSD: 100, pricing: Pricing(inputPer1K: 0.001),
+            compaction: Compaction(atContextTokens: 400, keepRecentMessages: 2)
+        )
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+
+        let (notes, result) = try await run(loop, "go")
+
+        #expect(result?.text == "done")
+        #expect(notes.contains { $0.hasPrefix("Compacted ") })
+        #expect(model.requests.count == 4)
+        #expect(model.requests.allSatisfy { !$0.mayFailOver })
+    }
+
+    @Test
     func aFallbackReplyIsFineWithoutABudgetCap() async throws {
         let model = ScriptedModel(responses: [reply(from: "fallback")])
         let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: LoopOptions(pricing: Pricing(inputPer1K: 1)))

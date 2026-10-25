@@ -161,7 +161,8 @@ public final class AgentLoop: @unchecked Sendable {
                             messages: self._session.messages,
                             tools: self.options.sendTools ? self.toolDefinitions : nil,
                             maxOutputTokens: self.options.maxOutputTokens,
-                            temperature: self.options.temperature
+                            temperature: self.options.temperature,
+                            mayFailOver: self.mayFailOver
                         )
 
                         let response = try await self.ask(request) { update in
@@ -170,7 +171,7 @@ public final class AgentLoop: @unchecked Sendable {
                         }
                         self._usage.accumulate(response.usage)
                         self._contextTokens = response.usage.total
-                        try self.checkAnsweringProvider(response) { note in
+                        try self.checkAnsweringProvider(response, for: request) { note in
                             self.emit(note)
                             continuation.yield(note)
                         }
@@ -542,11 +543,12 @@ public final class AgentLoop: @unchecked Sendable {
                 Message(role: .user, text: ContextShrinking.transcript(Array(older))),
             ],
             maxOutputTokens: options.maxOutputTokens,
-            temperature: options.temperature
+            temperature: options.temperature,
+            mayFailOver: mayFailOver
         )
         let response = try await gateway.complete(request)
         recordUsage(response.usage, helper: true)
-        try checkAnsweringProvider(response) { note in emit(note) }
+        try checkAnsweringProvider(response, for: request) { note in emit(note) }
 
         var summary = "Summary of the conversation so far (older messages were compacted):\n\n\(response.message.text)"
         if !_notes.isEmpty {
@@ -562,13 +564,20 @@ public final class AgentLoop: @unchecked Sendable {
 
     // MARK: Cost
 
+    /// A run with a budget cap stays on the gateway's preferred provider:
+    /// `options.pricing` is that provider's price, so a fallback's tokens
+    /// couldn't be counted against the cap. Its errors end the run instead.
+    private var mayFailOver: Bool {
+        let hasBudgetCap = options.maxBudgetUSD != nil && options.pricing != nil
+        return !hasBudgetCap
+    }
+
     /// Reports a reply from another provider than the last one: a fallback
     /// answered (see `Gateway.fallbackProviderNames`), or the preferred
-    /// provider is back. A fallback's reply ends the run when it has a
-    /// budget cap: `options.pricing` is for the preferred provider's model,
-    /// so the cap could no longer be enforced.
-    private func checkAnsweringProvider(_ response: ModelResponse, report: (AgentEvent) -> Void) throws {
-        let preferred = gateway.providerName
+    /// provider is back. A fallback's reply also ends a run with a budget
+    /// cap, for a model that fails over despite `mayFailOver`.
+    private func checkAnsweringProvider(_ response: ModelResponse, for request: ModelRequest, report: (AgentEvent) -> Void) throws {
+        let preferred = request.providerName ?? gateway.providerName
         let answering = response.providerName ?? preferred
         let previous = _answeringProvider ?? preferred
         _answeringProvider = answering
@@ -577,8 +586,7 @@ public final class AgentLoop: @unchecked Sendable {
             report(.informational("Model provider \(answering)\(model) answered instead of \(previous)."))
         }
         let isFallback = answering != preferred
-        let hasBudgetCap = options.maxBudgetUSD != nil && options.pricing != nil
-        if isFallback && hasBudgetCap {
+        if isFallback && !mayFailOver {
             throw UnpricedFallbackError(provider: answering, preferred: preferred)
         }
     }

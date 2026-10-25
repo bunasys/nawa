@@ -50,6 +50,9 @@ public struct ModelRequest: Sendable {
     public var tools: [ToolDefinition]?
     public var maxOutputTokens: Int?
     public var temperature: Double?
+    /// False keeps the request on its preferred provider even when the
+    /// gateway has fallbacks (see `Gateway.fallbackProviderNames`).
+    public var mayFailOver: Bool
 
     public init(
         providerName: String? = nil,
@@ -57,7 +60,8 @@ public struct ModelRequest: Sendable {
         messages: [Message],
         tools: [ToolDefinition]? = nil,
         maxOutputTokens: Int? = nil,
-        temperature: Double? = nil
+        temperature: Double? = nil,
+        mayFailOver: Bool = true
     ) {
         self.providerName = providerName
         self.model = model
@@ -65,6 +69,7 @@ public struct ModelRequest: Sendable {
         self.tools = tools
         self.maxOutputTokens = maxOutputTokens
         self.temperature = temperature
+        self.mayFailOver = mayFailOver
     }
 
     /// The model id a wire client must send. `Gateway` fills in the default

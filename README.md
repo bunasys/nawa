@@ -174,8 +174,10 @@ fails over. In code, pass `fallbackProviderNames` to `Gateway`.
 A switch is never silent: each reply carries the provider that wrote it
 (`ModelResponse.providerName`), and the agent loop reports every change as
 an informational event. A cost estimate uses one `pricing` for the run, so
-it can't price a fallback's tokens: a run with `maxBudgetUSD` stops when a
-fallback answers, rather than spend past a cap it can no longer enforce.
+it can't price a fallback's tokens: a run with `maxBudgetUSD` doesn't fail
+over (its requests set `ModelRequest.mayFailOver` to false), and the
+preferred provider's error ends it rather than spend past a cap it could no
+longer enforce.
 
 ## Anthropic
 

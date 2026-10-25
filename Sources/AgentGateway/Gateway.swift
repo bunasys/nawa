@@ -140,15 +140,17 @@ public struct Gateway: LanguageModel, Sendable {
                 attempt.model = try await model(for: provider, client: client(for: provider), requested: isPreferred ? request.model : nil)
                 return try await call(provider, attempt)
             } catch {
+                let isUnavailable = GatewayFailover.isProviderUnavailable(error)
+                if isUnavailable {
+                    failover.markFailed(provider.name)
+                }
                 let isLast = provider.name == chain.last?.name
-                let canMoveOn = !isLast && GatewayFailover.isProviderUnavailable(error) && mayFailOver()
-                guard canMoveOn else {
+                guard isUnavailable && !isLast && mayFailOver() else {
                     // Only a run of unavailable providers is summed up: a
                     // cancellation or a bad request must keep its own type.
-                    let isWholeChainDown = !failures.isEmpty && GatewayFailover.isProviderUnavailable(error)
+                    let isWholeChainDown = !failures.isEmpty && isUnavailable
                     throw isWholeChainDown ? GatewayError.providersFailed(failures + ["\(provider.name): \(error)"]) : error
                 }
-                failover.markFailed(provider.name)
                 failures.append("\(provider.name): \(error)")
             }
         }
@@ -164,20 +166,23 @@ public struct Gateway: LanguageModel, Sendable {
         return provider
     }
 
-    /// The providers to try, in order. A request that names a provider gets
-    /// only that one. Otherwise: the preferred provider, then the fallbacks,
-    /// with any still cooling down from a failure moved to the end (not
-    /// dropped: a provider that may have recovered beats none).
+    /// The providers to try, in order. A request that names a provider, or
+    /// may not fail over, gets only its preferred one. Otherwise: the
+    /// preferred provider, then the fallbacks, with any still cooling down
+    /// from a failure moved to the end (not dropped: a provider that may
+    /// have recovered beats none).
     func providerChain(for request: ModelRequest, preferred: ProviderConfig) -> [ProviderConfig] {
-        guard request.providerName == nil else { return [preferred] }
+        let staysOnPreferred = request.providerName != nil || !request.mayFailOver
+        guard !staysOnPreferred else { return [preferred] }
         var chain = [preferred]
         for name in fallbackProviderNames where !chain.contains(where: { $0.name == name }) {
             // A name with no provider behind it is skipped, like a fallback that is down.
             if let fallback = providers.first(where: { $0.name == name }) { chain.append(fallback) }
         }
-        let available = chain.filter { !failover.isCoolingDown($0.name) }
-        let coolingDown = chain.filter { failover.isCoolingDown($0.name) }
-        return available + coolingDown
+        // One look at the clock for the whole chain, so no provider can fall between the two lists.
+        let now = Date()
+        let coolingDown = Set(chain.map(\.name).filter { failover.isCoolingDown($0, now: now) })
+        return chain.filter { !coolingDown.contains($0.name) } + chain.filter { coolingDown.contains($0.name) }
     }
 
     public func listModels() async throws -> [ModelSummary] {
@@ -222,7 +227,6 @@ public struct Gateway: LanguageModel, Sendable {
         return first.id
     }
 }
-
 
 /// When the gateway moves a request to a fallback provider, and which
 /// providers it is avoiding for now.

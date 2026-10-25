@@ -161,6 +161,31 @@ struct FailoverTests {
     }
 
     @Test
+    func aRequestThatMayNotFailOverStaysOnItsProvider() async throws {
+        let (primary, fallback) = ("pinned.primary.test", "pinned.fallback.test")
+        let session = StubURLProtocol.session(host: primary, replies: [.init(status: 429, pieces: ["slow down"])])
+
+        await #expect(throws: GatewayError.self) {
+            try await gateway(primary: primary, fallback: fallback, session: session)
+                .complete(ModelRequest(messages: hello, mayFailOver: false))
+        }
+        #expect(StubURLProtocol.bodies(host: fallback).isEmpty)
+    }
+
+    @Test
+    func theLastProviderCoolsDownToo() async throws {
+        let (primary, fallback) = ("last.primary.test", "last.fallback.test")
+        _ = StubURLProtocol.session(host: primary, replies: [.init(status: 429, pieces: ["a"])])
+        let session = StubURLProtocol.session(host: fallback, replies: [.init(status: 429, pieces: ["b"])])
+        let gateway = gateway(primary: primary, fallback: fallback, session: session)
+
+        _ = try? await gateway.complete(ModelRequest(messages: hello))
+
+        #expect(gateway.failover.isCoolingDown("primary"))
+        #expect(gateway.failover.isCoolingDown("fallback"))
+    }
+
+    @Test
     func aRequestThatNamesAProviderNeverFailsOver() async throws {
         let (primary, fallback) = ("named.primary.test", "named.fallback.test")
         let session = StubURLProtocol.session(host: primary, replies: [.init(status: 503, pieces: ["down"])])
