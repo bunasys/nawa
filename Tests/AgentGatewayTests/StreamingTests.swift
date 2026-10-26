@@ -114,10 +114,18 @@ final class HangingHTTPServer: @unchecked Sendable {
     /// Whether a client has connected yet.
     var hasAccepted: Bool { accepted.withLock { $0 >= 0 } }
 
+    /// Cut the connection with a reset rather than an orderly close: after
+    /// a plain close, macOS now and then treated the unfinished chunked body
+    /// as a normal end, and the cut-off tests failed on CI.
     func close() {
         shutdown(listener, Int32(SHUT_RDWR))
         Foundation.close(listener)
-        accepted.withLock { if $0 >= 0 { Foundation.close($0) } }
+        accepted.withLock { connection in
+            guard connection >= 0 else { return }
+            var resetOnClose = linger(l_onoff: 1, l_linger: 0)
+            _ = setsockopt(connection, SOL_SOCKET, SO_LINGER, &resetOnClose, socklen_t(MemoryLayout<linger>.size))
+            Foundation.close(connection)
+        }
     }
 }
 
