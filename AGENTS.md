@@ -38,7 +38,9 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   providers tried in order when one can't serve (`fallbackProviderNames`,
   `GatewayFailover` cooldowns; `ModelRequest.mayFailOver` opts out;
   `ModelResponse.providerName`/`replacedProvider` say who answered) and auto
-  model discovery (`GET /v1/models`), `ProviderConfig`,
+  model discovery (`GET /v1/models`), `ProviderConfig` (its
+  `requestTimeout`, 600 s by default, is how long a call waits before it
+  fails over),
   `AgentConfigStore` (the per-directory config file written by `nawa config`).
 - `Sources/AgentJSONRPC` — JSON-RPC 2.0 envelope shared by MCP and ACP.
 - `Sources/AgentTools` — built-in tools: `ShellTool`, `ReadFileTool`,
@@ -46,7 +48,8 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `FileWalk` gives the same results, .gitignore included), `CurrentTimeTool`,
   `EchoTool` (tests/demos), and `ToolSearchTool` / `CallToolTool`, which put
   large MCP tool sets behind two tools. Tools that touch files take the
-  session's `workingDirectory`. Long output is cut to head + tail with the
+  session's `workingDirectory`. `read_file` reads whole files (up to 2000
+  lines) by default, since paging costs a model call per page. Long output is cut to head + tail with the
   full text saved to a temp file (`CapturedOutput`).
 - `Sources/AgentInstructions` — `ProjectInstructions`: loads AGENTS.md from a
   directory, root-first / nearest-last so the closest file wins.

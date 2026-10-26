@@ -1,14 +1,16 @@
 import AgentCore
 import Foundation
 
-/// Reads part of a text file as numbered lines.
+/// Reads a text file as numbered lines. The line numbers let the model point
+/// at code precisely.
 ///
-/// Reading a window instead of the whole file (`cat`) keeps tool output, and
-/// so every later request, small. The line numbers let the model point at
-/// code precisely.
+/// Whole files by default: paging through a file in windows costs a model
+/// call per window, and agents then grep and read line ranges instead
+/// (seen in Hafez's review logs), which costs more calls than the lines save.
+/// The cap only keeps a huge generated file from flooding the context.
 public struct ReadFileTool: Tool {
     public let workingDirectory: URL
-    static let defaultLimit = 400
+    static let defaultLimit = 2000
 
     public init(workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) {
         self.workingDirectory = workingDirectory
@@ -18,8 +20,9 @@ public struct ReadFileTool: Tool {
         ToolDefinition(
             name: "read_file",
             description: """
-            Read a text file as numbered lines, \(Self.defaultLimit) lines at a time by default. \
-            Use offset and limit to read a specific part; use search to find the lines you need first.
+            Read a text file as numbered lines: the whole file, up to \(Self.defaultLimit) lines. \
+            Read a file once, whole, rather than in parts; use offset and limit only for a file \
+            longer than that. To read several files, call read_file for each in the same turn.
             """,
             parameters: .object([
                 "type": .string("object"),

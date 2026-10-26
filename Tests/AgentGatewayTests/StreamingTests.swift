@@ -287,6 +287,34 @@ struct OpenAIStreamingTests {
         #expect(StubURLProtocol.timeouts(host: host) == [600, 600])
     }
 
+    /// A caller that knows its replies are quick sets a shorter wait per
+    /// provider, so a hanging provider fails over in minutes, not ten.
+    @Test
+    func aProvidersRequestTimeoutReachesItsRequests() async throws {
+        let (openAIHost, anthropicHost) = ("quick-openai.test", "quick-anthropic.test")
+        _ = StubURLProtocol.session(host: openAIHost, replies: [
+            .init(pieces: [#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#]),
+        ])
+        let session = StubURLProtocol.session(host: anthropicHost, replies: [
+            .init(pieces: [#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#]),
+        ])
+        let gateway = Gateway(
+            providers: [
+                ProviderConfig(name: "openai", baseURL: URL(string: "https://\(openAIHost)/v1")!, apiKey: "k", model: "m", requestTimeout: 120),
+                ProviderConfig(name: "claude", api: .anthropic, baseURL: URL(string: "https://\(anthropicHost)")!, apiKey: "k", model: "m", requestTimeout: 90),
+            ],
+            activeProviderName: "openai",
+            session: session
+        )
+        let request = ModelRequest(model: "m", messages: [Message(role: .user, text: "hi")])
+
+        _ = try await gateway.client(for: "openai").complete(request)
+        _ = try await gateway.client(for: "claude").complete(request)
+
+        #expect(StubURLProtocol.timeouts(host: openAIHost) == [120])
+        #expect(StubURLProtocol.timeouts(host: anthropicHost) == [90])
+    }
+
     /// Providers cache the longest identical prefix of a request, so the
     /// same request must be the same bytes every turn, though its tool
     /// schemas are dictionaries rebuilt each time.

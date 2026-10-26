@@ -65,7 +65,9 @@ public struct Gateway: LanguageModel, Sendable {
         switch provider.api ?? .openAI {
         case .openAI:
             return OpenAICompatibleClient(
-                providerName: provider.name, baseURL: provider.baseURL, apiKey: apiKey, session: session
+                providerName: provider.name, baseURL: provider.baseURL, apiKey: apiKey,
+                requestTimeout: provider.requestTimeout ?? OpenAICompatibleClient.defaultRequestTimeout,
+                session: session
             )
         case .anthropic:
             // Same precedence as Anthropic's SDKs: an API key shadows federation.
@@ -79,6 +81,7 @@ public struct Gateway: LanguageModel, Sendable {
                 workspaceID: provider.workspaceID,
                 workloadIdentity: workloadIdentity,
                 serverFallbacks: provider.usesServerFallbacks,
+                requestTimeout: provider.requestTimeout ?? AnthropicClient.defaultRequestTimeout,
                 session: session
             )
         }
