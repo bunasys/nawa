@@ -14,17 +14,21 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
     public let providerName: String
     public let baseURL: URL
     public let apiKey: String?
+    /// Seconds a request may wait for its reply; see `defaultRequestTimeout`.
+    public let requestTimeout: TimeInterval
     public let session: URLSession
 
     public init(
         providerName: String,
         baseURL: URL,
         apiKey: String? = nil,
+        requestTimeout: TimeInterval = Self.defaultRequestTimeout,
         session: URLSession = .shared
     ) {
         self.providerName = providerName
         self.baseURL = baseURL
         self.apiKey = apiKey
+        self.requestTimeout = requestTimeout
         self.session = session
     }
 
@@ -39,7 +43,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             temperature: request.temperature,
             maxTokens: request.maxOutputTokens
         )
-        let data = try await Self.post(session: session, url: chatCompletionsURL, apiKey: apiKey, sessionID: request.sessionID, body: body)
+        let data = try await Self.post(session: session, url: chatCompletionsURL, apiKey: apiKey, sessionID: request.sessionID, timeout: requestTimeout, body: body)
         do {
             let response = try JSONDecoder().decode(OpenAIResponse.self, from: data)
             guard let choice = response.choices.first, let message = choice.message else {
@@ -77,8 +81,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
     /// A chat reply can take minutes before its first byte: a long context, a
     /// slow model, or a proxy in front that waits for the whole reply (as
     /// Hafez's does). URLSession's 60-second default cut those off; this
-    /// matches `AnthropicClient.requestTimeout`.
-    static let requestTimeout: TimeInterval = 600
+    /// matches `AnthropicClient.defaultRequestTimeout`.
+    public static let defaultRequestTimeout: TimeInterval = 600
 
     /// Endpoints that answered `stream_options` with a 400, by URL: asked
     /// once per process, then streamed without usage.
@@ -111,7 +115,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         var urlRequest = URLRequest(url: chatCompletionsURL)
         // Assigned, not passed to init: on Linux only the setter marks the
         // timeout as set, and otherwise URLSession uses the session's 60 s.
-        urlRequest.timeoutInterval = Self.requestTimeout
+        urlRequest.timeoutInterval = requestTimeout
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
@@ -235,12 +239,13 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         url: URL,
         apiKey: String?,
         sessionID: String? = nil,
+        timeout: TimeInterval = defaultRequestTimeout,
         body: some Encodable
     ) async throws -> Data {
         var urlRequest = URLRequest(url: url)
         // Assigned, not passed to init: on Linux only the setter marks the
         // timeout as set, and otherwise URLSession uses the session's 60 s.
-        urlRequest.timeoutInterval = requestTimeout
+        urlRequest.timeoutInterval = timeout
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }

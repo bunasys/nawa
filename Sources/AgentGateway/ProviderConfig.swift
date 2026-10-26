@@ -40,6 +40,11 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
     /// for api.anthropic.com, the only endpoint known to support it; set it
     /// to true for others that do (Claude Platform on AWS, Google Cloud).
     public var serverFallbacks: Bool?
+    /// Seconds a model call may wait for its reply before failing (and the
+    /// gateway moving to a fallback provider). Nil means 600. A caller that
+    /// knows its replies are quick sets less, so a provider that hangs costs
+    /// minutes rather than ten.
+    public var requestTimeout: TimeInterval?
 
     public init(
         name: String,
@@ -51,7 +56,8 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
         headers: [String: String]? = nil,
         workspaceID: String? = nil,
         workloadIdentity: WorkloadIdentityConfig? = nil,
-        serverFallbacks: Bool? = nil
+        serverFallbacks: Bool? = nil,
+        requestTimeout: TimeInterval? = nil
     ) {
         self.name = name
         self.api = api
@@ -63,6 +69,7 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
         self.workspaceID = workspaceID
         self.workloadIdentity = workloadIdentity
         self.serverFallbacks = serverFallbacks
+        self.requestTimeout = requestTimeout
     }
 
     /// Whether requests to this provider ask for server-side fallbacks.

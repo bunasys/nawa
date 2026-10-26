@@ -25,6 +25,8 @@ public struct AnthropicClient: LanguageModel, Sendable {
     /// recommends for the refusal's category (`fallbacks: "default"`).
     /// Only Anthropic's own API offers it; see `ProviderConfig.serverFallbacks`.
     public let serverFallbacks: Bool
+    /// Seconds a request may wait for its reply; see `defaultRequestTimeout`.
+    public let requestTimeout: TimeInterval
     public let session: URLSession
 
     static let apiVersion = "2023-06-01"
@@ -34,7 +36,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     /// URLSession's 60-second default. URLSession counts it from the last
     /// bytes received, so for streams (which send `ping`s) it is an idle
     /// timeout and a long reply is never cut.
-    static let requestTimeout: TimeInterval = 600
+    public static let defaultRequestTimeout: TimeInterval = 600
     /// The beta that `fallbacks: "default"` needs.
     static let serverFallbackBeta = "server-side-fallback-2026-07-01"
 
@@ -45,6 +47,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
         workspaceID: String? = nil,
         workloadIdentity: WorkloadIdentityConfig? = nil,
         serverFallbacks: Bool = false,
+        requestTimeout: TimeInterval = Self.defaultRequestTimeout,
         session: URLSession = .shared
     ) {
         self.providerName = providerName
@@ -53,6 +56,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
         self.workspaceID = workspaceID
         self.workloadIdentity = workloadIdentity
         self.serverFallbacks = serverFallbacks
+        self.requestTimeout = requestTimeout
         self.session = session
     }
 
@@ -390,7 +394,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
         var urlRequest = URLRequest(url: url)
         // Assigned, not passed to init: on Linux only the setter marks the
         // timeout as set, and otherwise URLSession uses the session's 60 s.
-        urlRequest.timeoutInterval = Self.requestTimeout
+        urlRequest.timeoutInterval = requestTimeout
         urlRequest.httpMethod = method
         urlRequest.setValue(Self.apiVersion, forHTTPHeaderField: "anthropic-version")
         if serverFallbacks {

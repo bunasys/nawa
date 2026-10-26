@@ -63,6 +63,22 @@ struct ReadFileToolTests {
     }
 }
 
+extension ReadFileToolTests {
+    /// Whole files by default: paging costs a model call per page.
+    @Test
+    func readsAWholeLongFileInOneCall() async throws {
+        let directory = try makeScratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let text = (1...1500).map { "line \($0)" }.joined(separator: "\n") + "\n"
+        try text.write(to: directory.appendingPathComponent("long.swift"), atomically: true, encoding: .utf8)
+
+        let output = try await ReadFileTool(workingDirectory: directory).run(arguments: .object(["path": .string("long.swift")]))
+
+        #expect(output.split(separator: "\n").count == 1500)
+        #expect(output.hasSuffix("1500\tline 1500"))
+    }
+}
+
 struct EditFileToolTests {
     @Test
     func replacesExactlyOneOccurrence() async throws {
