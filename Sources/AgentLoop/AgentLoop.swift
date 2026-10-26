@@ -65,6 +65,8 @@ public final class AgentLoop: @unchecked Sendable {
     private var _runPromptIndex = 0
     /// The last refusal of the current run, reported with its result.
     private var _lastRefusal: RefusalNotice?
+    /// The provider that wrote the last reply, when the gateway said so.
+    private var _answeringProvider: String?
     /// The prompt a model declined in the last run, kept until the next run
     /// or a compaction so `removeDeclinedRequest` can take it out.
     private var _declined: DeclinedRequest?
@@ -159,7 +161,9 @@ public final class AgentLoop: @unchecked Sendable {
                             messages: self._session.messages,
                             tools: self.options.sendTools ? self.toolDefinitions : nil,
                             maxOutputTokens: self.options.maxOutputTokens,
-                            temperature: self.options.temperature
+                            temperature: self.options.temperature,
+                            mayFailOver: self.mayFailOver,
+                            sessionID: self._session.id
                         )
 
                         let response = try await self.ask(request) { update in
@@ -168,6 +172,10 @@ public final class AgentLoop: @unchecked Sendable {
                         }
                         self._usage.accumulate(response.usage)
                         self._contextTokens = response.usage.total
+                        try self.checkAnsweringProvider(response) { note in
+                            self.emit(note)
+                            continuation.yield(note)
+                        }
 
                         // Enforce the spend cap, if any.
                         if let maxBudget = self.options.maxBudgetUSD,
@@ -513,7 +521,7 @@ public final class AgentLoop: @unchecked Sendable {
             _session.messages = ContextShrinking.clearingOldToolResults(_session.messages, keep: keep)
         }
         guard let compaction = options.compaction, _contextTokens >= compaction.atContextTokens else { return }
-        let compacted = try await compact(keepRecent: compaction.keepRecentMessages)
+        let compacted = try await compact(keepRecent: compaction.keepRecentMessages, report: report)
         if compacted > 0 {
             report(.informational("Compacted \(compacted) older messages into a summary."))
         }
@@ -523,7 +531,7 @@ public final class AgentLoop: @unchecked Sendable {
     /// summary, keeping the recent messages word for word.
     /// Returns how many messages were folded into the summary (0 when there
     /// was nothing old enough to compact).
-    private func compact(keepRecent: Int) async throws -> Int {
+    private func compact(keepRecent: Int, report: (AgentEvent) -> Void) async throws -> Int {
         let messages = _session.messages
         guard let cut = ContextShrinking.compactionCut(messages, keepRecent: keepRecent) else { return 0 }
         let systemMessages = messages.prefix { $0.role == .system }
@@ -536,10 +544,12 @@ public final class AgentLoop: @unchecked Sendable {
                 Message(role: .user, text: ContextShrinking.transcript(Array(older))),
             ],
             maxOutputTokens: options.maxOutputTokens,
-            temperature: options.temperature
+            temperature: options.temperature,
+            mayFailOver: mayFailOver
         )
         let response = try await gateway.complete(request)
         recordUsage(response.usage, helper: true)
+        try checkAnsweringProvider(response, report: report)
 
         var summary = "Summary of the conversation so far (older messages were compacted):\n\n\(response.message.text)"
         if !_notes.isEmpty {
@@ -555,6 +565,34 @@ public final class AgentLoop: @unchecked Sendable {
 
     // MARK: Cost
 
+    /// A run with a budget cap stays on the gateway's preferred provider:
+    /// `options.pricing` is that provider's price, so a fallback's tokens
+    /// couldn't be counted against the cap. Its errors end the run instead.
+    private var mayFailOver: Bool {
+        let hasBudgetCap = options.maxBudgetUSD != nil && options.pricing != nil
+        return !hasBudgetCap
+    }
+
+    /// Reports a reply from another provider than the last one: a fallback
+    /// answered (see `Gateway.fallbackProviderNames`), or the preferred
+    /// provider is back. A fallback's reply also ends a run with a budget
+    /// cap, for a model that fails over despite `mayFailOver`.
+    ///
+    /// Which provider was meant is the gateway's word (`replacedProvider`),
+    /// not worked out again here: it knows how it resolved the request.
+    private func checkAnsweringProvider(_ response: ModelResponse, report: (AgentEvent) -> Void) throws {
+        guard let answering = response.providerName else { return }
+        let previous = _answeringProvider ?? response.replacedProvider ?? answering
+        _answeringProvider = answering
+        if answering != previous {
+            let model = response.model.map { " (\($0))" } ?? ""
+            report(.informational("Model provider \(answering)\(model) answered instead of \(previous)."))
+        }
+        if let preferred = response.replacedProvider, !mayFailOver {
+            throw UnpricedFallbackError(provider: answering, preferred: preferred)
+        }
+    }
+
     /// Approximate US-dollar cost of the conversation so far, from per-token
     /// pricing if configured (nil otherwise). Helper-model usage is priced
     /// with `helperPricing` when that is set.
@@ -568,6 +606,17 @@ public final class AgentLoop: @unchecked Sendable {
 
     private func emit(_ event: AgentEvent) {
         onEvent?(event)
+    }
+}
+
+/// A fallback provider answered a run that has a budget cap.
+struct UnpricedFallbackError: Error, LocalizedError {
+    var provider: String
+    var preferred: String
+
+    var errorDescription: String? {
+        "\(preferred) couldn't serve the request and fallback provider \(provider) answered, "
+            + "but the run's pricing is for \(preferred): stopped, since its budget cap can't be enforced"
     }
 }
 

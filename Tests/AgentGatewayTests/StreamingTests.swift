@@ -19,6 +19,8 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     /// Host → replies, served in order; the bodies received, per host.
     private static let replies = Mutex<[String: [Reply]]>([:])
     private static let bodies = Mutex<[String: [String]]>([:])
+    private static let timeouts = Mutex<[String: [TimeInterval]]>([:])
+    private static let sessionIDs = Mutex<[String: [String?]]>([:])
 
     /// A session whose requests to `host` get `replies`.
     static func session(host: String, replies: [Reply]) -> URLSession {
@@ -29,6 +31,8 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     static func bodies(host: String) -> [String] { bodies.withLock { $0[host] ?? [] } }
+    static func timeouts(host: String) -> [TimeInterval] { timeouts.withLock { $0[host] ?? [] } }
+    static func sessionIDs(host: String) -> [String?] { sessionIDs.withLock { $0[host] ?? [] } }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -36,6 +40,8 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         let host = request.url?.host ?? ""
         Self.bodies.withLock { $0[host, default: []].append(Self.body(of: request)) }
+        Self.timeouts.withLock { $0[host, default: []].append(request.timeoutInterval) }
+        Self.sessionIDs.withLock { $0[host, default: []].append(request.value(forHTTPHeaderField: "x-session-id")) }
         let reply = Self.replies.withLock { replies -> Reply? in
             guard var queue = replies[host], !queue.isEmpty else { return nil }
             let next = queue.removeFirst()
@@ -105,10 +111,21 @@ final class HangingHTTPServer: @unchecked Sendable {
         }.start()
     }
 
+    /// Whether a client has connected yet.
+    var hasAccepted: Bool { accepted.withLock { $0 >= 0 } }
+
+    /// Cut the connection with a reset rather than an orderly close: after
+    /// a plain close, macOS now and then treated the unfinished chunked body
+    /// as a normal end, and the cut-off tests failed on CI.
     func close() {
         shutdown(listener, Int32(SHUT_RDWR))
         Foundation.close(listener)
-        accepted.withLock { if $0 >= 0 { Foundation.close($0) } }
+        accepted.withLock { connection in
+            guard connection >= 0 else { return }
+            var resetOnClose = linger(l_onoff: 1, l_linger: 0)
+            _ = setsockopt(connection, SOL_SOCKET, SO_LINGER, &resetOnClose, socklen_t(MemoryLayout<linger>.size))
+            Foundation.close(connection)
+        }
     }
 }
 
@@ -250,6 +267,84 @@ struct OpenAIStreamingTests {
         #expect(bodies.count == 3)
         #expect(bodies[0].contains("stream_options"))
         #expect(!bodies[1].contains("stream_options") && !bodies[2].contains("stream_options"))
+    }
+
+    /// A slow reply (a long context, or a proxy that waits for the whole
+    /// reply) must not hit URLSession's 60-second default.
+    @Test
+    func chatRequestsWaitMinutesNotSeconds() async throws {
+        let host = "slow-chat.test"
+        let session = StubURLProtocol.session(host: host, replies: [
+            .init(pieces: [#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#]),
+            .init(pieces: [sse([#"{"choices":[{"delta":{"content":"ok"}}]}"#, "[DONE]"])]),
+        ])
+        let client = OpenAICompatibleClient(providerName: "p", baseURL: URL(string: "https://\(host)/v1")!, session: session)
+        let request = ModelRequest(model: "m", messages: [Message(role: .user, text: "hi")])
+
+        _ = try await client.complete(request)
+        _ = try await collect(client.stream(request))
+
+        #expect(StubURLProtocol.timeouts(host: host) == [600, 600])
+    }
+
+    /// Providers cache the longest identical prefix of a request, so the
+    /// same request must be the same bytes every turn, though its tool
+    /// schemas are dictionaries rebuilt each time.
+    @Test
+    func theSameRequestIsTheSameBytesAndNamesItsSession() async throws {
+        let host = "cacheable.test"
+        let ok = StubURLProtocol.Reply(pieces: [#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#])
+        let session = StubURLProtocol.session(host: host, replies: Array(repeating: ok, count: 8))
+        let client = OpenAICompatibleClient(providerName: "p", baseURL: URL(string: "https://\(host)/v1")!, session: session)
+        func freshTool() -> ToolDefinition {
+            let properties = Dictionary(uniqueKeysWithValues: (1...12).map { ("field\($0)", JSON.object(["type": .string("string")])) })
+            return ToolDefinition(name: "t", description: "", parameters: .object(["type": .string("object"), "properties": .object(properties)]))
+        }
+
+        for _ in 0..<8 {
+            let request = ModelRequest(model: "m", messages: [Message(role: .user, text: "hi")], tools: [freshTool()], sessionID: "s1")
+            _ = try await client.complete(request)
+        }
+
+        #expect(Set(StubURLProtocol.bodies(host: host)).count == 1)
+        // Sorted, not insertion order (field1, field2, …): deterministic even
+        // where equal dictionaries happen to iterate alike.
+        let sortedProperties = (1...12).map { #""field\#($0)":{"type":"string"}"# }.sorted().joined(separator: ",")
+        #expect(StubURLProtocol.bodies(host: host).allSatisfy { $0.contains(sortedProperties) })
+        #expect(StubURLProtocol.sessionIDs(host: host) == Array(repeating: "s1", count: 8))
+    }
+
+    /// The request's own timeout must win over the session's, on Linux too:
+    /// there, a timeout passed to `URLRequest`'s init is ignored, and a
+    /// review on Linux was cut off this way after 60 s.
+    @Test(.timeLimit(.minutes(1)))
+    func aSessionsShortTimeoutDoesNotCutAChatReply() async throws {
+        final class Outcome: Sendable {
+            let text = Mutex<String?>(nil)
+        }
+        // Not empty: an empty chunk would end the chunked body.
+        let server = try HangingHTTPServer(firstBytes: "{")
+        defer { server.close() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 1
+        let client = OpenAICompatibleClient(
+            providerName: "p", baseURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!,
+            session: URLSession(configuration: configuration)
+        )
+        let outcome = Outcome()
+        let call = Task {
+            do {
+                _ = try await client.complete(ModelRequest(model: "m", messages: [Message(role: .user, text: "hi")]))
+                outcome.text.withLock { $0 = "answered" }
+            } catch {
+                outcome.text.withLock { $0 = "\(error)" }
+            }
+        }
+
+        try await Task.sleep(for: .seconds(3))
+
+        #expect(outcome.text.withLock { $0 } == nil, "still waiting after 3 s, past the session's 1 s")
+        call.cancel()
     }
 }
 

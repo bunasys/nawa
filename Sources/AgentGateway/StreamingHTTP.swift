@@ -30,6 +30,18 @@ typealias HTTPResponseBytes = ResponseByteStream
 typealias HTTPResponseBytes = URLSession.AsyncBytes
 #endif
 
+/// A request body as JSON, with object keys sorted.
+///
+/// `JSON.object` is a Swift dictionary, and two equal dictionaries can list
+/// their keys in different orders (tool schemas are rebuilt per request).
+/// Providers cache the longest identical prefix of a request, so an order
+/// that changes from turn to turn means no cache hits at all.
+func sortedJSON(_ value: some Encodable) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .sortedKeys
+    return try encoder.encode(value)
+}
+
 /// Reads a whole (error) body as text.
 func collectText<Bytes: AsyncSequence>(_ bytes: Bytes) async throws -> String where Bytes.Element == UInt8 {
     var data: [UInt8] = []

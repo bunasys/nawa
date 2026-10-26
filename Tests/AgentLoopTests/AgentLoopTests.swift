@@ -142,6 +142,21 @@ struct AgentLoopTests {
         #expect(result.numTurns == 12)
     }
 
+    /// One session ID for every turn, so the provider can keep the
+    /// conversation on one prompt cache.
+    @Test
+    func everyTurnNamesTheSameSession() async throws {
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("hi")]))),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]))
+        _ = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(model.requests.count == 2)
+        #expect(model.requests.allSatisfy { $0.sessionID == loop.session.id })
+    }
+
     @Test
     func subAgentAnswersAndItsUsageCountsInTheParent() async throws {
         let model = ScriptedModel(responses: [
@@ -391,4 +406,120 @@ func finalResult(_ stream: AsyncThrowingStream<AgentEvent, any Error>) async thr
         if case .result(let result) = event { final = result }
     }
     return try #require(final)
+}
+
+/// Replies from a fallback provider (`ModelResponse.providerName` other than
+/// the gateway's own) are reported, and end a run that has a budget cap.
+struct FallbackProviderLoopTests {
+    /// A reply as `Gateway` stamps it, with "scripted" as the preferred provider.
+    private func reply(from provider: String, text: String = "done") -> ModelResponse {
+        ModelResponse(
+            message: Message(role: .assistant, text: text), finishReason: .endTurn,
+            usage: Usage(inputTokens: 10, outputTokens: 2), model: "\(provider)-model", providerName: provider,
+            replacedProvider: provider == "scripted" ? nil : "scripted"
+        )
+    }
+
+    private func run(_ loop: AgentLoop, _ prompt: String) async throws -> (notes: [String], result: AgentResult?) {
+        var notes: [String] = []
+        var result: AgentResult?
+        for try await event in loop.run(prompt: prompt, continuing: true) {
+            if case .informational(let note) = event { notes.append(note) }
+            if case .result(let final) = event { result = final }
+        }
+        return (notes, result)
+    }
+
+    @Test
+    func aSwitchToAFallbackAndBackIsReportedOnce() async throws {
+        // ScriptedModel's providerName is "scripted": that is the preferred provider.
+        let model = ScriptedModel(responses: [reply(from: "fallback"), reply(from: "fallback"), reply(from: "scripted")])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+
+        let first = try await run(loop, "one")
+        let second = try await run(loop, "two")
+        let third = try await run(loop, "three")
+
+        #expect(first.notes == ["Model provider fallback (fallback-model) answered instead of scripted."])
+        #expect(second.notes.isEmpty)
+        #expect(third.notes == ["Model provider scripted (scripted-model) answered instead of fallback."])
+        #expect(third.result?.isSuccess == true)
+    }
+
+    @Test
+    func aFallbackReplyEndsARunWithABudgetCap() async throws {
+        let model = ScriptedModel(responses: [reply(from: "fallback")])
+        let options = LoopOptions(maxBudgetUSD: 100, pricing: Pricing(inputPer1K: 1))
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: options)
+
+        let (_, result) = try await run(loop, "hi")
+
+        #expect(result?.isSuccess == false)
+        #expect(result?.errorMessage?.contains("budget cap can't be enforced") == true)
+    }
+
+    @Test
+    func aRunWithABudgetCapAsksNotToFailOverIncludingForCompaction() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("x")])))]), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("y")])))]), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, text: "SUMMARY")),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let options = LoopOptions(
+            maxBudgetUSD: 100, pricing: Pricing(inputPer1K: 0.001),
+            compaction: Compaction(atContextTokens: 400, keepRecentMessages: 2)
+        )
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+
+        let (notes, result) = try await run(loop, "go")
+
+        #expect(result?.text == "done")
+        #expect(notes.contains { $0.hasPrefix("Compacted ") })
+        #expect(model.requests.count == 4)
+        #expect(model.requests.allSatisfy { !$0.mayFailOver })
+    }
+
+    @Test
+    func aSwitchFirstSeenDuringCompactionReachesTheStream() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("x")])))]), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("y")])))]), usage: Usage(inputTokens: 500)),
+            reply(from: "fallback", text: "SUMMARY"),
+            reply(from: "fallback"),
+        ])
+        let options = LoopOptions(compaction: Compaction(atContextTokens: 400, keepRecentMessages: 2))
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+
+        let (notes, _) = try await run(loop, "go")
+
+        #expect(notes.filter { $0.contains("answered instead of") } == ["Model provider fallback (fallback-model) answered instead of scripted."])
+    }
+
+    /// The gateway decides what was preferred: a reply it didn't mark as a
+    /// fallback is never one, whatever the loop's model calls itself (an
+    /// unknown provider name, a wrapper around a gateway).
+    @Test
+    func aReplyTheGatewayDidNotMarkIsNoSwitchEvenWithABudgetCap() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, text: "done"), finishReason: .endTurn, model: "m", providerName: "inner-name"),
+        ])
+        let options = LoopOptions(maxBudgetUSD: 100, pricing: Pricing(inputPer1K: 1))
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: options)
+
+        let (notes, result) = try await run(loop, "hi")
+
+        #expect(notes.isEmpty)
+        #expect(result?.isSuccess == true)
+    }
+
+    @Test
+    func aFallbackReplyIsFineWithoutABudgetCap() async throws {
+        let model = ScriptedModel(responses: [reply(from: "fallback")])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: LoopOptions(pricing: Pricing(inputPer1K: 1)))
+
+        let (_, result) = try await run(loop, "hi")
+
+        #expect(result?.isSuccess == true)
+    }
 }

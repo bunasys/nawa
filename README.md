@@ -89,8 +89,8 @@ Prebuilt binaries are on the
 | Linux, x86-64 | `nawa-<version>-linux-amd64.tar.gz` | nothing: fully static |
 
 ```sh
-shasum -a 256 -c nawa-0.2.0-macos-arm64.tar.gz.sha256   # optional: check the download
-tar xzf nawa-0.2.0-macos-arm64.tar.gz   # or …-linux-amd64.tar.gz
+shasum -a 256 -c nawa-0.3.0-macos-arm64.tar.gz.sha256   # optional: check the download
+tar xzf nawa-0.3.0-macos-arm64.tar.gz   # or …-linux-amd64.tar.gz
 sudo mv nawa /usr/local/bin/
 nawa --version
 ```
@@ -144,6 +144,46 @@ nawa config remove <name>
 env override → the saved config for the directory (for ACP, the session's
 `cwd`) → `Gateways.json` (or `NAWA_GATEWAY_CONFIG`) → OpenAI with
 `OPENAI_API_KEY`.
+
+### Fallback providers
+
+`Gateways.json` can name providers to fall back to, tried in order when the
+active one can't serve a request: a rate limit or exhausted quota (429, or
+Anthropic's "credit balance is too low"), an outage (5xx, 529), a network
+failure, a request timeout (408), or a credential or model the provider
+rejects (401, 402, 403, 404).
+A malformed request (other 400s) fails straight away, since it would fail
+anywhere.
+
+```json
+{
+  "activeProvider": "anthropic",
+  "providers": [
+    { "name": "anthropic", "api": "anthropic", "baseURL": "https://api.anthropic.com", "apiKey": "env:ANTHROPIC_API_KEY", "model": "claude-opus-5-5" },
+    { "name": "openrouter", "baseURL": "https://openrouter.ai/api/v1", "apiKey": "env:OPENROUTER_API_KEY", "model": "z-ai/glm-5.3" }
+  ],
+  "fallbackProviders": ["openrouter"]
+}
+```
+
+Each provider uses its own `model`, since model ids differ between providers.
+A provider that failed is skipped for a minute, so a long run doesn't wait on
+it before every call. A 404 (a model the provider doesn't have, often a
+typo) still fails over but doesn't take the provider out for the others,
+and a cancelled call never counts as a failure. A streamed reply fails over only before its first
+chunk. A request that names a provider (`ModelRequest.providerName`) never
+fails over. In code, pass `fallbackProviderNames` to `Gateway`. When every
+provider fails, the error is `GatewayError.providersFailed`, one line per
+provider in the order tried (new in 0.3.0: an exhaustive `switch` over
+`GatewayError` needs a case for it).
+
+A switch is never silent: each reply carries the provider that wrote it
+(`ModelResponse.providerName`), and the agent loop reports every change as
+an informational event. A cost estimate uses one `pricing` for the run, so
+it can't price a fallback's tokens: a run with `maxBudgetUSD` doesn't fail
+over (its requests set `ModelRequest.mayFailOver` to false), and the
+preferred provider's error ends it rather than spend past a cap it could no
+longer enforce.
 
 ## Anthropic
 

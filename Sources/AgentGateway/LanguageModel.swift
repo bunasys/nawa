@@ -50,6 +50,13 @@ public struct ModelRequest: Sendable {
     public var tools: [ToolDefinition]?
     public var maxOutputTokens: Int?
     public var temperature: Double?
+    /// False keeps the request on its preferred provider even when the
+    /// gateway has fallbacks (see `Gateway.fallbackProviderNames`).
+    public var mayFailOver: Bool
+    /// The same for every request of one conversation, so the provider can
+    /// send them to the same prompt cache. Sent as `x-session-id` to
+    /// OpenAI-compatible providers (RunInfra uses it; others ignore it).
+    public var sessionID: String?
 
     public init(
         providerName: String? = nil,
@@ -57,7 +64,9 @@ public struct ModelRequest: Sendable {
         messages: [Message],
         tools: [ToolDefinition]? = nil,
         maxOutputTokens: Int? = nil,
-        temperature: Double? = nil
+        temperature: Double? = nil,
+        mayFailOver: Bool = true,
+        sessionID: String? = nil
     ) {
         self.providerName = providerName
         self.model = model
@@ -65,6 +74,8 @@ public struct ModelRequest: Sendable {
         self.tools = tools
         self.maxOutputTokens = maxOutputTokens
         self.temperature = temperature
+        self.mayFailOver = mayFailOver
+        self.sessionID = sessionID
     }
 
     /// The model id a wire client must send. `Gateway` fills in the default
@@ -93,6 +104,12 @@ public struct ModelResponse: Sendable {
     /// Models that declined this request before `model` answered it
     /// (Anthropic's server-side fallback), in order.
     public var declinedBy: [String]
+    /// The configured provider that answered, set by `Gateway`. With
+    /// fallback providers it can differ from the active one.
+    public var providerName: String?
+    /// Set by `Gateway` when a fallback answered: the provider the request
+    /// was meant for. Nil when that provider answered itself.
+    public var replacedProvider: String?
 
     public init(
         message: Message,
@@ -100,7 +117,9 @@ public struct ModelResponse: Sendable {
         usage: Usage = .zero,
         model: String? = nil,
         refusal: RefusalDetails? = nil,
-        declinedBy: [String] = []
+        declinedBy: [String] = [],
+        providerName: String? = nil,
+        replacedProvider: String? = nil
     ) {
         self.message = message
         self.finishReason = finishReason
@@ -108,6 +127,8 @@ public struct ModelResponse: Sendable {
         self.model = model
         self.refusal = refusal
         self.declinedBy = declinedBy
+        self.providerName = providerName
+        self.replacedProvider = replacedProvider
     }
 }
 
@@ -168,6 +189,9 @@ public enum GatewayError: Error, Sendable {
     case workloadIdentity(String)
     /// A streamed reply ended without its final chunk.
     case incompleteStream
+    /// Every provider the gateway tried failed: one line per provider, in
+    /// the order tried.
+    case providersFailed([String])
 }
 
 extension GatewayError: CustomStringConvertible, LocalizedError {
@@ -189,6 +213,8 @@ extension GatewayError: CustomStringConvertible, LocalizedError {
             return "workload identity federation: \(detail)"
         case .incompleteStream:
             return "the model provider's reply ended before it was complete"
+        case .providersFailed(let failures):
+            return "every model provider failed: " + failures.joined(separator: "; ")
         }
     }
 

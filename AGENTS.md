@@ -34,7 +34,11 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   fallback (see Refusals below); authenticates with an API key or Workload Identity
   Federation via `WorkloadIdentityTokenSource` in `WorkloadIdentity.swift`,
   one cached token per process), `Gateway` with multiple
-  providers (each `ProviderConfig.api` is `openai` or `anthropic`) and auto model discovery (`GET /v1/models`), `ProviderConfig`,
+  providers (each `ProviderConfig.api` is `openai` or `anthropic`), fallback
+  providers tried in order when one can't serve (`fallbackProviderNames`,
+  `GatewayFailover` cooldowns; `ModelRequest.mayFailOver` opts out;
+  `ModelResponse.providerName`/`replacedProvider` say who answered) and auto
+  model discovery (`GET /v1/models`), `ProviderConfig`,
   `AgentConfigStore` (the per-directory config file written by `nawa config`).
 - `Sources/AgentJSONRPC` — JSON-RPC 2.0 envelope shared by MCP and ACP.
 - `Sources/AgentTools` — built-in tools: `ShellTool`, `ReadFileTool`,
