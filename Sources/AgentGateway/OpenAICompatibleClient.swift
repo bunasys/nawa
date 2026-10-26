@@ -39,7 +39,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             temperature: request.temperature,
             maxTokens: request.maxOutputTokens
         )
-        let data = try await Self.post(session: session, url: chatCompletionsURL, apiKey: apiKey, body: body)
+        let data = try await Self.post(session: session, url: chatCompletionsURL, apiKey: apiKey, sessionID: request.sessionID, body: body)
         do {
             let response = try JSONDecoder().decode(OpenAIResponse.self, from: data)
             guard let choice = response.choices.first, let message = choice.message else {
@@ -115,7 +115,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-        urlRequest.httpBody = try JSONEncoder().encode(body)
+        if let sessionID = request.sessionID { urlRequest.setValue(sessionID, forHTTPHeaderField: "x-session-id") }
+        urlRequest.httpBody = try sortedJSON(body)
 
         let (bytes, response) = try await session.streamBytes(for: urlRequest)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
@@ -223,7 +224,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
     }
 
     static func argumentsString(_ arguments: JSON) -> String {
-        guard let data = try? JSONEncoder().encode(arguments) else { return "{}" }
+        guard let data = try? sortedJSON(arguments) else { return "{}" }
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 
@@ -233,6 +234,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         session: URLSession,
         url: URL,
         apiKey: String?,
+        sessionID: String? = nil,
         body: some Encodable
     ) async throws -> Data {
         var urlRequest = URLRequest(url: url)
@@ -242,7 +244,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-        urlRequest.httpBody = try JSONEncoder().encode(body)
+        if let sessionID { urlRequest.setValue(sessionID, forHTTPHeaderField: "x-session-id") }
+        urlRequest.httpBody = try sortedJSON(body)
         let (data, response) = try await session.data(for: urlRequest)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw GatewayError.httpError(statusCode: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")

@@ -20,6 +20,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     private static let replies = Mutex<[String: [Reply]]>([:])
     private static let bodies = Mutex<[String: [String]]>([:])
     private static let timeouts = Mutex<[String: [TimeInterval]]>([:])
+    private static let sessionIDs = Mutex<[String: [String?]]>([:])
 
     /// A session whose requests to `host` get `replies`.
     static func session(host: String, replies: [Reply]) -> URLSession {
@@ -31,6 +32,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
 
     static func bodies(host: String) -> [String] { bodies.withLock { $0[host] ?? [] } }
     static func timeouts(host: String) -> [TimeInterval] { timeouts.withLock { $0[host] ?? [] } }
+    static func sessionIDs(host: String) -> [String?] { sessionIDs.withLock { $0[host] ?? [] } }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -39,6 +41,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         let host = request.url?.host ?? ""
         Self.bodies.withLock { $0[host, default: []].append(Self.body(of: request)) }
         Self.timeouts.withLock { $0[host, default: []].append(request.timeoutInterval) }
+        Self.sessionIDs.withLock { $0[host, default: []].append(request.value(forHTTPHeaderField: "x-session-id")) }
         let reply = Self.replies.withLock { replies -> Reply? in
             guard var queue = replies[host], !queue.isEmpty else { return nil }
             let next = queue.removeFirst()
@@ -274,6 +277,29 @@ struct OpenAIStreamingTests {
         _ = try await collect(client.stream(request))
 
         #expect(StubURLProtocol.timeouts(host: host) == [600, 600])
+    }
+
+    /// Providers cache the longest identical prefix of a request, so the
+    /// same request must be the same bytes every turn, though its tool
+    /// schemas are dictionaries rebuilt each time.
+    @Test
+    func theSameRequestIsTheSameBytesAndNamesItsSession() async throws {
+        let host = "cacheable.test"
+        let ok = StubURLProtocol.Reply(pieces: [#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#])
+        let session = StubURLProtocol.session(host: host, replies: Array(repeating: ok, count: 8))
+        let client = OpenAICompatibleClient(providerName: "p", baseURL: URL(string: "https://\(host)/v1")!, session: session)
+        func freshTool() -> ToolDefinition {
+            let properties = Dictionary(uniqueKeysWithValues: (1...12).map { ("field\($0)", JSON.object(["type": .string("string")])) })
+            return ToolDefinition(name: "t", description: "", parameters: .object(["type": .string("object"), "properties": .object(properties)]))
+        }
+
+        for _ in 0..<8 {
+            let request = ModelRequest(model: "m", messages: [Message(role: .user, text: "hi")], tools: [freshTool()], sessionID: "s1")
+            _ = try await client.complete(request)
+        }
+
+        #expect(Set(StubURLProtocol.bodies(host: host)).count == 1)
+        #expect(StubURLProtocol.sessionIDs(host: host) == Array(repeating: "s1", count: 8))
     }
 
     /// The request's own timeout must win over the session's, on Linux too:

@@ -412,7 +412,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
         }
         if let body {
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            urlRequest.httpBody = try JSONEncoder().encode(body)
+            urlRequest.httpBody = try sortedJSON(body)
         }
         return urlRequest
     }

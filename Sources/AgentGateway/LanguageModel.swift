@@ -53,6 +53,10 @@ public struct ModelRequest: Sendable {
     /// False keeps the request on its preferred provider even when the
     /// gateway has fallbacks (see `Gateway.fallbackProviderNames`).
     public var mayFailOver: Bool
+    /// The same for every request of one conversation, so the provider can
+    /// send them to the same prompt cache. Sent as `x-session-id` to
+    /// OpenAI-compatible providers (RunInfra uses it; others ignore it).
+    public var sessionID: String?
 
     public init(
         providerName: String? = nil,
@@ -61,7 +65,8 @@ public struct ModelRequest: Sendable {
         tools: [ToolDefinition]? = nil,
         maxOutputTokens: Int? = nil,
         temperature: Double? = nil,
-        mayFailOver: Bool = true
+        mayFailOver: Bool = true,
+        sessionID: String? = nil
     ) {
         self.providerName = providerName
         self.model = model
@@ -70,6 +75,7 @@ public struct ModelRequest: Sendable {
         self.maxOutputTokens = maxOutputTokens
         self.temperature = temperature
         self.mayFailOver = mayFailOver
+        self.sessionID = sessionID
     }
 
     /// The model id a wire client must send. `Gateway` fills in the default

@@ -162,7 +162,8 @@ public final class AgentLoop: @unchecked Sendable {
                             tools: self.options.sendTools ? self.toolDefinitions : nil,
                             maxOutputTokens: self.options.maxOutputTokens,
                             temperature: self.options.temperature,
-                            mayFailOver: self.mayFailOver
+                            mayFailOver: self.mayFailOver,
+                            sessionID: self._session.id
                         )
 
                         let response = try await self.ask(request) { update in

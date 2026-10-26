@@ -142,6 +142,21 @@ struct AgentLoopTests {
         #expect(result.numTurns == 12)
     }
 
+    /// One session ID for every turn, so the provider can keep the
+    /// conversation on one prompt cache.
+    @Test
+    func everyTurnNamesTheSameSession() async throws {
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("hi")]))),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]))
+        _ = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(model.requests.count == 2)
+        #expect(model.requests.allSatisfy { $0.sessionID == loop.session.id })
+    }
+
     @Test
     func subAgentAnswersAndItsUsageCountsInTheParent() async throws {
         let model = ScriptedModel(responses: [
