@@ -148,6 +148,11 @@ public final class AgentLoop: @unchecked Sendable {
     /// another way (budget, refusal, loop detector, error) drops the message,
     /// since it was about that run, and says so with a "Not delivered: …"
     /// informational event. Sent between runs, it waits for the next one.
+    ///
+    /// A model call made only to answer a steer counts as a turn toward
+    /// `maxTurns`. The "Steered: …" and "Not delivered: …" notes reach the
+    /// event stream and `onEvent` only; ACP sessions don't show informational
+    /// events.
     public func steer(_ text: String) {
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { return }
@@ -273,6 +278,9 @@ public final class AgentLoop: @unchecked Sendable {
                         // 3. No tool calls → the run is done, unless the caller
                         // steered in a message the model hasn't seen yet.
                         if response.message.toolCalls.isEmpty && self.hasSteering {
+                            // Counted as a turn, so steering after every answer
+                            // still reaches maxTurns.
+                            self._turnCounter += 1
                             continue
                         }
                         guard !response.message.toolCalls.isEmpty else {

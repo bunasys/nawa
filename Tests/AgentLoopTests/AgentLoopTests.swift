@@ -240,8 +240,22 @@ struct AgentLoopTests {
         #expect(result.text == "here is what I have")
     }
 
-    /// The real use: a supervisor steers from its own task while a tool runs.
+    /// Answers that only reply to steers count as turns, so a caller that
+    /// steers after every answer still runs into maxTurns.
     @Test
+    func steeringAfterEveryTextAnswerStillReachesTheTurnCap() async throws {
+        let model = ScriptedModel(responses: [ModelResponse(message: Message(role: .assistant, text: "an answer"))])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: LoopOptions(maxTurns: 3))
+        // Bounded, so a regression fails instead of hanging.
+        model.onCall = { index in if index < 10 { loop.steer("one more thing") } }
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.kind == .errorMaxTurns)
+        #expect(model.requests.count == 4)
+    }
+
+    /// The real use: a supervisor steers from its own task while a tool runs.
+    @Test(.timeLimit(.minutes(1)))
     func aMessageSteeredFromAnotherTaskWhileAToolRunsArrivesNext() async throws {
         let gate = GateTool()
         let model = ScriptedModel(responses: [
