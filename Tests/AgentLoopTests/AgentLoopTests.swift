@@ -20,8 +20,12 @@ final class ScriptedModel: LanguageModel, @unchecked Sendable {
         self.responses = responses
     }
 
+    /// Called with each call's index, before it answers.
+    var onCall: ((Int) -> Void)?
+
     func complete(_ request: ModelRequest) async throws -> ModelResponse {
         requests.append(request)
+        onCall?(callIndex)
         let response = responses[min(callIndex, responses.count - 1)]
         callIndex += 1
         return response
@@ -140,6 +144,203 @@ struct AgentLoopTests {
 
         #expect(result.isSuccess)
         #expect(result.numTurns == 12)
+    }
+
+    /// Lets a tool or model double reach the loop it runs in.
+    final class LoopBox: @unchecked Sendable {
+        var loop: AgentLoop?
+    }
+
+    struct SteerTool: Tool {
+        let box: LoopBox
+        var definition: ToolDefinition { ToolDefinition(name: "steer_me", description: "") }
+        func run(arguments: JSON) async throws -> String {
+            box.loop?.steer("wrap up now")
+            return "ok"
+        }
+    }
+
+    @Test
+    func aSteeredMessageArrivesAfterTheTurnsToolResults() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SteerTool(box: box)]))
+        box.loop = loop
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.text == "done")
+        let sent = model.requests[1].messages
+        #expect(sent.map(\.role).suffix(3) == [.assistant, .tool, .user])
+        #expect(sent.last?.text == "wrap up now")
+    }
+
+    @Test
+    func aSteeredMessageKeepsARunGoingThatWouldHaveEnded() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, text: "first answer")),
+            ModelResponse(message: Message(role: .assistant, text: "second answer")),
+        ])
+        model.onCall = { index in if index == 0 { box.loop?.steer("also check Y") } }
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        box.loop = loop
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.text == "second answer")
+        #expect(model.requests.count == 2)
+        #expect(model.requests[1].messages.last?.text == "also check Y")
+    }
+
+    @Test
+    func aMessageSteeredBetweenRunsWaitsForTheNextOne() async throws {
+        let model = ScriptedModel(responses: [ModelResponse(message: Message(role: .assistant, text: "ok"))])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        _ = try await finalResult(loop.run(prompt: "first"))
+        loop.steer("note for later")
+        _ = try await finalResult(loop.run(prompt: "second", continuing: true))
+
+        #expect(model.requests.count == 2)
+        #expect(model.requests[1].messages.suffix(2).map(\.text) == ["second", "note for later"])
+    }
+
+    /// "Wrap up now" usually comes as the turns run out: the run gets one
+    /// more model call, whose tools still run, and then ends at the cap.
+    @Test
+    func aSteeredMessageGetsOneCallAtTheTurnCap() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
+            toolCallResponse(ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("submitted")]))),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SteerTool(box: box), EchoTool()]), options: LoopOptions(maxTurns: 1))
+        box.loop = loop
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.kind == .errorMaxTurns)
+        #expect(result.numTurns == 2)
+        #expect(model.requests.count == 2)
+        #expect(model.requests[1].messages.last?.text == "wrap up now")
+    }
+
+    @Test
+    func aTextAnswerAtTheTurnCapIsTheRunsAnswer() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
+            ModelResponse(message: Message(role: .assistant, text: "here is what I have")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SteerTool(box: box)]), options: LoopOptions(maxTurns: 1))
+        box.loop = loop
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.kind == .success)
+        #expect(result.text == "here is what I have")
+    }
+
+    /// Answers that only reply to steers count as turns, so a caller that
+    /// steers after every answer still runs into maxTurns.
+    @Test
+    func steeringAfterEveryTextAnswerStillReachesTheTurnCap() async throws {
+        let model = ScriptedModel(responses: [ModelResponse(message: Message(role: .assistant, text: "an answer"))])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: LoopOptions(maxTurns: 3))
+        // Bounded, so a regression fails instead of hanging.
+        model.onCall = { index in if index < 10 { loop.steer("one more thing") } }
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.kind == .errorMaxTurns)
+        #expect(model.requests.count == 4)
+    }
+
+    /// The real use: a supervisor steers from its own task while a tool runs.
+    @Test(.timeLimit(.minutes(1)))
+    func aMessageSteeredFromAnotherTaskWhileAToolRunsArrivesNext() async throws {
+        let gate = GateTool()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "gate")),
+            ModelResponse(message: Message(role: .assistant, text: "wrapped up")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([gate]))
+        let running = Task { try await finalResult(loop.run(prompt: "go")) }
+
+        await gate.waitUntilStarted()
+        loop.steer("wrap up now")
+        gate.open()
+        let result = try await running.value
+
+        #expect(result.text == "wrapped up")
+        #expect(model.requests[1].messages.last?.text == "wrap up now")
+    }
+
+    /// Steering on every turn must not lift the cap: one extra call per run.
+    @Test
+    func steeringEveryTurnCanNotLiftTheTurnCap() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
+            toolCallResponse(ToolCall(id: "c2", name: "steer_me")),
+            // Only reached if the cap was lifted twice; ends the run instead of looping.
+            ModelResponse(message: Message(role: .assistant, text: "past the cap")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SteerTool(box: box)]), options: LoopOptions(maxTurns: 1))
+        box.loop = loop
+        var notes: [String] = []
+        for try await event in loop.run(prompt: "go") {
+            if case .informational(let text) = event { notes.append(text) }
+        }
+
+        #expect(model.requests.count == 2)
+        #expect(notes.contains("Not delivered: wrap up now"))
+    }
+
+    @Test
+    func aSteeredMessageARunNeverSawIsDroppedWhenItEnds() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, text: ""), finishReason: .refusal),
+            ModelResponse(message: Message(role: .assistant, text: "ok")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        model.onCall = { index in if index == 0 { loop.steer("about the first prompt") } }
+        _ = try await finalResult(loop.run(prompt: "first"))
+        _ = try await finalResult(loop.run(prompt: "second", continuing: true))
+
+        let lastRequest = try #require(model.requests.last)
+        #expect(!lastRequest.messages.contains { $0.text == "about the first prompt" })
+    }
+
+    @Test
+    func messagesSteeredBeforeTheNextTurnArriveTogether() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, text: "first answer")),
+            ModelResponse(message: Message(role: .assistant, text: "second answer")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        model.onCall = { index in
+            guard index == 0 else { return }
+            loop.steer("check X")
+            loop.steer("  ")
+            loop.steer("then Y")
+        }
+        var notes: [String] = []
+        for try await event in loop.run(prompt: "go") {
+            if case .informational(let text) = event { notes.append(text) }
+        }
+
+        #expect(model.requests.count == 2)
+        #expect(model.requests[1].messages.last?.text == "check X\n\nthen Y")
+        #expect(notes.contains("Steered: check X\n\nthen Y"))
+    }
+
+    @Test
+    func anEmptySteerIsIgnored() async throws {
+        let model = ScriptedModel(responses: [ModelResponse(message: Message(role: .assistant, text: "ok"))])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        model.onCall = { index in if index == 0 { loop.steer(" \n ") } }
+        _ = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(model.requests.count == 1)
     }
 
     /// One session ID for every turn, so the provider can keep the
@@ -328,6 +529,25 @@ struct SlowTool: Tool {
         try await Task.sleep(for: .seconds(60))
         return "finished"
     }
+}
+
+/// Holds its run until the test opens it, so the test can act while a tool runs.
+final class GateTool: Tool, @unchecked Sendable {
+    private let started = AsyncStream<Void>.makeStream()
+    private let opened = AsyncStream<Void>.makeStream()
+    var definition: ToolDefinition { ToolDefinition(name: "gate", description: "", parameters: .object([:])) }
+
+    func run(arguments: JSON) async throws -> String {
+        started.continuation.yield()
+        for await _ in opened.stream { break }
+        return "opened"
+    }
+
+    func waitUntilStarted() async {
+        for await _ in started.stream { break }
+    }
+
+    func open() { opened.continuation.yield() }
 }
 
 func toolCallResponse(_ call: ToolCall, usage: Usage = .zero) -> ModelResponse {

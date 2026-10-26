@@ -70,6 +70,11 @@ public final class AgentLoop: @unchecked Sendable {
     /// The prompt a model declined in the last run, kept until the next run
     /// or a compaction so `removeDeclinedRequest` can take it out.
     private var _declined: DeclinedRequest?
+    /// Messages from `steer`, waiting for the next model call.
+    private var _steering: [String] = []
+    /// Whether this run already took its one model call past `maxTurns` to
+    /// answer a steer. One only, so steering can't lift the cap.
+    private var _tookTurnCapGrace = false
 
     private struct DeclinedRequest {
         var promptIndex: Int
@@ -129,6 +134,46 @@ public final class AgentLoop: @unchecked Sendable {
         self._loopDetector = LoopDetector(checkAfterTurns: options.loopCheckAfterTurns)
     }
 
+    /// Tell the agent something while it works, e.g. "wrap up and answer now".
+    ///
+    /// The message joins the conversation as a user message just before the
+    /// next model call, after the current turn's tool results, and the run
+    /// goes on with everything it has done so far. A reply that would have
+    /// ended the run is followed by the message instead.
+    ///
+    /// A run at its `maxTurns` gets one more model call to answer it, once per
+    /// run. A text answer to that call is the run's answer (`success`); if it
+    /// calls tools instead, they still run (so a "submit" tool gets its
+    /// answer) and the run ends as `errorMaxTurns`. A run that ends
+    /// another way (budget, refusal, loop detector, error) drops the message,
+    /// since it was about that run, and says so with a "Not delivered: …"
+    /// informational event. Sent between runs, it waits for the next one.
+    ///
+    /// A model call made only to answer a steer counts as a turn toward
+    /// `maxTurns`. The "Steered: …" and "Not delivered: …" notes reach the
+    /// event stream and `onEvent` only; ACP sessions don't show informational
+    /// events.
+    public func steer(_ text: String) {
+        let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        _steering.append(message)
+    }
+
+    private var hasSteering: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !_steering.isEmpty
+    }
+
+    /// Empties the steer queue: its messages as one text, or nil when empty.
+    private func takeSteering() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard !_steering.isEmpty else { return nil }
+        let text = _steering.joined(separator: "\n\n")
+        _steering = []
+        return text
+    }
+
     /// Run a prompt, streaming `AgentEvent`s.
     public func run(prompt: String, continuing: Bool = false) -> AsyncThrowingStream<AgentEvent, any Error> {
         AsyncThrowingStream { continuation in
@@ -146,13 +191,26 @@ public final class AgentLoop: @unchecked Sendable {
 
                     while true {
                         if let maxTurns = self.options.maxTurns, self._turnCounter >= maxTurns {
-                            self.emit(.informational("Hit maxTurns (\(maxTurns)) — stopping."))
-                            self.finish(continuation, self.result(.errorMaxTurns))
-                            return
+                            // A steer ("wrap up now") is most likely to come just
+                            // as the turns run out, so it gets one call to answer.
+                            let mayAnswerSteer = self.hasSteering && !self._tookTurnCapGrace
+                            if !mayAnswerSteer {
+                                self.emit(.informational("Hit maxTurns (\(maxTurns)) — stopping."))
+                                self.finish(continuation, self.result(.errorMaxTurns))
+                                return
+                            }
+                            self._tookTurnCapGrace = true
                         }
 
-                        // 1. Ask the model, after trimming what it no longer needs.
+                        // 1. Ask the model, after trimming what it no longer needs
+                        // and adding what the caller steered in meanwhile.
                         try await self.shrinkContext { note in
+                            self.emit(note)
+                            continuation.yield(note)
+                        }
+                        if let steered = self.takeSteering() {
+                            self._session.append(Message(role: .user, text: steered))
+                            let note = AgentEvent.informational("Steered: \(steered)")
                             self.emit(note)
                             continuation.yield(note)
                         }
@@ -217,7 +275,14 @@ public final class AgentLoop: @unchecked Sendable {
                         self.emit(.assistant(update))
                         continuation.yield(.assistant(update))
 
-                        // 3. No tool calls → the run is done.
+                        // 3. No tool calls → the run is done, unless the caller
+                        // steered in a message the model hasn't seen yet.
+                        if response.message.toolCalls.isEmpty && self.hasSteering {
+                            // Counted as a turn, so steering after every answer
+                            // still reaches maxTurns.
+                            self._turnCounter += 1
+                            continue
+                        }
                         guard !response.message.toolCalls.isEmpty else {
                             let success = self.result(.success, text: response.message.text, stopReason: response.finishReason)
                             self.finish(continuation, success)
@@ -273,6 +338,7 @@ public final class AgentLoop: @unchecked Sendable {
         _loopDetector.reset()
         _lastRefusal = nil
         _declined = nil
+        _tookTurnCapGrace = false
     }
 
     // MARK: Refusals
@@ -350,6 +416,11 @@ public final class AgentLoop: @unchecked Sendable {
     }
 
     private func finish(_ continuation: AsyncThrowingStream<AgentEvent, any Error>.Continuation, _ result: AgentResult) {
+        if let dropped = takeSteering() {
+            let note = AgentEvent.informational("Not delivered: \(dropped)")
+            emit(note)
+            continuation.yield(note)
+        }
         emit(.result(result))
         continuation.yield(.result(result))
         continuation.finish()
