@@ -20,8 +20,12 @@ final class ScriptedModel: LanguageModel, @unchecked Sendable {
         self.responses = responses
     }
 
+    /// Called with each call's index, before it answers.
+    var onCall: ((Int) -> Void)?
+
     func complete(_ request: ModelRequest) async throws -> ModelResponse {
         requests.append(request)
+        onCall?(callIndex)
         let response = responses[min(callIndex, responses.count - 1)]
         callIndex += 1
         return response
@@ -140,6 +144,66 @@ struct AgentLoopTests {
 
         #expect(result.isSuccess)
         #expect(result.numTurns == 12)
+    }
+
+    /// Lets a tool or model double reach the loop it runs in.
+    final class LoopBox: @unchecked Sendable {
+        var loop: AgentLoop?
+    }
+
+    struct SteerTool: Tool {
+        let box: LoopBox
+        var definition: ToolDefinition { ToolDefinition(name: "steer_me", description: "") }
+        func run(arguments: JSON) async throws -> String {
+            box.loop?.steer("wrap up now")
+            return "ok"
+        }
+    }
+
+    @Test
+    func aSteeredMessageArrivesAfterTheTurnsToolResults() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SteerTool(box: box)]))
+        box.loop = loop
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.text == "done")
+        let sent = model.requests[1].messages
+        #expect(sent.map(\.role).suffix(3) == [.assistant, .tool, .user])
+        #expect(sent.last?.text == "wrap up now")
+    }
+
+    @Test
+    func aSteeredMessageKeepsARunGoingThatWouldHaveEnded() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, text: "first answer")),
+            ModelResponse(message: Message(role: .assistant, text: "second answer")),
+        ])
+        model.onCall = { index in if index == 0 { box.loop?.steer("also check Y") } }
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        box.loop = loop
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.text == "second answer")
+        #expect(model.requests.count == 2)
+        #expect(model.requests[1].messages.last?.text == "also check Y")
+    }
+
+    @Test
+    func aMessageSteeredBetweenRunsWaitsForTheNextOne() async throws {
+        let model = ScriptedModel(responses: [ModelResponse(message: Message(role: .assistant, text: "ok"))])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        _ = try await finalResult(loop.run(prompt: "first"))
+        loop.steer("note for later")
+        _ = try await finalResult(loop.run(prompt: "second", continuing: true))
+
+        #expect(model.requests.count == 2)
+        #expect(model.requests[1].messages.suffix(2).map(\.text) == ["second", "note for later"])
     }
 
     /// One session ID for every turn, so the provider can keep the

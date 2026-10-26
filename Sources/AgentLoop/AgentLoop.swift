@@ -70,6 +70,8 @@ public final class AgentLoop: @unchecked Sendable {
     /// The prompt a model declined in the last run, kept until the next run
     /// or a compaction so `removeDeclinedRequest` can take it out.
     private var _declined: DeclinedRequest?
+    /// Messages from `steer`, waiting for the next model call.
+    private var _steering: [String] = []
 
     private struct DeclinedRequest {
         var promptIndex: Int
@@ -129,6 +131,34 @@ public final class AgentLoop: @unchecked Sendable {
         self._loopDetector = LoopDetector(checkAfterTurns: options.loopCheckAfterTurns)
     }
 
+    /// Tell the agent something while it works, e.g. "wrap up and answer now".
+    ///
+    /// The message joins the conversation as a user message just before the
+    /// next model call, after the current turn's tool results, and the run
+    /// goes on with everything it has done so far. A reply that would have
+    /// ended the run is followed by the message instead. Sent between runs,
+    /// it waits for the next one.
+    public func steer(_ text: String) {
+        lock.lock(); defer { lock.unlock() }
+        _steering.append(text)
+    }
+
+    private var hasSteering: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !_steering.isEmpty
+    }
+
+    /// Add the waiting `steer` messages to the conversation, as one user
+    /// message. Returns it, or nil when there was none.
+    private func deliverSteering() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard !_steering.isEmpty else { return nil }
+        let text = _steering.joined(separator: "\n\n")
+        _steering = []
+        _session.append(Message(role: .user, text: text))
+        return text
+    }
+
     /// Run a prompt, streaming `AgentEvent`s.
     public func run(prompt: String, continuing: Bool = false) -> AsyncThrowingStream<AgentEvent, any Error> {
         AsyncThrowingStream { continuation in
@@ -151,8 +181,14 @@ public final class AgentLoop: @unchecked Sendable {
                             return
                         }
 
-                        // 1. Ask the model, after trimming what it no longer needs.
+                        // 1. Ask the model, after trimming what it no longer needs
+                        // and adding what the caller steered in meanwhile.
                         try await self.shrinkContext { note in
+                            self.emit(note)
+                            continuation.yield(note)
+                        }
+                        if let steered = self.deliverSteering() {
+                            let note = AgentEvent.informational("Steered: \(steered)")
                             self.emit(note)
                             continuation.yield(note)
                         }
@@ -217,7 +253,11 @@ public final class AgentLoop: @unchecked Sendable {
                         self.emit(.assistant(update))
                         continuation.yield(.assistant(update))
 
-                        // 3. No tool calls → the run is done.
+                        // 3. No tool calls → the run is done, unless the caller
+                        // steered in a message the model hasn't seen yet.
+                        if response.message.toolCalls.isEmpty && self.hasSteering {
+                            continue
+                        }
                         guard !response.message.toolCalls.isEmpty else {
                             let success = self.result(.success, text: response.message.text, stopReason: response.finishReason)
                             self.finish(continuation, success)
