@@ -136,16 +136,25 @@ public final class AgentLoop: @unchecked Sendable {
     /// The message joins the conversation as a user message just before the
     /// next model call, after the current turn's tool results, and the run
     /// goes on with everything it has done so far. A reply that would have
-    /// ended the run is followed by the message instead. Sent between runs,
-    /// it waits for the next one.
+    /// ended the run is followed by the message instead, and a run at its
+    /// `maxTurns` gets one more model call to answer it. A run that ends
+    /// another way (budget, refusal, loop detector, error) drops it: it was
+    /// about that run. Sent between runs, it waits for the next one.
     public func steer(_ text: String) {
+        let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
         lock.lock(); defer { lock.unlock() }
-        _steering.append(text)
+        _steering.append(message)
     }
 
     private var hasSteering: Bool {
         lock.lock(); defer { lock.unlock() }
         return !_steering.isEmpty
+    }
+
+    private func dropSteering() {
+        lock.lock(); defer { lock.unlock() }
+        _steering = []
     }
 
     /// Add the waiting `steer` messages to the conversation, as one user
@@ -175,7 +184,9 @@ public final class AgentLoop: @unchecked Sendable {
                     self.appendUser(prompt)
 
                     while true {
-                        if let maxTurns = self.options.maxTurns, self._turnCounter >= maxTurns {
+                        // A pending steer ("wrap up now") is most likely to come
+                        // just as the turns run out, so it still gets its answer.
+                        if let maxTurns = self.options.maxTurns, self._turnCounter >= maxTurns, !self.hasSteering {
                             self.emit(.informational("Hit maxTurns (\(maxTurns)) — stopping."))
                             self.finish(continuation, self.result(.errorMaxTurns))
                             return
@@ -390,6 +401,7 @@ public final class AgentLoop: @unchecked Sendable {
     }
 
     private func finish(_ continuation: AsyncThrowingStream<AgentEvent, any Error>.Continuation, _ result: AgentResult) {
+        dropSteering()
         emit(.result(result))
         continuation.yield(.result(result))
         continuation.finish()

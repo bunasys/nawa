@@ -206,6 +206,72 @@ struct AgentLoopTests {
         #expect(model.requests[1].messages.suffix(2).map(\.text) == ["second", "note for later"])
     }
 
+    /// "Wrap up now" usually comes as the turns run out: the run still gets
+    /// one more model call to act on it.
+    @Test
+    func aSteeredMessageGetsAnAnswerAtTheTurnCap() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
+            toolCallResponse(ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("submitted")]))),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SteerTool(box: box), EchoTool()]), options: LoopOptions(maxTurns: 1))
+        box.loop = loop
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.kind == .errorMaxTurns)
+        #expect(model.requests.count == 2)
+        #expect(model.requests[1].messages.last?.text == "wrap up now")
+    }
+
+    @Test
+    func aSteeredMessageARunNeverSawIsDroppedWhenItEnds() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, text: ""), finishReason: .refusal),
+            ModelResponse(message: Message(role: .assistant, text: "ok")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        model.onCall = { index in if index == 0 { loop.steer("about the first prompt") } }
+        _ = try await finalResult(loop.run(prompt: "first"))
+        _ = try await finalResult(loop.run(prompt: "second", continuing: true))
+
+        let lastRequest = try #require(model.requests.last)
+        #expect(!lastRequest.messages.contains { $0.text == "about the first prompt" })
+    }
+
+    @Test
+    func messagesSteeredBeforeTheNextTurnArriveTogether() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, text: "first answer")),
+            ModelResponse(message: Message(role: .assistant, text: "second answer")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        model.onCall = { index in
+            guard index == 0 else { return }
+            loop.steer("check X")
+            loop.steer("  ")
+            loop.steer("then Y")
+        }
+        var notes: [String] = []
+        for try await event in loop.run(prompt: "go") {
+            if case .informational(let text) = event { notes.append(text) }
+        }
+
+        #expect(model.requests.count == 2)
+        #expect(model.requests[1].messages.last?.text == "check X\n\nthen Y")
+        #expect(notes.contains("Steered: check X\n\nthen Y"))
+    }
+
+    @Test
+    func anEmptySteerIsIgnored() async throws {
+        let model = ScriptedModel(responses: [ModelResponse(message: Message(role: .assistant, text: "ok"))])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        model.onCall = { index in if index == 0 { loop.steer(" \n ") } }
+        _ = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(model.requests.count == 1)
+    }
+
     /// One session ID for every turn, so the provider can keep the
     /// conversation on one prompt cache.
     @Test
