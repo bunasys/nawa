@@ -206,10 +206,10 @@ struct AgentLoopTests {
         #expect(model.requests[1].messages.suffix(2).map(\.text) == ["second", "note for later"])
     }
 
-    /// "Wrap up now" usually comes as the turns run out: the run still gets
-    /// one more model call to act on it.
+    /// "Wrap up now" usually comes as the turns run out: the run gets one
+    /// more model call, whose tools still run, and then ends at the cap.
     @Test
-    func aSteeredMessageGetsAnAnswerAtTheTurnCap() async throws {
+    func aSteeredMessageGetsOneCallAtTheTurnCap() async throws {
         let box = LoopBox()
         let model = ScriptedModel(responses: [
             toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
@@ -220,8 +220,30 @@ struct AgentLoopTests {
         let result = try await finalResult(loop.run(prompt: "go"))
 
         #expect(result.kind == .errorMaxTurns)
+        #expect(result.numTurns == 2)
         #expect(model.requests.count == 2)
         #expect(model.requests[1].messages.last?.text == "wrap up now")
+    }
+
+    /// Steering on every turn must not lift the cap: one extra call per run.
+    @Test
+    func steeringEveryTurnCanNotLiftTheTurnCap() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
+            toolCallResponse(ToolCall(id: "c2", name: "steer_me")),
+            // Only reached if the cap was lifted twice; ends the run instead of looping.
+            ModelResponse(message: Message(role: .assistant, text: "past the cap")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SteerTool(box: box)]), options: LoopOptions(maxTurns: 1))
+        box.loop = loop
+        var notes: [String] = []
+        for try await event in loop.run(prompt: "go") {
+            if case .informational(let text) = event { notes.append(text) }
+        }
+
+        #expect(model.requests.count == 2)
+        #expect(notes.contains("Not delivered: wrap up now"))
     }
 
     @Test

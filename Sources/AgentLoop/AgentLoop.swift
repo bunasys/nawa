@@ -72,6 +72,9 @@ public final class AgentLoop: @unchecked Sendable {
     private var _declined: DeclinedRequest?
     /// Messages from `steer`, waiting for the next model call.
     private var _steering: [String] = []
+    /// Whether this run already took its one model call past `maxTurns` to
+    /// answer a steer. One only, so steering can't lift the cap.
+    private var _tookTurnCapGrace = false
 
     private struct DeclinedRequest {
         var promptIndex: Int
@@ -136,10 +139,14 @@ public final class AgentLoop: @unchecked Sendable {
     /// The message joins the conversation as a user message just before the
     /// next model call, after the current turn's tool results, and the run
     /// goes on with everything it has done so far. A reply that would have
-    /// ended the run is followed by the message instead, and a run at its
-    /// `maxTurns` gets one more model call to answer it. A run that ends
-    /// another way (budget, refusal, loop detector, error) drops it: it was
-    /// about that run. Sent between runs, it waits for the next one.
+    /// ended the run is followed by the message instead.
+    ///
+    /// A run at its `maxTurns` gets one more model call to answer it, once per
+    /// run. The tools that call asks for still run (so a "submit" tool gets
+    /// its answer), and then the run ends as `errorMaxTurns`. A run that ends
+    /// another way (budget, refusal, loop detector, error) drops the message,
+    /// since it was about that run, and says so with a "Not delivered: …"
+    /// informational event. Sent between runs, it waits for the next one.
     public func steer(_ text: String) {
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { return }
@@ -152,9 +159,13 @@ public final class AgentLoop: @unchecked Sendable {
         return !_steering.isEmpty
     }
 
-    private func dropSteering() {
+    /// Empties the steer queue; returns what was in it, or nil when empty.
+    private func dropSteering() -> String? {
         lock.lock(); defer { lock.unlock() }
+        guard !_steering.isEmpty else { return nil }
+        let dropped = _steering.joined(separator: "\n\n")
         _steering = []
+        return dropped
     }
 
     /// Add the waiting `steer` messages to the conversation, as one user
@@ -184,12 +195,16 @@ public final class AgentLoop: @unchecked Sendable {
                     self.appendUser(prompt)
 
                     while true {
-                        // A pending steer ("wrap up now") is most likely to come
-                        // just as the turns run out, so it still gets its answer.
-                        if let maxTurns = self.options.maxTurns, self._turnCounter >= maxTurns, !self.hasSteering {
-                            self.emit(.informational("Hit maxTurns (\(maxTurns)) — stopping."))
-                            self.finish(continuation, self.result(.errorMaxTurns))
-                            return
+                        if let maxTurns = self.options.maxTurns, self._turnCounter >= maxTurns {
+                            // A steer ("wrap up now") is most likely to come just
+                            // as the turns run out, so it gets one call to answer.
+                            let mayAnswerSteer = self.hasSteering && !self._tookTurnCapGrace
+                            if !mayAnswerSteer {
+                                self.emit(.informational("Hit maxTurns (\(maxTurns)) — stopping."))
+                                self.finish(continuation, self.result(.errorMaxTurns))
+                                return
+                            }
+                            self._tookTurnCapGrace = true
                         }
 
                         // 1. Ask the model, after trimming what it no longer needs
@@ -324,6 +339,7 @@ public final class AgentLoop: @unchecked Sendable {
         _loopDetector.reset()
         _lastRefusal = nil
         _declined = nil
+        _tookTurnCapGrace = false
     }
 
     // MARK: Refusals
@@ -401,7 +417,11 @@ public final class AgentLoop: @unchecked Sendable {
     }
 
     private func finish(_ continuation: AsyncThrowingStream<AgentEvent, any Error>.Continuation, _ result: AgentResult) {
-        dropSteering()
+        if let dropped = dropSteering() {
+            let note = AgentEvent.informational("Not delivered: \(dropped)")
+            emit(note)
+            continuation.yield(note)
+        }
         emit(.result(result))
         continuation.yield(.result(result))
         continuation.finish()
