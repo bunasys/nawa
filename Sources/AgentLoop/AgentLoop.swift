@@ -142,8 +142,9 @@ public final class AgentLoop: @unchecked Sendable {
     /// ended the run is followed by the message instead.
     ///
     /// A run at its `maxTurns` gets one more model call to answer it, once per
-    /// run. The tools that call asks for still run (so a "submit" tool gets
-    /// its answer), and then the run ends as `errorMaxTurns`. A run that ends
+    /// run. A text answer to that call is the run's answer (`success`); if it
+    /// calls tools instead, they still run (so a "submit" tool gets its
+    /// answer) and the run ends as `errorMaxTurns`. A run that ends
     /// another way (budget, refusal, loop detector, error) drops the message,
     /// since it was about that run, and says so with a "Not delivered: …"
     /// informational event. Sent between runs, it waits for the next one.
@@ -159,23 +160,12 @@ public final class AgentLoop: @unchecked Sendable {
         return !_steering.isEmpty
     }
 
-    /// Empties the steer queue; returns what was in it, or nil when empty.
-    private func dropSteering() -> String? {
-        lock.lock(); defer { lock.unlock() }
-        guard !_steering.isEmpty else { return nil }
-        let dropped = _steering.joined(separator: "\n\n")
-        _steering = []
-        return dropped
-    }
-
-    /// Add the waiting `steer` messages to the conversation, as one user
-    /// message. Returns it, or nil when there was none.
-    private func deliverSteering() -> String? {
+    /// Empties the steer queue: its messages as one text, or nil when empty.
+    private func takeSteering() -> String? {
         lock.lock(); defer { lock.unlock() }
         guard !_steering.isEmpty else { return nil }
         let text = _steering.joined(separator: "\n\n")
         _steering = []
-        _session.append(Message(role: .user, text: text))
         return text
     }
 
@@ -213,7 +203,8 @@ public final class AgentLoop: @unchecked Sendable {
                             self.emit(note)
                             continuation.yield(note)
                         }
-                        if let steered = self.deliverSteering() {
+                        if let steered = self.takeSteering() {
+                            self._session.append(Message(role: .user, text: steered))
                             let note = AgentEvent.informational("Steered: \(steered)")
                             self.emit(note)
                             continuation.yield(note)
@@ -417,7 +408,7 @@ public final class AgentLoop: @unchecked Sendable {
     }
 
     private func finish(_ continuation: AsyncThrowingStream<AgentEvent, any Error>.Continuation, _ result: AgentResult) {
-        if let dropped = dropSteering() {
+        if let dropped = takeSteering() {
             let note = AgentEvent.informational("Not delivered: \(dropped)")
             emit(note)
             continuation.yield(note)

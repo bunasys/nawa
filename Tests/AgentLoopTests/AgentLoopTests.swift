@@ -225,6 +225,41 @@ struct AgentLoopTests {
         #expect(model.requests[1].messages.last?.text == "wrap up now")
     }
 
+    @Test
+    func aTextAnswerAtTheTurnCapIsTheRunsAnswer() async throws {
+        let box = LoopBox()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "steer_me")),
+            ModelResponse(message: Message(role: .assistant, text: "here is what I have")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([SteerTool(box: box)]), options: LoopOptions(maxTurns: 1))
+        box.loop = loop
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(result.kind == .success)
+        #expect(result.text == "here is what I have")
+    }
+
+    /// The real use: a supervisor steers from its own task while a tool runs.
+    @Test
+    func aMessageSteeredFromAnotherTaskWhileAToolRunsArrivesNext() async throws {
+        let gate = GateTool()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "gate")),
+            ModelResponse(message: Message(role: .assistant, text: "wrapped up")),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([gate]))
+        let running = Task { try await finalResult(loop.run(prompt: "go")) }
+
+        await gate.waitUntilStarted()
+        loop.steer("wrap up now")
+        gate.open()
+        let result = try await running.value
+
+        #expect(result.text == "wrapped up")
+        #expect(model.requests[1].messages.last?.text == "wrap up now")
+    }
+
     /// Steering on every turn must not lift the cap: one extra call per run.
     @Test
     func steeringEveryTurnCanNotLiftTheTurnCap() async throws {
@@ -480,6 +515,25 @@ struct SlowTool: Tool {
         try await Task.sleep(for: .seconds(60))
         return "finished"
     }
+}
+
+/// Holds its run until the test opens it, so the test can act while a tool runs.
+final class GateTool: Tool, @unchecked Sendable {
+    private let started = AsyncStream<Void>.makeStream()
+    private let opened = AsyncStream<Void>.makeStream()
+    var definition: ToolDefinition { ToolDefinition(name: "gate", description: "", parameters: .object([:])) }
+
+    func run(arguments: JSON) async throws -> String {
+        started.continuation.yield()
+        for await _ in opened.stream { break }
+        return "opened"
+    }
+
+    func waitUntilStarted() async {
+        for await _ in started.stream { break }
+    }
+
+    func open() { opened.continuation.yield() }
 }
 
 func toolCallResponse(_ call: ToolCall, usage: Usage = .zero) -> ModelResponse {
