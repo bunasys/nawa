@@ -74,6 +74,12 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         }
     }
 
+    /// A chat reply can take minutes before its first byte: a long context, a
+    /// slow model, or a proxy in front that waits for the whole reply (as
+    /// Hafez's does). URLSession's 60-second default cut those off; this
+    /// matches `AnthropicClient.requestTimeout`.
+    static let requestTimeout: TimeInterval = 600
+
     /// Endpoints that answered `stream_options` with a 400, by URL: asked
     /// once per process, then streamed without usage.
     private static let rejectsStreamOptions = Mutex<Set<String>>([])
@@ -102,7 +108,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             maxTokens: request.maxOutputTokens,
             streamOptions: askForUsage ? ["include_usage": true] : nil
         )
-        var urlRequest = URLRequest(url: chatCompletionsURL)
+        var urlRequest = URLRequest(url: chatCompletionsURL, timeoutInterval: Self.requestTimeout)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
@@ -226,7 +232,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         apiKey: String?,
         body: some Encodable
     ) async throws -> Data {
-        var urlRequest = URLRequest(url: url)
+        var urlRequest = URLRequest(url: url, timeoutInterval: requestTimeout)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }

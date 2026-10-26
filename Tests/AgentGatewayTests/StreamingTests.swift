@@ -19,6 +19,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     /// Host → replies, served in order; the bodies received, per host.
     private static let replies = Mutex<[String: [Reply]]>([:])
     private static let bodies = Mutex<[String: [String]]>([:])
+    private static let timeouts = Mutex<[String: [TimeInterval]]>([:])
 
     /// A session whose requests to `host` get `replies`.
     static func session(host: String, replies: [Reply]) -> URLSession {
@@ -29,6 +30,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     static func bodies(host: String) -> [String] { bodies.withLock { $0[host] ?? [] } }
+    static func timeouts(host: String) -> [TimeInterval] { timeouts.withLock { $0[host] ?? [] } }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -36,6 +38,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         let host = request.url?.host ?? ""
         Self.bodies.withLock { $0[host, default: []].append(Self.body(of: request)) }
+        Self.timeouts.withLock { $0[host, default: []].append(request.timeoutInterval) }
         let reply = Self.replies.withLock { replies -> Reply? in
             guard var queue = replies[host], !queue.isEmpty else { return nil }
             let next = queue.removeFirst()
@@ -253,6 +256,24 @@ struct OpenAIStreamingTests {
         #expect(bodies.count == 3)
         #expect(bodies[0].contains("stream_options"))
         #expect(!bodies[1].contains("stream_options") && !bodies[2].contains("stream_options"))
+    }
+
+    /// A slow reply (a long context, or a proxy that waits for the whole
+    /// reply) must not hit URLSession's 60-second default.
+    @Test
+    func chatRequestsWaitMinutesNotSeconds() async throws {
+        let host = "slow-chat.test"
+        let session = StubURLProtocol.session(host: host, replies: [
+            .init(pieces: [#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#]),
+            .init(pieces: [sse([#"{"choices":[{"delta":{"content":"ok"}}]}"#, "[DONE]"])]),
+        ])
+        let client = OpenAICompatibleClient(providerName: "p", baseURL: URL(string: "https://\(host)/v1")!, session: session)
+        let request = ModelRequest(model: "m", messages: [Message(role: .user, text: "hi")])
+
+        _ = try await client.complete(request)
+        _ = try await collect(client.stream(request))
+
+        #expect(StubURLProtocol.timeouts(host: host) == [600, 600])
     }
 }
 
