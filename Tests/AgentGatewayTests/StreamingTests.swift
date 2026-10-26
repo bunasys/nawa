@@ -307,6 +307,10 @@ struct OpenAIStreamingTests {
         }
 
         #expect(Set(StubURLProtocol.bodies(host: host)).count == 1)
+        // Sorted, not insertion order (field1, field2, …): deterministic even
+        // where equal dictionaries happen to iterate alike.
+        let sortedProperties = (1...12).map { #""field\#($0)":{"type":"string"}"# }.sorted().joined(separator: ",")
+        #expect(StubURLProtocol.bodies(host: host).allSatisfy { $0.contains(sortedProperties) })
         #expect(StubURLProtocol.sessionIDs(host: host) == Array(repeating: "s1", count: 8))
     }
 

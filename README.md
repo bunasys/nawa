@@ -150,7 +150,8 @@ env override → the saved config for the directory (for ACP, the session's
 `Gateways.json` can name providers to fall back to, tried in order when the
 active one can't serve a request: a rate limit or exhausted quota (429, or
 Anthropic's "credit balance is too low"), an outage (5xx, 529), a network
-failure, or a credential or model the provider rejects (401, 402, 403, 404).
+failure, a request timeout (408), or a credential or model the provider
+rejects (401, 402, 403, 404).
 A malformed request (other 400s) fails straight away, since it would fail
 anywhere.
 
