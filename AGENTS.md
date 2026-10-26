@@ -55,7 +55,9 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   caps, usage accounting, and cost estimates. There is no turn cap by
   default: from turn 50 (`loopCheckAfterTurns`) `LoopDetector` stops a run
   whose last 10 turns repeat the same tool calls with the same results 3
-  times. `LoopOptions` also turns on
+  times. `steer(_:)` hands a running loop a message ("wrap up now"): it
+  arrives as a user message after the current turn's tool results, and keeps
+  a run going that would otherwise have ended. `LoopOptions` also turns on
   the token savers: `keepToolResults` (clear old tool output in batches),
   `compaction` (summarize older messages; adds a `remember` tool whose notes
   survive), `subAgents` (a `task` tool running a fresh child loop), and
