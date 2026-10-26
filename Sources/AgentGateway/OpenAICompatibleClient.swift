@@ -108,7 +108,10 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             maxTokens: request.maxOutputTokens,
             streamOptions: askForUsage ? ["include_usage": true] : nil
         )
-        var urlRequest = URLRequest(url: chatCompletionsURL, timeoutInterval: Self.requestTimeout)
+        var urlRequest = URLRequest(url: chatCompletionsURL)
+        // Assigned, not passed to init: on Linux only the setter marks the
+        // timeout as set, and otherwise URLSession uses the session's 60 s.
+        urlRequest.timeoutInterval = Self.requestTimeout
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
@@ -232,7 +235,10 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         apiKey: String?,
         body: some Encodable
     ) async throws -> Data {
-        var urlRequest = URLRequest(url: url, timeoutInterval: requestTimeout)
+        var urlRequest = URLRequest(url: url)
+        // Assigned, not passed to init: on Linux only the setter marks the
+        // timeout as set, and otherwise URLSession uses the session's 60 s.
+        urlRequest.timeoutInterval = requestTimeout
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }

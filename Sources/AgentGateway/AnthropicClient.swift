@@ -387,7 +387,10 @@ public struct AnthropicClient: LanguageModel, Sendable {
 
     /// A request with the version and auth headers.
     private func makeRequest(method: String, url: URL, body: JSON?, serverFallbacks: Bool = false) async throws -> URLRequest {
-        var urlRequest = URLRequest(url: url, timeoutInterval: Self.requestTimeout)
+        var urlRequest = URLRequest(url: url)
+        // Assigned, not passed to init: on Linux only the setter marks the
+        // timeout as set, and otherwise URLSession uses the session's 60 s.
+        urlRequest.timeoutInterval = Self.requestTimeout
         urlRequest.httpMethod = method
         urlRequest.setValue(Self.apiVersion, forHTTPHeaderField: "anthropic-version")
         if serverFallbacks {

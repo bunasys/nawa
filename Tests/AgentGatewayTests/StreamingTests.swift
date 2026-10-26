@@ -275,6 +275,39 @@ struct OpenAIStreamingTests {
 
         #expect(StubURLProtocol.timeouts(host: host) == [600, 600])
     }
+
+    /// The request's own timeout must win over the session's, on Linux too:
+    /// there, a timeout passed to `URLRequest`'s init is ignored, and a
+    /// review on Linux was cut off this way after 60 s.
+    @Test(.timeLimit(.minutes(1)))
+    func aSessionsShortTimeoutDoesNotCutAChatReply() async throws {
+        final class Outcome: Sendable {
+            let text = Mutex<String?>(nil)
+        }
+        // Not empty: an empty chunk would end the chunked body.
+        let server = try HangingHTTPServer(firstBytes: "{")
+        defer { server.close() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 1
+        let client = OpenAICompatibleClient(
+            providerName: "p", baseURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!,
+            session: URLSession(configuration: configuration)
+        )
+        let outcome = Outcome()
+        let call = Task {
+            do {
+                _ = try await client.complete(ModelRequest(model: "m", messages: [Message(role: .user, text: "hi")]))
+                outcome.text.withLock { $0 = "answered" }
+            } catch {
+                outcome.text.withLock { $0 = "\(error)" }
+            }
+        }
+
+        try await Task.sleep(for: .seconds(3))
+
+        #expect(outcome.text.withLock { $0 } == nil, "still waiting after 3 s, past the session's 1 s")
+        call.cancel()
+    }
 }
 
 /// `ResponseByteStream` is what streams on Linux; it is tested here on
