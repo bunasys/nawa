@@ -1,10 +1,12 @@
 # Push a tag `vX.Y.Z` on main to publish a release: on each platform the
 # tests run, then the macOS arm64 and static Linux amd64 binaries are
 # built, checked and attached to the GitHub release `vX.Y.Z` (created with generated notes,
-# or added to if it already exists). The tag must match the version
-# `nawa --version` prints (ACPServerInfo.nawa in Sources/AgentACP/ACPTypes.swift).
+# or added to if it already exists). The tag is the version: it is written
+# into Sources/AgentACP/Version.swift before the build, and the check step
+# makes sure `nawa --version` prints it.
 # Run it by hand (Actions > Release > Run workflow) for a dry run: the same
-# builds and checks, binaries kept as run artifacts, nothing published.
+# builds and checks, binaries kept as run artifacts (version "dev"),
+# nothing published.
 # After publishing, the formula in github.com/bunasys/homebrew-tap is
 # updated (needs the HOMEBREW_TAP_TOKEN secret).
 name: Release
@@ -33,6 +35,10 @@ jobs:
       - uses: ./.github/actions/swift-build-cache
         with:
           platform: macos
+      - name: Stamp the version
+        # The tag is the version: `nawa --version` prints what this writes.
+        if: github.ref_type == 'tag'
+        run: echo "let nawaVersion = \"${GITHUB_REF_NAME#v}\"" > Sources/AgentACP/Version.swift
       - name: Test
         run: swift build --build-tests && swift test --skip-build
       - name: Build
@@ -76,6 +82,10 @@ jobs:
       - uses: ./.github/actions/swift-build-cache
         with:
           platform: linux
+      - name: Stamp the version
+        # The tag is the version: `nawa --version` prints what this writes.
+        if: github.ref_type == 'tag'
+        run: echo "let nawaVersion = \"${GITHUB_REF_NAME#v}\"" > Sources/AgentACP/Version.swift
       - name: Test
         run: swift build --build-tests && swift test --skip-build
       - name: Install the Static Linux SDK

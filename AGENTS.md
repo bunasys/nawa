@@ -164,10 +164,12 @@ GitHub Actions (`.github/workflows/`):
   read & write on the tap repo). Without it the job warns and skips.
   Run it by hand from the Actions tab for a dry run that publishes nothing.
 
-To release: set the version in `ACPServerInfo.nawa`
-(`Sources/AgentACP/ACPTypes.swift`; `nawa --version` prints it), commit,
-push `main`, then `git tag -a vX.Y.Z -m "Nawa X.Y.Z" && git push origin vX.Y.Z`.
-The run fails if the tag and the version differ.
+To release: push `main`, then
+`git tag -a vX.Y.Z -m "Nawa X.Y.Z" && git push origin vX.Y.Z`. No version
+commit: the workflow writes the tag's version into
+`Sources/AgentACP/Version.swift` before building, and `nawa --version`
+prints it. Builds from the repo say `dev`; never commit a stamped
+`Version.swift`.
 
 The Static Linux SDK must match the container's compiler exactly: to move
 to a newer Swift, change the `swift:` image in both workflows together with
