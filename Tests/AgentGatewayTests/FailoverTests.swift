@@ -46,6 +46,31 @@ struct FailoverTests {
         #expect(sentToFallback[0].contains(#""model":"fallback-model""#))
     }
 
+    /// The session journal learns about failovers and the HTTP exchange
+    /// from the response.
+    @Test
+    func aFallbackAnswerListsTheFailedProviderAndTheWireFacts() async throws {
+        let (primary, fallback) = ("facts.primary.test", "facts.fallback.test")
+        _ = StubURLProtocol.session(host: primary, replies: [.init(status: 503, pieces: ["down"])])
+        var answer = reply("ok", model: "fallback-model")
+        answer.headers = [
+            "x-request-id": "req_42",
+            "x-ratelimit-remaining-requests": "99",
+            "set-cookie": "never-recorded",
+        ]
+        let session = StubURLProtocol.session(host: fallback, replies: [answer])
+
+        let response = try await gateway(primary: primary, fallback: fallback, session: session)
+            .complete(ModelRequest(model: "primary-model", messages: hello))
+
+        #expect(response.failedAttempts.map(\.provider) == ["primary"])
+        #expect(response.failedAttempts.first?.error.contains("503") == true)
+        let wire = try #require(response.wire)
+        #expect(wire.requestBytes == StubURLProtocol.bodies(host: fallback).first?.utf8.count)
+        #expect(wire.providerRequestID == "req_42")
+        #expect(wire.rateLimitHeaders == ["x-ratelimit-remaining-requests": "99"])
+    }
+
     @Test
     func aFailedProviderIsSkippedWhileItCoolsDown() async throws {
         let (primary, fallback) = ("cooling.primary.test", "cooling.fallback.test")

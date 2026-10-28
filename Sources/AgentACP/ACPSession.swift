@@ -19,6 +19,8 @@ public actor ACPSession {
     private let loop: AgentLoop
     private let sink: ACPMessageSink
     private var promptTask: Task<Void, Never>?
+    private var isRunning = false
+    private var lastActive = ContinuousClock.now
 
     /// Builds a session for a prompt turn.
     /// - Parameters:
@@ -46,6 +48,7 @@ public actor ACPSession {
             return nil
         }.joined(separator: "\n")
         let firstPrompt = loop.session.messages.allSatisfy { $0.role != .user }
+        lastActive = .now
         promptTask = Task { [weak self] in
             await self?.runTurn(requestID: requestID, prompt: text, continuing: !firstPrompt)
         }
@@ -62,7 +65,48 @@ public actor ACPSession {
         promptTask?.cancel()
     }
 
+    /// Whether no prompt has run for `duration`, so the session may be
+    /// unloaded. A session that never ran isn't: its journal starts with
+    /// its first prompt, so there would be nothing to rebuild it from.
+    func isIdle(for duration: Duration) -> Bool {
+        let hasRun = loop.session.messages.contains { $0.role == .user }
+        let quietLongEnough = ContinuousClock.now - lastActive >= duration
+        return hasRun && !isRunning && quietLongEnough
+    }
+
+    /// Sends the conversation so far as `session/update` notifications, the
+    /// way `session/load` replays a session: prompts as user chunks, replies
+    /// as agent chunks, tool calls with their results.
+    func sendHistory() async {
+        for message in loop.session.messages {
+            switch message.role {
+            case .system:
+                continue
+            case .user:
+                guard !message.text.isEmpty else { continue }
+                await emitUpdate(ACPSessionUpdate.messageChunk(kind: .userMessageChunk, messageID: message.id, content: .text(message.text)))
+            case .assistant:
+                if !message.text.isEmpty {
+                    await emitUpdate(ACPSessionUpdate.messageChunk(kind: .agentMessageChunk, messageID: message.id, content: .text(message.text)))
+                }
+                for call in message.toolCalls {
+                    await emitUpdate(ACPSessionUpdate.toolCall(callID: call.id, title: call.name))
+                }
+            case .tool:
+                for case .toolResult(let result) in message.content {
+                    let status: ACPToolCallStatus = result.isError ? .failed : .completed
+                    await emitUpdate(ACPSessionUpdate.toolCallUpdate(callID: result.callID, status: status, content: .text(result.content)))
+                }
+            }
+        }
+    }
+
     private func runTurn(requestID: JSONRPCID, prompt: String, continuing: Bool) async {
+        isRunning = true
+        defer {
+            isRunning = false
+            lastActive = .now
+        }
         let messageID = "msg_\(UUID().uuidString.prefix(8))"
         var finalResult: AgentResult?
         var textStreamed = false

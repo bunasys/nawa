@@ -12,12 +12,16 @@ public struct Usage: Sendable, Hashable, Codable {
     public var cacheReadTokens: Int
     /// Input tokens written to the provider's prompt cache on this call.
     public var cacheWriteTokens: Int
+    /// The part of `outputTokens` spent on reasoning, when the provider
+    /// reports it (OpenAI's `completion_tokens_details`); 0 otherwise.
+    public var reasoningTokens: Int
 
-    public init(inputTokens: Int = 0, outputTokens: Int = 0, cacheReadTokens: Int = 0, cacheWriteTokens: Int = 0) {
+    public init(inputTokens: Int = 0, outputTokens: Int = 0, cacheReadTokens: Int = 0, cacheWriteTokens: Int = 0, reasoningTokens: Int = 0) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.cacheReadTokens = cacheReadTokens
         self.cacheWriteTokens = cacheWriteTokens
+        self.reasoningTokens = reasoningTokens
     }
 
     public static let zero = Usage()
@@ -28,6 +32,7 @@ public struct Usage: Sendable, Hashable, Codable {
         outputTokens += other.outputTokens
         cacheReadTokens += other.cacheReadTokens
         cacheWriteTokens += other.cacheWriteTokens
+        reasoningTokens += other.reasoningTokens
     }
 
     /// Everything the model read on this call: the size of the prompt.

@@ -44,4 +44,11 @@ struct AgentGatewayTests {
         let usage = OpenAICompatibleClient.usage(try JSONDecoder().decode(OpenAIUsage.self, from: data))
         #expect(usage == Usage(inputTokens: 200, outputTokens: 7, cacheReadTokens: 800))
     }
+
+    @Test
+    func reasoningTokensAreKept() throws {
+        let data = Data(#"{"prompt_tokens":10,"completion_tokens":500,"completion_tokens_details":{"reasoning_tokens":420}}"#.utf8)
+        let usage = OpenAICompatibleClient.usage(try JSONDecoder().decode(OpenAIUsage.self, from: data))
+        #expect(usage == Usage(inputTokens: 10, outputTokens: 500, reasoningTokens: 420))
+    }
 }

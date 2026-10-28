@@ -25,6 +25,7 @@ public struct PlainChat {
     public func run(readLine: () -> String?) async {
         var transcript = Transcript()
         emit([layout.header(session.header)])
+        emit(Transcript.blocks(replaying: session.history))
         if !echoPrompts { emit(["Type a prompt and press Enter; /help lists commands, Ctrl-D quits."]) }
 
         while let line = readLine() {

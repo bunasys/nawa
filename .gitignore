@@ -27,3 +27,7 @@ waku.sh
 
 # Release builds
 dist/
+
+# Core dumps (e.g. from emulated Linux test runs)
+core
+*.core

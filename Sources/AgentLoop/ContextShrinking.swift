@@ -27,10 +27,17 @@ enum ContextShrinking {
         guard positions.count > 2 * keep else { return messages }
 
         var cleared = messages
+        var changedMessages = Set<Int>()
         for position in positions.dropLast(keep) {
             guard case .toolResult(var result) = cleared[position.message].content[position.block] else { continue }
             result.content = elidedResult
             cleared[position.message].content[position.block] = .toolResult(result)
+            changedMessages.insert(position.message)
+        }
+        // The journal refers to messages by id, so an id must always mean
+        // the same content: a changed message is a new message.
+        for index in changedMessages {
+            cleared[index].id = UUID().uuidString
         }
         return cleared
     }

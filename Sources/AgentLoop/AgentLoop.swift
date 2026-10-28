@@ -45,6 +45,11 @@ public final class AgentLoop: @unchecked Sendable {
     public let cwd: String
     /// A hook invoked for every event (instrumentation/telemetry).
     public let onEvent: (@Sendable (AgentEvent) -> Void)?
+    /// Where the session is recorded (proposal 0005); nil records nothing.
+    public let journal: (any SessionJournal)?
+    /// For a sub-agent: the session and `task` call it works for, written
+    /// into its `session_started` record.
+    var journalParent: JournalParent?
 
     private let lock = NSLock()
     private var _session: Session
@@ -75,6 +80,13 @@ public final class AgentLoop: @unchecked Sendable {
     /// Whether this run already took its one model call past `maxTurns` to
     /// answer a steer. One only, so steering can't lift the cap.
     private var _tookTurnCapGrace = false
+    /// Whether `session_started` is written; nothing is recorded before it.
+    private var _journalStarted = false
+    /// Set by `init(restoring:)`: the session's messages are already in
+    /// the journal, so starting it again must not record them twice.
+    private var _isRestored = false
+    /// The tool set last recorded, so an unchanged set isn't written again.
+    private var _recordedTools: (definitions: [ToolDefinition], id: String)?
 
     private struct DeclinedRequest {
         var promptIndex: Int
@@ -87,7 +99,16 @@ public final class AgentLoop: @unchecked Sendable {
     /// (ACP `session/set_model`).
     public var model: String? {
         get { lock.lock(); defer { lock.unlock() }; return _model }
-        set { lock.lock(); defer { lock.unlock() }; _model = newValue }
+        set {
+            lock.lock()
+            let previous = _model
+            _model = newValue
+            let isRecording = _journalStarted
+            lock.unlock()
+            if isRecording && previous != newValue {
+                record(.modelChanged(from: previous, to: newValue))
+            }
+        }
     }
 
     /// The session this loop has been driving. Resumption: keep it, then run
@@ -109,6 +130,9 @@ public final class AgentLoop: @unchecked Sendable {
     ///   - systemPrompt: Optional instructions prepended to every conversation.
     ///   - options: Optional limits (maxTurns, loop check, maxBudgetUSD).
     ///   - cwd: Working directory for tools; defaults to the process cwd.
+    ///   - sessionID: The session's id, also its id in the journal. ACP
+    ///     passes its own session id so the two match.
+    ///   - journal: Where to record the session; nil records nothing.
     ///   - onEvent: Observability hook; fires for every event the loop yields.
     public init(
         gateway: any LanguageModel,
@@ -116,6 +140,8 @@ public final class AgentLoop: @unchecked Sendable {
         systemPrompt: String? = nil,
         options: LoopOptions = LoopOptions(),
         cwd: String = WorkingDirectory().url.path,
+        sessionID: String = UUID().uuidString,
+        journal: (any SessionJournal)? = nil,
         onEvent: (@Sendable (AgentEvent) -> Void)? = nil
     ) {
         self.gateway = gateway
@@ -123,8 +149,9 @@ public final class AgentLoop: @unchecked Sendable {
         self.systemPrompt = systemPrompt
         self.options = options
         self.cwd = cwd
+        self.journal = journal
         self.onEvent = onEvent
-        var session = Session(id: UUID().uuidString, cwd: cwd)
+        var session = Session(id: sessionID, cwd: cwd)
         if let systemPrompt, !systemPrompt.isEmpty {
             session.append(Message(role: .system, text: systemPrompt))
         }
@@ -132,6 +159,42 @@ public final class AgentLoop: @unchecked Sendable {
         self._usage = .zero
         self._turnCounter = 0
         self._loopDetector = LoopDetector(checkAfterTurns: options.loopCheckAfterTurns)
+    }
+
+    /// A loop that goes on with a session rebuilt from its journal
+    /// (`JournalReader.replay`): same id, context, model, notes and totals.
+    ///
+    /// Pass the journal the state was read from: the restored loop appends
+    /// to it and doesn't record the old messages again. `systemPrompt` is
+    /// for sub-agents only; the session keeps the system prompt it had.
+    /// Continue it with `run(prompt:continuing: true)`.
+    public convenience init(
+        restoring state: SessionState,
+        gateway: any LanguageModel,
+        tools: ToolRegistry,
+        systemPrompt: String? = nil,
+        options: LoopOptions = LoopOptions(),
+        journal: (any SessionJournal)? = nil,
+        onEvent: (@Sendable (AgentEvent) -> Void)? = nil
+    ) {
+        self.init(
+            gateway: gateway,
+            tools: tools,
+            systemPrompt: systemPrompt,
+            options: options,
+            cwd: state.cwd,
+            sessionID: state.sessionID,
+            journal: journal,
+            onEvent: onEvent
+        )
+        _session.messages = state.messages
+        _model = state.model
+        _notes = state.notes
+        _usage = state.usage
+        // Helper usage only counts apart when there is a helper to price it.
+        _helperUsage = options.helperModel == nil ? .zero : state.helperUsage
+        _contextTokens = state.contextTokens
+        _isRestored = true
     }
 
     /// Tell the agent something while it works, e.g. "wrap up and answer now".
@@ -179,6 +242,7 @@ public final class AgentLoop: @unchecked Sendable {
         AsyncThrowingStream { continuation in
             let task = Task { [self] in
                 do {
+                    self.startJournalIfNeeded()
                     // Emit the init event once per *conversation*, not per run.
                     if !continuing {
                         let initEvent = AgentEvent.initEvent(self.session)
@@ -188,6 +252,7 @@ public final class AgentLoop: @unchecked Sendable {
 
                     // Append the user's message to the live session.
                     self.appendUser(prompt)
+                    self.record(.runStarted(promptMessageID: self._session.messages[self._runPromptIndex].id, model: self.model))
 
                     while true {
                         if let maxTurns = self.options.maxTurns, self._turnCounter >= maxTurns {
@@ -209,7 +274,10 @@ public final class AgentLoop: @unchecked Sendable {
                             continuation.yield(note)
                         }
                         if let steered = self.takeSteering() {
-                            self._session.append(Message(role: .user, text: steered))
+                            let message = Message(role: .user, text: steered)
+                            self._session.append(message)
+                            self.recordAppended([message])
+                            self.record(.steered(messageID: message.id))
                             let note = AgentEvent.informational("Steered: \(steered)")
                             self.emit(note)
                             continuation.yield(note)
@@ -224,7 +292,7 @@ public final class AgentLoop: @unchecked Sendable {
                             sessionID: self._session.id
                         )
 
-                        let response = try await self.ask(request) { update in
+                        let (response, _) = try await self.callModel(request, purpose: .turn, stream: self.options.streamReplies) { update in
                             self.emit(.stream(update))
                             continuation.yield(.stream(update))
                         }
@@ -239,6 +307,7 @@ public final class AgentLoop: @unchecked Sendable {
                         if let maxBudget = self.options.maxBudgetUSD,
                            let cost = self.totalCost, cost >= maxBudget
                         {
+                            self.record(.message(response.message, appendedToContext: false))
                             self.finish(continuation, self.result(.errorMaxBudgetUSD))
                             return
                         }
@@ -246,7 +315,9 @@ public final class AgentLoop: @unchecked Sendable {
                         // A declined reply is dropped, partial text included:
                         // it is not an answer. Ask the fallback model, if any.
                         if response.finishReason == .refusal {
+                            self.record(.message(response.message, appendedToContext: false))
                             let notice = self.recordRefusal(response)
+                            self.record(.refusal(notice))
                             self.emit(.refusal(notice))
                             continuation.yield(.refusal(notice))
                             if notice.answeredBy != nil { continue }
@@ -258,6 +329,7 @@ public final class AgentLoop: @unchecked Sendable {
                         if let declinedModel = response.declinedBy.first {
                             let notice = RefusalNotice(declinedBy: declinedModel, answeredBy: response.model)
                             self.rememberDeclinedPrompt(notice)
+                            self.record(.refusal(notice))
                             self.emit(.refusal(notice))
                             continuation.yield(.refusal(notice))
                         }
@@ -272,6 +344,7 @@ public final class AgentLoop: @unchecked Sendable {
                             sessionCost: self.totalCost
                         )
                         self._session.append(response.message)
+                        self.recordAppended([response.message])
                         self.emit(.assistant(update))
                         continuation.yield(.assistant(update))
 
@@ -300,7 +373,9 @@ public final class AgentLoop: @unchecked Sendable {
                         for result in results {
                             self.emit(.toolResult(result))
                         }
-                        self._session.messages.append(contentsOf: results.map { $0.asMessage })
+                        let resultMessages = results.map { $0.asMessage }
+                        self._session.messages.append(contentsOf: resultMessages)
+                        self.recordAppended(resultMessages)
                         continuation.yield(.toolResults(results))
 
                         if let repeatedTools = self._loopDetector.record(calls: response.message.toolCalls, results: results) {
@@ -324,6 +399,7 @@ public final class AgentLoop: @unchecked Sendable {
     /// loop check, so both apply to each prompt rather than the whole conversation.
     private func appendUser(_ prompt: String) {
         lock.lock(); defer { lock.unlock() }
+        let countBefore = _session.messages.count
         // A run interrupted between the model's tool calls and their results
         // left calls unanswered, and providers refuse such a conversation.
         if let last = _session.messages.last, last.role == .assistant {
@@ -333,6 +409,7 @@ public final class AgentLoop: @unchecked Sendable {
             }
         }
         _session.append(Message(role: .user, text: prompt))
+        recordAppended(_session.messages[countBefore...])
         _runPromptIndex = _session.messages.count - 1
         _turnCounter = 0
         _loopDetector.reset()
@@ -387,7 +464,12 @@ public final class AgentLoop: @unchecked Sendable {
     public func removeDeclinedRequest() -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard let declined = _declined, declined.promptIndex < _session.messages.count else { return false }
+        let before = _session.messages
         _session.messages.removeSubrange(declined.promptIndex...)
+        recordRewrite(.declinedPromptRemoved, before: before)
+        if _model != declined.modelBefore {
+            record(.modelChanged(from: _model, to: declined.modelBefore))
+        }
         _model = declined.modelBefore
         _declined = nil
         _lastRefusal = nil
@@ -421,6 +503,7 @@ public final class AgentLoop: @unchecked Sendable {
             emit(note)
             continuation.yield(note)
         }
+        record(.runFinished(result))
         emit(.result(result))
         continuation.yield(.result(result))
         continuation.finish()
@@ -443,7 +526,18 @@ public final class AgentLoop: @unchecked Sendable {
     private func runTools(_ toolCalls: [ToolCall], progress: (AgentEvent) -> Void) async -> [ToolCallResult] {
         var results: [ToolCallResult] = []
         for call in toolCalls {
-            results.append(await runTool(call, progress: progress))
+            let startedAt = Date()
+            let result = await runTool(call, progress: progress)
+            let run = ToolRunRecord(
+                callID: call.id,
+                name: call.name,
+                startedAt: startedAt,
+                durationMS: millisecondsSince(startedAt),
+                outputChars: result.content.count,
+                isError: result.isError
+            )
+            record(.toolRun(run))
+            results.append(result)
         }
         return results
     }
@@ -460,6 +554,7 @@ public final class AgentLoop: @unchecked Sendable {
                 return ToolCallResult(callID: call.id, name: call.name, content: "missing string argument 'note'", isError: true)
             }
             _notes.append(note)
+            record(.noteSaved(note))
             return ToolCallResult(callID: call.id, name: call.name, content: "Noted.")
         }
         guard let tool = tools.tool(named: call.name) else {
@@ -514,7 +609,8 @@ public final class AgentLoop: @unchecked Sendable {
         if prompt.isEmpty {
             return ToolCallResult(callID: call.id, name: call.name, content: "missing string argument 'prompt'", isError: true)
         }
-        let child = AgentLoop(gateway: gateway, tools: tools, systemPrompt: systemPrompt, options: childOptions, cwd: cwd)
+        let child = AgentLoop(gateway: gateway, tools: tools, systemPrompt: systemPrompt, options: childOptions, cwd: cwd, journal: journal)
+        child.journalParent = JournalParent(session: _session.id, callID: call.id)
         let childModel = options.helperModel ?? model
         child.model = childModel
 
@@ -541,10 +637,71 @@ public final class AgentLoop: @unchecked Sendable {
         return ToolCallResult(callID: call.id, name: call.name, content: childResult.text ?? "")
     }
 
-    /// One model call for the main turn: streamed when `streamReplies` is
-    /// on, with each partial update handed to `progress` as it arrives.
-    private func ask(_ request: ModelRequest, progress: (AgentStreamUpdate) -> Void) async throws -> ModelResponse {
-        guard options.streamReplies else { return try await gateway.complete(request) }
+    /// One model call, recorded in the journal whether it succeeds or not.
+    /// Streams when `stream` is on, handing each partial update to `progress`.
+    /// Returns the call's id too, so records can refer to it.
+    private func callModel(
+        _ request: ModelRequest,
+        purpose: ModelCallRecord.Purpose,
+        stream: Bool,
+        progress: (AgentStreamUpdate) -> Void = { _ in }
+    ) async throws -> (response: ModelResponse, callID: String) {
+        let callID = UUID().uuidString
+        let toolsID = recordTools(request.tools)
+        let startedAt = Date()
+        var firstChunkAt: Date?
+        func callRecord(_ response: ModelResponse?, error: String?) -> ModelCallRecord {
+            let summary = ModelCallRecord.Request(
+                messageIDs: request.messages.map(\.id),
+                toolsID: toolsID,
+                model: request.model,
+                provider: request.providerName,
+                maxOutputTokens: request.maxOutputTokens,
+                temperature: request.temperature,
+                streamed: stream
+            )
+            let reply = response.map { response in
+                ModelCallRecord.Response(
+                    messageID: response.message.id,
+                    stopReason: response.finishReason,
+                    model: response.model,
+                    provider: response.providerName,
+                    replacedProvider: response.replacedProvider,
+                    declinedBy: response.declinedBy
+                )
+            }
+            let usage = response?.usage ?? .zero
+            return ModelCallRecord(
+                id: callID,
+                purpose: purpose,
+                request: summary,
+                response: reply,
+                usage: usage,
+                costUSD: response == nil ? nil : cost(of: usage, purpose: purpose),
+                startedAt: startedAt,
+                firstChunkMS: firstChunkAt.map { Int(($0.timeIntervalSince(startedAt) * 1000).rounded()) },
+                durationMS: millisecondsSince(startedAt),
+                failedAttempts: response?.failedAttempts ?? [],
+                wire: response?.wire,
+                error: error
+            )
+        }
+
+        do {
+            let response = try await ask(request, stream: stream) { update in
+                if firstChunkAt == nil { firstChunkAt = Date() }
+                progress(update)
+            }
+            record(.modelCall(callRecord(response, error: nil)))
+            return (response, callID)
+        } catch {
+            record(.modelCall(callRecord(nil, error: "\(error)")))
+            throw error
+        }
+    }
+
+    private func ask(_ request: ModelRequest, stream: Bool, progress: (AgentStreamUpdate) -> Void) async throws -> ModelResponse {
+        guard stream else { return try await gateway.complete(request) }
         for try await chunk in gateway.stream(request) {
             switch chunk {
             case .thinkingDelta(let text): progress(.thinkingDelta(text))
@@ -589,7 +746,9 @@ public final class AgentLoop: @unchecked Sendable {
     /// the loop's other notes it says something the result won't.
     private func shrinkContext(report: (AgentEvent) -> Void) async throws {
         if let keep = options.keepToolResults {
-            _session.messages = ContextShrinking.clearingOldToolResults(_session.messages, keep: keep)
+            let before = _session.messages
+            _session.messages = ContextShrinking.clearingOldToolResults(before, keep: keep)
+            recordRewrite(.toolResultsCleared, before: before)
         }
         guard let compaction = options.compaction, _contextTokens >= compaction.atContextTokens else { return }
         let compacted = try await compact(keepRecent: compaction.keepRecentMessages, report: report)
@@ -608,17 +767,22 @@ public final class AgentLoop: @unchecked Sendable {
         let systemMessages = messages.prefix { $0.role == .system }
         let older = messages[systemMessages.count..<cut]
 
+        let summarizerPrompt = [
+            Message(role: .system, text: ContextShrinking.summarizerInstructions),
+            Message(role: .user, text: ContextShrinking.transcript(Array(older))),
+        ]
+        for message in summarizerPrompt {
+            record(.message(message, appendedToContext: false))
+        }
         let request = ModelRequest(
             model: options.helperModel ?? model,
-            messages: [
-                Message(role: .system, text: ContextShrinking.summarizerInstructions),
-                Message(role: .user, text: ContextShrinking.transcript(Array(older))),
-            ],
+            messages: summarizerPrompt,
             maxOutputTokens: options.maxOutputTokens,
             temperature: options.temperature,
             mayFailOver: mayFailOver
         )
-        let response = try await gateway.complete(request)
+        let (response, callID) = try await callModel(request, purpose: .compaction, stream: false)
+        record(.message(response.message, appendedToContext: false))
         recordUsage(response.usage, helper: true)
         try checkAnsweringProvider(response, report: report)
 
@@ -627,11 +791,115 @@ public final class AgentLoop: @unchecked Sendable {
             summary += "\n\nNotes you saved with remember:\n" + _notes.map { "- \($0)" }.joined(separator: "\n")
         }
         _session.messages = Array(systemMessages) + [Message(role: .user, text: summary)] + messages[cut...]
+        recordRewrite(.compaction, before: messages, modelCallID: callID)
         // Message positions moved, and the declined prompt may be in the summary.
         _declined = nil
         // The next model call reports the new size; until then, don't compact again.
         _contextTokens = 0
         return older.count
+    }
+
+    // MARK: Journal
+
+    /// Writes `session_started` and the messages the session began with
+    /// (the system prompt), once, at the first run.
+    private func startJournalIfNeeded() {
+        guard let journal, !_journalStarted else { return }
+        lock.lock()
+        _journalStarted = true
+        lock.unlock()
+        let start = SessionStart(
+            origin: journal.origin,
+            cwd: cwd,
+            model: model,
+            options: journalOptions,
+            parent: journalParent,
+            resumed: _isRestored
+        )
+        record(.sessionStarted(start))
+        if !_isRestored {
+            recordAppended(_session.messages)
+        }
+    }
+
+    private func record(_ record: JournalRecord) {
+        guard let journal, _journalStarted else { return }
+        journal.record(JournalEntry(session: _session.id, record: record))
+    }
+
+    /// Records messages that joined the end of the context.
+    private func recordAppended(_ messages: some Sequence<Message>) {
+        for message in messages {
+            record(.message(message, appendedToContext: true))
+        }
+    }
+
+    /// Records a change to the context that isn't a plain append: the new
+    /// messages first, then which ids left, which came in, and the order
+    /// that results. Nothing is written when nothing changed.
+    private func recordRewrite(_ reason: ContextRewrite.Reason, before: [Message], modelCallID: String? = nil) {
+        let beforeIDs = Set(before.map(\.id))
+        let afterIDs = Set(_session.messages.map(\.id))
+        let added = _session.messages.filter { !beforeIDs.contains($0.id) }
+        let removed = before.map(\.id).filter { !afterIDs.contains($0) }
+        guard !added.isEmpty || !removed.isEmpty else { return }
+        for message in added {
+            record(.message(message, appendedToContext: false))
+        }
+        let rewrite = ContextRewrite(
+            reason: reason,
+            removed: removed,
+            added: added.map(\.id),
+            context: _session.messages.map(\.id),
+            modelCallID: modelCallID
+        )
+        record(.contextRewrite(rewrite))
+    }
+
+    /// Records a tool set the first time it is sent; returns its id.
+    private func recordTools(_ definitions: [ToolDefinition]?) -> String? {
+        guard let definitions, journal != nil else { return nil }
+        if let recorded = _recordedTools, recorded.definitions == definitions {
+            return recorded.id
+        }
+        let id = UUID().uuidString
+        _recordedTools = (definitions, id)
+        record(.tools(id: id, definitions: definitions))
+        return id
+    }
+
+    /// The options that shape a session's cost, for `session_started`.
+    private var journalOptions: JSON {
+        var fields: [String: JSON] = [
+            "send_tools": .bool(options.sendTools),
+            "sub_agents": .bool(options.subAgents),
+            "stream_replies": .bool(options.streamReplies),
+        ]
+        if let maxTurns = options.maxTurns { fields["max_turns"] = .int(maxTurns) }
+        if let turns = options.loopCheckAfterTurns { fields["loop_check_after_turns"] = .int(turns) }
+        if let budget = options.maxBudgetUSD { fields["max_budget_usd"] = .double(budget) }
+        if let tokens = options.maxOutputTokens { fields["max_output_tokens"] = .int(tokens) }
+        if let temperature = options.temperature { fields["temperature"] = .double(temperature) }
+        if let keep = options.keepToolResults { fields["keep_tool_results"] = .int(keep) }
+        if let compaction = options.compaction {
+            fields["compaction"] = .object([
+                "at_context_tokens": .int(compaction.atContextTokens),
+                "keep_recent_messages": .int(compaction.keepRecentMessages),
+            ])
+        }
+        if let model = options.helperModel { fields["helper_model"] = .string(model) }
+        if let model = options.fallbackModel { fields["fallback_model"] = .string(model) }
+        if let pricing = options.pricing { fields["pricing"] = pricing.json }
+        if let pricing = options.helperPricing { fields["helper_pricing"] = pricing.json }
+        return .object(fields)
+    }
+
+    /// One call's estimated cost, priced the way `totalCost` prices it.
+    private func cost(of usage: Usage, purpose: ModelCallRecord.Purpose) -> Double? {
+        guard let pricing = options.pricing else { return nil }
+        let isHelperCall = purpose == .compaction && options.helperModel != nil
+        let callPricing = isHelperCall ? (options.helperPricing ?? pricing) : pricing
+        return callPricing.cost(of: usage)
     }
 
     // MARK: Cost
@@ -717,6 +985,16 @@ public struct Pricing: Sendable, Codable, Equatable {
         let parts = text.split(separator: ",").map { Double($0.trimmingCharacters(in: .whitespaces)) }
         guard parts.count == 2, let input = parts[0], let output = parts[1], input >= 0, output >= 0 else { return nil }
         self.init(inputPer1K: input / 1000, outputPer1K: output / 1000)
+    }
+
+    /// USD per 1,000 tokens, for the journal.
+    var json: JSON {
+        .object([
+            "input_per_1k": .double(inputPer1K),
+            "output_per_1k": .double(outputPer1K),
+            "cache_read_per_1k": .double(cacheReadPer1K),
+            "cache_write_per_1k": .double(cacheWritePer1K),
+        ])
     }
 
     public func cost(of usage: Usage) -> Double {

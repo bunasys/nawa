@@ -119,11 +119,21 @@ struct OpenAIUsage: Decodable {
     let completionTokens: Int?
     let totalTokens: Int?
     let promptTokensDetails: OpenAIPromptTokensDetails?
+    let completionTokensDetails: OpenAICompletionTokensDetails?
     private enum CodingKeys: String, CodingKey {
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
         case totalTokens = "total_tokens"
         case promptTokensDetails = "prompt_tokens_details"
+        case completionTokensDetails = "completion_tokens_details"
+    }
+}
+
+/// Reasoning models report the share of `completion_tokens` spent thinking.
+struct OpenAICompletionTokensDetails: Decodable {
+    let reasoningTokens: Int?
+    private enum CodingKeys: String, CodingKey {
+        case reasoningTokens = "reasoning_tokens"
     }
 }
 

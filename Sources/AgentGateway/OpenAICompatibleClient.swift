@@ -43,7 +43,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             temperature: request.temperature,
             maxTokens: request.maxOutputTokens
         )
-        let data = try await Self.post(session: session, url: chatCompletionsURL, apiKey: apiKey, sessionID: request.sessionID, timeout: requestTimeout, body: body)
+        let (data, wire) = try await Self.post(session: session, url: chatCompletionsURL, apiKey: apiKey, sessionID: request.sessionID, timeout: requestTimeout, body: body)
         do {
             let response = try JSONDecoder().decode(OpenAIResponse.self, from: data)
             guard let choice = response.choices.first, let message = choice.message else {
@@ -51,7 +51,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             }
             let assistant = Self.assistantMessage(from: message)
             let stop = Self.stopReason(from: choice.finishReason)
-            return ModelResponse(message: assistant, finishReason: stop, usage: Self.usage(response.usage))
+            return ModelResponse(message: assistant, finishReason: stop, usage: Self.usage(response.usage), wire: wire)
         } catch let error as GatewayError {
             throw error
         } catch {
@@ -63,12 +63,14 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         AsyncThrowingStream { continuation in
             let task = Task { [self] in
                 do {
-                    let bytes = try await openStream(request)
+                    let (bytes, wire) = try await openStream(request)
                     var assembler = OpenAIStreamAssembler()
                     try await ServerSentEvents.forEachData(in: bytes) { payload in
                         for chunk in try assembler.consume(payload) { continuation.yield(chunk) }
                     }
-                    continuation.yield(.finished(assembler.response()))
+                    var response = assembler.response()
+                    response.wire = wire
+                    continuation.yield(.finished(response))
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -91,7 +93,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
     /// Starts the streaming request. Usage is asked for with
     /// `stream_options.include_usage` (OpenAI sends none without it); a
     /// server that refuses the field gets one retry without it.
-    private func openStream(_ request: ModelRequest) async throws -> HTTPResponseBytes {
+    private func openStream(_ request: ModelRequest) async throws -> (HTTPResponseBytes, WireFacts) {
         let endpoint = chatCompletionsURL.absoluteString
         let askForUsage = !Self.rejectsStreamOptions.withLock { $0.contains(endpoint) }
         do {
@@ -102,7 +104,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         }
     }
 
-    private func openStream(_ request: ModelRequest, askForUsage: Bool) async throws -> HTTPResponseBytes {
+    private func openStream(_ request: ModelRequest, askForUsage: Bool) async throws -> (HTTPResponseBytes, WireFacts) {
         let body = OpenAIRequest(
             model: try request.requiredModel(),
             messages: Self.openAIMessages(request.messages),
@@ -126,7 +128,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw GatewayError.httpError(statusCode: http.statusCode, body: try await collectText(bytes))
         }
-        return bytes
+        return (bytes, WireFacts(request: urlRequest, response: response))
     }
 
     public func listModels() async throws -> [ModelSummary] {
@@ -223,7 +225,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         return Usage(
             inputTokens: prompt - cached,
             outputTokens: usage?.completionTokens ?? 0,
-            cacheReadTokens: cached
+            cacheReadTokens: cached,
+            reasoningTokens: usage?.completionTokensDetails?.reasoningTokens ?? 0
         )
     }
 
@@ -241,7 +244,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         sessionID: String? = nil,
         timeout: TimeInterval = defaultRequestTimeout,
         body: some Encodable
-    ) async throws -> Data {
+    ) async throws -> (Data, WireFacts) {
         var urlRequest = URLRequest(url: url)
         // Assigned, not passed to init: on Linux only the setter marks the
         // timeout as set, and otherwise URLSession uses the session's 60 s.
@@ -255,7 +258,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw GatewayError.httpError(statusCode: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
         }
-        return data
+        return (data, WireFacts(request: urlRequest, response: response))
     }
 
     static func get(session: URLSession, url: URL, apiKey: String?) async throws -> Data {
