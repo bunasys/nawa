@@ -18,6 +18,13 @@ struct AgentACPTests {
         if case .text(let t) = decoded! { #expect(t == "hello") } else { Issue.record("not text") }
     }
 
+    /// Releases stamp `nawaVersion` from the tag; `--version` and
+    /// `initialize` must report it.
+    @Test
+    func serverInfoReportsTheCompiledVersion() {
+        #expect(ACPServerInfo.nawa.version == nawaVersion)
+    }
+
     @Test
     func stopReasonFromDomain() {
         #expect(ACPStopReason(domain: .endTurn) == .endTurn)
