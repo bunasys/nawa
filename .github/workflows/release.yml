@@ -1,6 +1,6 @@
-# Push a tag `vX.Y.Z` on main to publish a release: tests run, then the
-# macOS arm64 and static Linux amd64 binaries are built, checked and
-# attached to the GitHub release `vX.Y.Z` (created with generated notes,
+# Push a tag `vX.Y.Z` on main to publish a release: on each platform the
+# tests run, then the macOS arm64 and static Linux amd64 binaries are
+# built, checked and attached to the GitHub release `vX.Y.Z` (created with generated notes,
 # or added to if it already exists). The tag must match the version
 # `nawa --version` prints (ACPServerInfo.nawa in Sources/AgentACP/ACPTypes.swift).
 # Run it by hand (Actions > Release > Run workflow) for a dry run: the same
@@ -22,16 +22,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  test:
-    uses: ./.github/workflows/ci.yml
-
+  # Each platform job tests and then builds on the same runner (the same
+  # steps as ci.yml), so the release waits for a macOS runner only once.
   macos:
-    name: Build macOS (arm64)
-    needs: test
+    name: Test and build macOS (arm64)
     runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/swift-build-cache
+        with:
+          platform: macos
+      - name: Test
+        run: swift build --build-tests && swift test --skip-build
       - name: Build
         run: swift build -c release --product nawa
       - name: Check
@@ -58,8 +61,7 @@ jobs:
           if-no-files-found: error
 
   linux:
-    name: Build Linux (amd64, static)
-    needs: test
+    name: Test and build Linux (amd64, static)
     runs-on: ubuntu-latest
     # The Static Linux SDK below only works with this exact compiler.
     container: swift:6.4.1
@@ -71,6 +73,11 @@ jobs:
       STATIC_SDK_CHECKSUM: cef5592d7430ed3c5ae1ddda479849c6f5252bd94a5723db1559f984caf38a7c
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/swift-build-cache
+        with:
+          platform: linux
+      - name: Test
+        run: swift build --build-tests && swift test --skip-build
       - name: Install the Static Linux SDK
         run: swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_CHECKSUM"
       - name: Build

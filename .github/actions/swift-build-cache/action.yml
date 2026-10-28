@@ -1,0 +1,25 @@
+name: Swift build cache
+description: >
+  Restores .build and saves it at the end of the job, so a build compiles
+  only Nawa's own code instead of all ~30 dependency packages.
+inputs:
+  platform:
+    description: macos or linux. Release jobs use the same value as CI so they restore what CI saved on main.
+    required: true
+runs:
+  using: composite
+  steps:
+    # Modules built by another compiler can't be imported, so a new
+    # Xcode or Swift image must start from an empty cache.
+    - id: compiler
+      shell: bash
+      run: echo "version=$(swift --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
+    # Keyed on Package.resolved, so the dependencies' build products are
+    # never stale; Nawa's own sources are newer than the cache and rebuild.
+    # Caches made on tags can't be reused by later tags, so release jobs
+    # rely on the ones CI saves from main.
+    - uses: actions/cache@v6
+      with:
+        path: .build
+        key: swift-${{ inputs.platform }}-${{ steps.compiler.outputs.version }}-${{ hashFiles('Package.resolved') }}
+        restore-keys: swift-${{ inputs.platform }}-${{ steps.compiler.outputs.version }}-

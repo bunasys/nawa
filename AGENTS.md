@@ -148,8 +148,11 @@ suite on Linux: `docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src s
 GitHub Actions (`.github/workflows/`):
 - `ci.yml` builds and tests on every push to `main` and every pull request:
   macOS (`macos-26`, its default Xcode) and Linux (`swift:6.4.1` container).
-- `release.yml` publishes a release when a tag `vX.Y.Z` is pushed: it runs
-  `ci.yml`, builds `nawa-X.Y.Z-macos-arm64.tar.gz` (ad-hoc signed, not
+  Both workflows cache `.build` with `.github/actions/swift-build-cache`
+  (keyed on the compiler and `Package.resolved`), so CI compiles the
+  dependencies only when they or the compiler change.
+- `release.yml` publishes a release when a tag `vX.Y.Z` is pushed: on each
+  platform it runs the same tests as `ci.yml`, then builds `nawa-X.Y.Z-macos-arm64.tar.gz` (ad-hoc signed, not
   notarized) and `nawa-X.Y.Z-linux-amd64.tar.gz` (fully static, Swift Static
   Linux SDK / musl), each with a `.sha256`, checks `--version` and an ACP
   `initialize` on both, then creates the GitHub release with generated notes

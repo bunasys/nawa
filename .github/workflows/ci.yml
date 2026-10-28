@@ -1,19 +1,17 @@
-# Build and test on macOS and Linux. Also called by release.yml before it
-# builds release binaries.
+# Build and test on macOS and Linux. release.yml runs the same steps
+# before it builds release binaries; keep the two in step.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  # One run per branch / PR; a newer push cancels the older run.
-  # Release runs (workflow_call) are keyed by their tag and never cancelled.
+  # One run per branch / PR; a newer push to a PR cancels the older run.
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -25,6 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: swift --version
+      - uses: ./.github/actions/swift-build-cache
+        with:
+          platform: macos
       - run: swift build --build-tests
       - run: swift test --skip-build
 
@@ -37,5 +38,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: swift --version
+      - uses: ./.github/actions/swift-build-cache
+        with:
+          platform: linux
       - run: swift build --build-tests
       - run: swift test --skip-build
