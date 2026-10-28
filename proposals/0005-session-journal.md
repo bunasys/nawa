@@ -300,7 +300,7 @@ group by session order by cost desc;
 | `acp` (Zed, Waku) | state directory, named by the ACP session id | `session/load` |
 | `serve` | state directory on the server host | `session/load`; idle unloading |
 | Waku one-shot (`--prompt`) | state directory | not restored (one prompt) |
-| Library (Hafez) | wherever the caller says: `JournalFile(path:)` | the caller's choice |
+| Library (Hafez) | wherever the caller says: `JournalFile(url:origin:)` | the caller's choice |
 
 **State directory**: `$NAWA_SESSIONS_DIR`, else
 `$XDG_STATE_HOME/nawa/sessions`, else `~/.local/state/nawa/sessions` (the
@@ -316,7 +316,8 @@ program passes a journal or records nothing.
 disk use turns out to need it.
 
 **Hafez in Sprites.** The reviewer passes
-`JournalFile(path: "/home/sprite/.hafez/session.jsonl")` to `AgentLoop`.
+`JournalFile(url: URL(fileURLWithPath: "/home/sprite/.hafez/session.jsonl"), origin: JournalOrigin(mode: "library"))`
+to `AgentLoop(journal:)`.
 After the exec, hafez-server reads the file with the Sprites `fs/read` API,
 exactly as it reads `verdict.json` today, and keeps it on its `/data`
 volume next to `runs.jsonl` (keyed by run id). This has to happen before

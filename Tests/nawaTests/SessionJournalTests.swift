@@ -48,12 +48,11 @@ struct ACPHarness {
             sessions: sessions,
             mode: "acp"
         )
-        connection = ACPConnection(
-            connectionID: "test",
-            factory: factory,
-            capabilities: ACPCapabilities(loadSession: sessions != nil),
-            routing: .singleStream
-        )
+        await self.init(factory: factory, capabilities: ACPCapabilities(loadSession: sessions != nil))
+    }
+
+    init(factory: HarnessSessionFactory, capabilities: ACPCapabilities) async {
+        connection = ACPConnection(connectionID: "test", factory: factory, capabilities: capabilities, routing: .singleStream)
         outbound = await connection.outbound.makeAsyncIterator()
     }
 
@@ -165,6 +164,60 @@ struct SessionJournalTests {
         #expect(await acp.prompt(sessionID, "again") == "end_turn")
         #expect(await acp.connection.isLoaded(sessionID))
         #expect(try #require(model.requests.last).messages.map(\.text) == ["hi", "ok", "again"])
+    }
+
+    @Test
+    func aSessionThatCantBeRebuiltSaysWhy() async throws {
+        let sessions = SessionStore(directory: try scratchDirectory())
+        let model = RecordingModel()
+        // The provider config breaks after the session was created.
+        let configBroken = Mutex(false)
+        let factory = HarnessSessionFactory(
+            gatewayForDirectory: { _ in
+                if configBroken.withLock({ $0 }) { throw CLIError.invalidGatewayURL("nowhere") }
+                return model
+            },
+            loopOptions: LoopOptions(streamReplies: false),
+            sessions: sessions
+        )
+        var acp = await ACPHarness(factory: factory, capabilities: ACPCapabilities(loadSession: true))
+        let sessionID = try await acp.newSession(cwd: try scratchDirectory())
+        #expect(await acp.prompt(sessionID, "hi") == "end_turn")
+        await acp.connection.unloadIdleSessions(idleFor: .zero)
+        configBroken.withLock { $0 = true }
+
+        let reply = await acp.call("session/prompt", ["sessionId": .string(sessionID), "prompt": .array([])]).reply
+        #expect(reply?.errorMessage?.hasPrefix("could not restore the session:") == true)
+        #expect(reply?.errorMessage?.contains("nowhere") == true)
+
+        let unknown = await acp.call("session/prompt", ["sessionId": .string("sess_00000000-000"), "prompt": .array([])]).reply
+        #expect(unknown?.errorMessage == "unknown session")
+    }
+
+    @Test
+    func theIdleTimeoutIsReadInMinutes() {
+        #expect(AgentCLI.idleSessionTimeout(env: [:]) == .seconds(30 * 60))
+        #expect(AgentCLI.idleSessionTimeout(env: ["NAWA_SESSION_IDLE_MINUTES": "5"]) == .seconds(5 * 60))
+        #expect(AgentCLI.idleSessionTimeout(env: ["NAWA_SESSION_IDLE_MINUTES": "0.5"]) == .seconds(30))
+        // Nonsense falls back to the default (with a warning on stderr).
+        #expect(AgentCLI.idleSessionTimeout(env: ["NAWA_SESSION_IDLE_MINUTES": "soon"]) == .seconds(30 * 60))
+        #expect(AgentCLI.idleSessionTimeout(env: ["NAWA_SESSION_IDLE_MINUTES": "-1"]) == .seconds(30 * 60))
+    }
+
+    @Test
+    func idleSessionsAreUnloadedOnTheirOwn() async throws {
+        let sessions = SessionStore(directory: try scratchDirectory())
+        var acp = await ACPHarness(sessions: sessions, model: RecordingModel())
+        let sessionID = try await acp.newSession(cwd: try scratchDirectory())
+        #expect(await acp.prompt(sessionID, "hi") == "end_turn")
+
+        await acp.connection.startUnloadingIdleSessions(after: .zero, checkingEvery: .milliseconds(10))
+        var waited = 0
+        while await acp.connection.isLoaded(sessionID), waited < 200 {
+            try await Task.sleep(for: .milliseconds(10))
+            waited += 1
+        }
+        #expect(await !acp.connection.isLoaded(sessionID))
     }
 
     @Test

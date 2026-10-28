@@ -188,10 +188,12 @@ struct AgentCLI {
             try await WakuCompatibility.providerCommand(arguments: Array(args.dropFirst()))
         case "repl":
             let replArgs = Array(args.dropFirst())
-            let gateway = try resolveGateway()
             let plain = replArgs.contains("--plain")
             let resume = try resumedSession(arguments: replArgs, sessions: sessions)
-            try await repl(gateway: gateway, options: loopOptions, mode: plain ? .plain : .auto, sessions: sessions, resume: resume)
+            // A resumed session runs where it was recorded, with that directory's provider.
+            let directory = resume.map { URL(fileURLWithPath: $0.state.cwd) } ?? WorkingDirectory.defaultURL
+            let gateway = try resolveGateway(directory: directory)
+            try await repl(gateway: gateway, options: loopOptions, mode: plain ? .plain : .auto, directory: directory, sessions: sessions, resume: resume)
         case "config":
             try await ConfigCommand.run(arguments: Array(args.dropFirst()))
         case "sessions":
@@ -364,11 +366,13 @@ struct AgentCLI {
         gateway: Gateway,
         options: LoopOptions,
         mode: ChatApp.Mode = .auto,
+        directory: URL = WorkingDirectory.defaultURL,
         sessions: SessionStore? = nil,
         resume: (state: SessionState, url: URL)? = nil
     ) async throws {
-        let instructions = try? ProjectInstructions.loadForCurrentWorkingDirectory()
-        let directory = WorkingDirectory.defaultURL
+        // Everything runs in `directory`: a resumed session's, which can
+        // differ from where `nawa repl` was started.
+        let instructions = try? ProjectInstructions.load(from: directory)
         let tools = ToolRegistry(builtInTools(workingDirectory: directory))
         // No turn cap, like Claude Code: the loop check (LoopOptions.loopCheckAfterTurns)
         // stops a stuck run, and NAWA_MAX_BUDGET_USD caps the spend.
@@ -379,6 +383,7 @@ struct AgentCLI {
                 tools: tools,
                 systemPrompt: instructions?.text,
                 options: options,
+                cwd: directory.path,
                 sessionID: sessionID,
                 journal: sessions.map { journal(at: $0.newJournalURL(sessionID: sessionID), mode: "repl") }
             )

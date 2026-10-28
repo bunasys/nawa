@@ -235,32 +235,35 @@ public actor ACPConnection {
     }
 
     private func prompt(request: JSONRPCRequest) async {
-        guard let params = request.params?.objectValue,
-              let sessionID = params["sessionId"]?.stringValue,
-              let session = try? await liveSession(sessionID)
-        else {
-            connectionStream.publish(
-                .makeError(id: request.id, code: .invalidParams, message: "unknown session")
-            )
-            return
-        }
+        let params = request.params?.objectValue ?? [:]
+        guard let session = await liveSession(params["sessionId"]?.stringValue, answering: request) else { return }
         let content = (params["prompt"]?.arrayValue ?? []).compactMap { ACPContentBlock(json: $0) }
         await session.prompt(requestID: request.id, content: content)
     }
 
     private func setModel(request: JSONRPCRequest) async {
-        guard let params = request.params?.objectValue,
-              let sessionID = params["sessionId"]?.stringValue,
-              let modelID = params["modelId"]?.stringValue,
-              let session = try? await liveSession(sessionID)
-        else {
-            connectionStream.publish(
-                .makeError(id: request.id, code: .invalidParams, message: "session/set_model needs a known sessionId and a modelId")
-            )
+        let params = request.params?.objectValue ?? [:]
+        guard let modelID = params["modelId"]?.stringValue else {
+            connectionStream.publish(.makeError(id: request.id, code: .invalidParams, message: "session/set_model needs a modelId"))
             return
         }
+        guard let session = await liveSession(params["sessionId"]?.stringValue, answering: request) else { return }
         await session.setModel(modelID)
         connectionStream.publish(.makeSuccess(id: request.id, result: .object([:])))
+    }
+
+    /// The request's session, rebuilt if it was unloaded. When there is
+    /// none, answers `request` and returns nil: `unknown session` for an id
+    /// this connection doesn't know, the error itself when rebuilding a
+    /// known one failed (a broken config must not look like a lost session).
+    private func liveSession(_ sessionID: String?, answering request: JSONRPCRequest) async -> ACPSession? {
+        do {
+            if let sessionID, let session = try await liveSession(sessionID) { return session }
+            connectionStream.publish(.makeError(id: request.id, code: .invalidParams, message: "unknown session"))
+        } catch {
+            connectionStream.publish(.makeError(id: request.id, code: .internalError, message: "could not restore the session: \(error)"))
+        }
+        return nil
     }
 
     // MARK: - Sessions in memory
