@@ -78,7 +78,18 @@ into bigger systems.
 - ✅ **Predictable** loop — the agent loop yields typed events and is testable
   with a scripted model.
 
-## Download
+## Install
+
+With [Homebrew](https://brew.sh) (macOS on Apple Silicon, Linux x86-64):
+
+```sh
+brew install bunasys/tap/nawa
+nawa --version
+```
+
+`brew upgrade nawa` picks up new releases.
+
+### Download
 
 Prebuilt binaries are on the
 [releases page](https://github.com/bunasys/nawa/releases):

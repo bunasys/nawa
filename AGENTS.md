@@ -153,7 +153,12 @@ GitHub Actions (`.github/workflows/`):
   notarized) and `nawa-X.Y.Z-linux-amd64.tar.gz` (fully static, Swift Static
   Linux SDK / musl), each with a `.sha256`, checks `--version` and an ACP
   `initialize` on both, then creates the GitHub release with generated notes
-  (or adds the files to one that already exists, e.g. written by hand).
+  (or adds the files to one that already exists, e.g. written by hand),
+  then pushes the new formula to the Homebrew tap
+  github.com/bunasys/homebrew-tap (`brew install bunasys/tap/nawa`).
+  The formula comes from `scripts/homebrew-formula.sh`; pushing it needs
+  the `HOMEBREW_TAP_TOKEN` secret (a fine-grained token with Contents
+  read & write on the tap repo). Without it the job warns and skips.
   Run it by hand from the Actions tab for a dry run that publishes nothing.
 
 To release: set the version in `ACPServerInfo.nawa`
