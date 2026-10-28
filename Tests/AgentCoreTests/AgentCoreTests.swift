@@ -24,6 +24,15 @@ struct AgentCoreTests {
     }
 
     @Test
+    func jsonEscapesControlCharactersValidly() throws {
+        // Shell output is full of ANSI escapes (ESC is U+001B).
+        let value: JSON = .string("\u{1B}[31mred\u{1B}[0m")
+        #expect(value.description == "\"\\u001B[31mred\\u001B[0m\"")
+        let decoded = try JSONDecoder().decode(JSON.self, from: Data(value.description.utf8))
+        #expect(decoded == value)
+    }
+
+    @Test
     func messageTextConcatenates() {
         let m = Message(role: .assistant, content: [.text("Hello, "), .text("world!")])
         #expect(m.text == "Hello, world!")

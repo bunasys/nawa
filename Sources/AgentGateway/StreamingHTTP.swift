@@ -1,3 +1,4 @@
+import AgentCore
 import Foundation
 import Synchronization
 
@@ -40,6 +41,21 @@ func sortedJSON(_ value: some Encodable) throws -> Data {
     let encoder = JSONEncoder()
     encoder.outputFormatting = .sortedKeys
     return try encoder.encode(value)
+}
+
+extension WireFacts {
+    /// What the journal keeps of an HTTP exchange: never a header that
+    /// could carry a credential, only ids and rate limits.
+    init(request: URLRequest, response: URLResponse) {
+        let http = response as? HTTPURLResponse
+        var rateLimits: [String: String] = [:]
+        for (key, value) in http?.allHeaderFields ?? [:] {
+            guard let name = (key as? String)?.lowercased(), name.contains("ratelimit") else { continue }
+            rateLimits[name] = "\(value)"
+        }
+        let requestID = http?.value(forHTTPHeaderField: "request-id") ?? http?.value(forHTTPHeaderField: "x-request-id")
+        self.init(requestBytes: request.httpBody?.count ?? 0, providerRequestID: requestID, rateLimitHeaders: rateLimits)
+    }
 }
 
 /// Reads a whole (error) body as text.

@@ -110,6 +110,10 @@ public struct ModelResponse: Sendable {
     /// Set by `Gateway` when a fallback answered: the provider the request
     /// was meant for. Nil when that provider answered itself.
     public var replacedProvider: String?
+    /// Set by `Gateway`: the providers that failed before this one answered.
+    public var failedAttempts: [FailedAttempt]
+    /// Set by the wire client: request size, request id, rate-limit headers.
+    public var wire: WireFacts?
 
     public init(
         message: Message,
@@ -119,7 +123,9 @@ public struct ModelResponse: Sendable {
         refusal: RefusalDetails? = nil,
         declinedBy: [String] = [],
         providerName: String? = nil,
-        replacedProvider: String? = nil
+        replacedProvider: String? = nil,
+        failedAttempts: [FailedAttempt] = [],
+        wire: WireFacts? = nil
     ) {
         self.message = message
         self.finishReason = finishReason
@@ -129,6 +135,8 @@ public struct ModelResponse: Sendable {
         self.declinedBy = declinedBy
         self.providerName = providerName
         self.replacedProvider = replacedProvider
+        self.failedAttempts = failedAttempts
+        self.wire = wire
     }
 }
 

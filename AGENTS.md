@@ -53,6 +53,17 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   full text saved to a temp file (`CapturedOutput`).
 - `Sources/AgentInstructions` — `ProjectInstructions`: loads AGENTS.md from a
   directory, root-first / nearest-last so the closest file wins.
+- `Sources/AgentJournal` — the session journal (proposal 0005): one JSON
+  Lines file per session, recording every message, model call (request
+  by message ids, usage, cost, timings, failed attempts, `WireFacts`),
+  tool run and context rewrite. The record types (`JournalRecord`,
+  `SessionJournal`) are in `AgentCore`; `JournalFormat` is the line
+  format (snake_case, nils left out; change both sides together and keep
+  `modelCallUsesTheDocumentedFieldNames` passing), `JournalFile` the
+  writer (0600, one line per record, never fails a run), `JournalReader`
+  the reader (skips cut-off lines, rebuilds requests and contexts).
+  `AgentLoop(journal:)` writes it; nil records nothing. A message's id
+  must always mean the same content: rewriting a message gives it a new id.
 - `Sources/AgentLoop` — `AgentLoop`: the Runner/Event loop. Drives a session
   (init event → turns → tool execution → result), with maxTurns/maxBudget
   caps, usage accounting, and cost estimates. There is no turn cap by
@@ -141,7 +152,9 @@ platform-specific code just as small:
   `InputLines` (`DispatchIO`) on Linux.
 Both Linux types build everywhere and are tested on macOS too. To run the
 suite on Linux: `docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src swift:6.4 swift test`
-(slow under emulation).
+(slow under emulation, and on Apple Silicon the emulated compiler and
+test runners sometimes die with "Illegal instruction"; there, use
+`--platform linux/arm64` instead: the same Linux Foundation, run natively).
 
 ## CI and releases
 

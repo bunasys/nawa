@@ -92,10 +92,11 @@ public struct Gateway: LanguageModel, Sendable {
     public var providerName: String { activeProvider?.name ?? "gateway" }
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
-        try await withFailover(request) { provider, preferred, attempt in
+        try await withFailover(request) { provider, preferred, attempt, failedBefore in
             var response = try await client(for: provider).complete(attempt)
             response.providerName = provider.name
             response.replacedProvider = provider.name == preferred.name ? nil : preferred.name
+            response.failedAttempts = failedBefore
             return response
         }
     }
@@ -107,7 +108,7 @@ public struct Gateway: LanguageModel, Sendable {
             let task = Task {
                 do {
                     var hasYielded = false
-                    try await self.withFailover(request, mayFailOver: { !hasYielded }) { provider, preferred, attempt in
+                    try await self.withFailover(request, mayFailOver: { !hasYielded }) { provider, preferred, attempt, failedBefore in
                         for try await chunk in self.client(for: provider).stream(attempt) {
                             hasYielded = true
                             guard case .finished(var response) = chunk else {
@@ -116,6 +117,7 @@ public struct Gateway: LanguageModel, Sendable {
                             }
                             response.providerName = provider.name
                             response.replacedProvider = provider.name == preferred.name ? nil : preferred.name
+                            response.failedAttempts = failedBefore
                             continuation.yield(.finished(response))
                         }
                     }
@@ -131,24 +133,27 @@ public struct Gateway: LanguageModel, Sendable {
     /// Runs `call` on each provider in the chain until one succeeds. It moves
     /// on only when the provider is unavailable (not when the request itself
     /// is bad) and `mayFailOver` agrees; then that provider cools down.
+    /// `call` gets the attempts that failed before it, for the journal.
     private func withFailover<T>(
         _ request: ModelRequest,
         mayFailOver: () -> Bool = { true },
-        _ call: (_ provider: ProviderConfig, _ preferred: ProviderConfig, ModelRequest) async throws -> T
+        _ call: (_ provider: ProviderConfig, _ preferred: ProviderConfig, ModelRequest, _ failedBefore: [FailedAttempt]) async throws -> T
     ) async throws -> T {
         let preferred = try preferredProvider(for: request)
         let chain = providerChain(for: request, preferred: preferred)
         var failures: [String] = []
+        var failedAttempts: [FailedAttempt] = []
         let hasFallbacks = chain.count > 1
         for provider in chain {
             // Cancellation never fails over, whatever the next client would do with it.
             try Task.checkCancellation()
+            let startedAt = Date()
             do {
                 // Model ids are per provider: the requested one is for the preferred provider only.
                 let isPreferred = provider.name == preferred.name
                 var attempt = request
                 attempt.model = try await model(for: provider, client: client(for: provider), requested: isPreferred ? request.model : nil)
-                return try await call(provider, preferred, attempt)
+                return try await call(provider, preferred, attempt, failedAttempts)
             } catch {
                 // A cancelled call may surface as a network error; it says nothing about the provider.
                 let isUnavailable = !Task.isCancelled && GatewayFailover.isProviderUnavailable(error)
@@ -166,6 +171,7 @@ public struct Gateway: LanguageModel, Sendable {
                     throw isWholeChainDown ? GatewayError.providersFailed(failures + [GatewayFailover.failureLine(provider.name, error)]) : error
                 }
                 failures.append(GatewayFailover.failureLine(provider.name, error))
+                failedAttempts.append(FailedAttempt(provider: provider.name, error: "\(error)", durationMS: millisecondsSince(startedAt)))
             }
         }
         // Not reached: the chain is never empty, and its last provider returns or throws.

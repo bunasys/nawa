@@ -110,7 +110,7 @@ public indirect enum JSON: Sendable, Hashable, Codable {
             case "\t": result += "\\t"
             default:
                 if scalar.value < 0x20 {
-                    result += String(format: "\\u{%04X}", scalar.value)
+                    result += String(format: "\\u%04X", scalar.value)
                 } else {
                     result.unicodeScalars.append(scalar)
                 }

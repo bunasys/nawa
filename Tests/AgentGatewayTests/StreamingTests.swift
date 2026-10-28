@@ -14,6 +14,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     struct Reply: Sendable {
         var status = 200
         var pieces: [String]
+        var headers: [String: String]? = nil
     }
 
     /// Host → replies, served in order; the bodies received, per host.
@@ -48,7 +49,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             replies[host] = queue
             return next
         } ?? Reply(status: 500, pieces: ["no reply scripted"])
-        let response = HTTPURLResponse(url: request.url!, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: nil)!
+        let response = HTTPURLResponse(url: request.url!, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: reply.headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         for piece in reply.pieces { client?.urlProtocol(self, didLoad: Data(piece.utf8)) }
         client?.urlProtocolDidFinishLoading(self)

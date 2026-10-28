@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "AgentGateway", targets: ["AgentGateway"]),
         .library(name: "AgentTools", targets: ["AgentTools"]),
         .library(name: "AgentInstructions", targets: ["AgentInstructions"]),
+        .library(name: "AgentJournal", targets: ["AgentJournal"]),
         .library(name: "AgentLoop", targets: ["AgentLoop"]),
         .library(name: "AgentMCP", targets: ["AgentMCP"]),
         .library(name: "AgentACP", targets: ["AgentACP"]),
@@ -39,6 +40,9 @@ let package = Package(
 
         // AGENTS.md discovery and parsing.
         .target(name: "AgentInstructions", dependencies: ["AgentCore"]),
+
+        // The session journal as a JSON Lines file: writing it and reading it back.
+        .target(name: "AgentJournal", dependencies: ["AgentCore"]),
 
         // The agent loop: the Runner/Event loop that drives a session to completion.
         .target(name: "AgentLoop", dependencies: [
@@ -67,7 +71,8 @@ let package = Package(
 
         .testTarget(name: "AgentCoreTests", dependencies: ["AgentCore"]),
         .testTarget(name: "AgentGatewayTests", dependencies: ["AgentCore", "AgentGateway"]),
-        .testTarget(name: "AgentLoopTests", dependencies: ["AgentCore", "AgentGateway", "AgentTools", "AgentLoop"]),
+        .testTarget(name: "AgentLoopTests", dependencies: ["AgentCore", "AgentGateway", "AgentTools", "AgentLoop", "AgentJournal"]),
+        .testTarget(name: "AgentJournalTests", dependencies: ["AgentCore", "AgentJournal"]),
         .testTarget(name: "AgentToolsTests", dependencies: ["AgentCore", "AgentTools"]),
         .testTarget(name: "AgentInstructionsTests", dependencies: ["AgentInstructions"]),
         .testTarget(name: "AgentMCPTests", dependencies: ["AgentMCP"]),

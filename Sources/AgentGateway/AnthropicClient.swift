@@ -63,7 +63,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     // MARK: LanguageModel
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
-        let data = try await withServerFallbacks(request) { fallbacks in
+        let (data, wire) = try await withServerFallbacks(request) { fallbacks in
             let body = try Self.requestBody(request, serverFallbacks: fallbacks)
             return try await send(method: "POST", url: messagesURL, body: body, serverFallbacks: fallbacks)
         }
@@ -73,7 +73,9 @@ public struct AnthropicClient: LanguageModel, Sendable {
         } catch {
             throw GatewayError.invalidResponse(String(describing: error))
         }
-        return try Self.modelResponse(from: reply, providerName: providerName)
+        var response = try Self.modelResponse(from: reply, providerName: providerName)
+        response.wire = wire
+        return response
     }
 
     /// Streams `POST /v1/messages` and builds the same reply `complete`
@@ -83,14 +85,16 @@ public struct AnthropicClient: LanguageModel, Sendable {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let bytes = try await withServerFallbacks(request) { fallbacks in
+                    let (bytes, wire) = try await withServerFallbacks(request) { fallbacks in
                         try await openStream(request, serverFallbacks: fallbacks)
                     }
                     var assembler = AnthropicStreamAssembler(providerName: providerName)
                     try await ServerSentEvents.forEachData(in: bytes) { payload in
                         for chunk in try assembler.consume(payload) { continuation.yield(chunk) }
                     }
-                    continuation.yield(.finished(try assembler.response()))
+                    var response = try assembler.response()
+                    response.wire = wire
+                    continuation.yield(.finished(response))
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -100,7 +104,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
         }
     }
 
-    private func openStream(_ request: ModelRequest, serverFallbacks: Bool) async throws -> HTTPResponseBytes {
+    private func openStream(_ request: ModelRequest, serverFallbacks: Bool) async throws -> (HTTPResponseBytes, WireFacts) {
         var body = try Self.requestBody(request, serverFallbacks: serverFallbacks).objectValue ?? [:]
         body["stream"] = .bool(true)
         let urlRequest = try await makeRequest(method: "POST", url: messagesURL, body: .object(body), serverFallbacks: serverFallbacks)
@@ -108,7 +112,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw GatewayError.httpError(statusCode: http.statusCode, body: try await collectText(bytes))
         }
-        return bytes
+        return (bytes, WireFacts(request: urlRequest, response: response))
     }
 
     /// Endpoint-and-model pairs that answered `fallbacks` with a 400:
@@ -136,7 +140,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     public func listModels() async throws -> [ModelSummary] {
         var components = URLComponents(url: baseURL.appendingPathComponent("models"), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "limit", value: "1000")]
-        let data = try await send(method: "GET", url: components.url!, body: nil)
+        let (data, _) = try await send(method: "GET", url: components.url!, body: nil)
         let list = try JSONDecoder().decode(JSON.self, from: data)
         let entries = list.objectValue?["data"]?.arrayValue ?? []
         return entries.compactMap { entry in
@@ -380,13 +384,13 @@ public struct AnthropicClient: LanguageModel, Sendable {
         return url.appendingPathComponent("v1")
     }
 
-    private func send(method: String, url: URL, body: JSON?, serverFallbacks: Bool = false) async throws -> Data {
+    private func send(method: String, url: URL, body: JSON?, serverFallbacks: Bool = false) async throws -> (Data, WireFacts) {
         let urlRequest = try await makeRequest(method: method, url: url, body: body, serverFallbacks: serverFallbacks)
         let (data, response) = try await session.data(for: urlRequest)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw GatewayError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
         }
-        return data
+        return (data, WireFacts(request: urlRequest, response: response))
     }
 
     /// A request with the version and auth headers.

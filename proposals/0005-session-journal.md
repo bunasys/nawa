@@ -1,6 +1,6 @@
 # 0005: Session journal: durable sessions for analysis and resume
 
-- Status: Draft
+- Status: Accepted (steps 1–3 implemented)
 - Depends on: none
 
 ## Summary
@@ -114,8 +114,9 @@ default, records nothing, so library users opt in. `AgentJournal` depends
 on `AgentCore` and Foundation only: Hafez links Nawa into a static musl
 binary, so no SQLite, no extra packages.
 
-`record` must not block the loop: `JournalFile` queues the entry and a
-single writer task encodes and appends it.
+`record` writes the line right away, under a lock: one `write` costs
+microseconds next to a model call that takes seconds, and writing at once
+means the order in the file is the order things happened.
 
 ### Why JSON Lines, and not the alternatives
 
@@ -144,13 +145,13 @@ Record types:
 
 | `type` | Written when | Main fields |
 | --- | --- | --- |
-| `session_started` | A loop starts a new session | `nawa_version`, `mode` (`repl`, `acp`, `serve`, `waku`, `library`), `cwd`, `options` (max turns, budget, `keep_tool_results`, compaction thresholds, helper model, streaming), `pricing`, `parent` (sub-agents only) |
-| `message` | A message is created | `message` (the existing `Message` encoding: id, role, content blocks), `added_to`: `context` (joins the conversation), `request` (made for one helper call only, e.g. the summarizer prompt), or `dropped` (a declined reply that was thrown away) |
-| `tools` | A tool set is first used | `id` (`sha256:…` of its JSON), `definitions` |
-| `run_started` | `run(prompt:)` begins | `prompt_message`, `model`, `continuing` |
+| `session_started` | A loop's first run begins | `nawa_version`, `mode` (`repl`, `acp`, `serve`, `waku`, `library`), `cwd`, `model`, `options` (max turns, budget, `keep_tool_results`, compaction thresholds, helper model, streaming, `pricing`), `parent` (sub-agents only) |
+| `message` | A message is created | `message` (`id`, `role`, `content` as `{"type": "text" \| "tool_call" \| "tool_result" \| "opaque", …}` blocks), `appended_to_context`: true when it joined the end of the context; false for messages kept for reference only (a summarizer prompt and reply, a declined reply) and for messages a rewrite puts in place |
+| `tools` | A tool set is first sent | `id` (a fresh UUID; recorded again only when the set changes), `definitions` |
+| `run_started` | `run(prompt:)` begins | `prompt_message`, `model` |
 | `model_call` | A model call ends, successfully or not | see below |
 | `tool_run` | A tool returns | `call_id`, `name`, `started_at`, `duration_ms`, `output_chars`, `is_error` |
-| `context_rewrite` | Messages in the context are replaced or removed | `reason` (`tool_results_cleared`, `compaction`, `declined_prompt_removed`), `removed` (message ids), `added` (message ids), `model_call` (the summary call, for compaction) |
+| `context_rewrite` | Messages in the context are replaced or removed | `reason` (`tool_results_cleared`, `compaction`, `declined_prompt_removed`), `removed` (message ids), `added` (message ids), `context` (the whole context after it, in order), `model_call` (the summary call, for compaction) |
 | `steered` | A `steer` message joins the context | `message` |
 | `note_saved` | The `remember` tool saved a note | `note` |
 | `model_changed` | `AgentLoop.model` is set between turns | `from`, `to` |
@@ -162,7 +163,7 @@ A `model_call` holds what an optimization needs:
 ```json
 {"v":1,"type":"model_call","seq":57,"at":"2026-10-28T08:01:12.481Z","session":"6f1c…",
  "id":"call-12","purpose":"turn",
- "request":{"messages":["m-001","m-002","…","m-041"],"tools":"sha256:9c2e…",
+ "request":{"messages":["m-001","m-002","…","m-041"],"tools":"5d0f…",
             "model":"claude-sonnet-5-5","provider":"anthropic","max_output_tokens":8192,
             "temperature":null,"streamed":true},
  "response":{"message":"m-042","stop_reason":"tool_use","model":"claude-sonnet-5-5",
@@ -171,13 +172,13 @@ A `model_call` holds what an optimization needs:
           "reasoning_tokens":288},
  "cost_usd":0.0231,
  "wire":{"request_bytes":214877,"provider_request_id":"req_011C…",
-         "rate_limit":{"requests_remaining":3998,"input_tokens_remaining":1950000}},
+         "rate_limit":{"anthropic-ratelimit-requests-remaining":"3998"}},
  "timing":{"started_at":"2026-10-28T08:01:03.002Z","first_chunk_ms":2140,"duration_ms":9479},
  "failed_attempts":[{"provider":"runinfra","error":"HTTP 503 …","duration_ms":812}],
  "error":null}
 ```
 
-`purpose` is `turn`, `compaction` or `steer_answer`. A call that threw
+`purpose` is `turn` or `compaction`. A call that threw
 has `error` set and no `response`.
 
 `wire` holds the few facts about the HTTP exchange that the messages
@@ -186,9 +187,10 @@ don't show, instead of the raw bodies (see "Why not raw HTTP capture"):
   shows how much of the request is JSON overhead and tool schemas.
 - `provider_request_id`: Anthropic's `request-id`, OpenAI's
   `x-request-id`. What a provider's support asks for about one call.
-- `rate_limit`: the remaining requests and tokens from the
-  `anthropic-ratelimit-*` / `x-ratelimit-*` headers, when sent. It shows
-  how close a run came to throttling, which is what makes failovers.
+- `rate_limit`: the `anthropic-ratelimit-*` / `x-ratelimit-*` headers
+  as the provider sent them (names lowercased), when sent. It shows how
+  close a run came to throttling, which is what makes failovers. No other
+  header is kept, so nothing that could carry a credential.
 
 `usage.reasoning_tokens` is the part of output spent on reasoning, when
 the provider reports it (OpenAI's `completion_tokens_details`). Clients
@@ -204,7 +206,11 @@ works if **an id always means the same content**. Today
 loop changes that: a rewritten message gets a new id, and the rewrite is
 recorded (`context_rewrite`: removed `m-007`, added `m-007b`). Nothing in
 Nawa looks messages up by id across a rewrite (refusal handling uses
-positions), so this is safe; step 1 checks it with a test.
+positions), so this is safe.
+
+Replaying the context needs two rules only: a `message` with
+`appended_to_context` joins the end; a `context_rewrite` replaces the
+whole context with its `context` list (`JournalContents.context(ofSession:)`).
 
 With that rule, a reader rebuilds any request by looking up its
 `request.messages` ids and its `tools` id. A test proves it: a scripted
@@ -323,8 +329,7 @@ each request carried.
 ### Restoring a session
 
 `JournalReader.replay(_:)` rebuilds a session's state from its records:
-the context messages in order (applying `message`/`added_to: context` and
-every `context_rewrite`), the model, the `remember` notes, total and helper
+the context messages in order (the two replay rules above), the model, the `remember` notes, total and helper
 usage, and the last call's context size. A new
 `AgentLoop(restoring: SessionState, …)` starts from it. Not restored: a
 pending steer, a declined prompt waiting to be removed, gateway cooldowns.
