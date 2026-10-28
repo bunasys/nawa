@@ -21,7 +21,7 @@ public struct ACPServerInfo: Sendable, Hashable {
         self.version = version
     }
 
-    public static let nawa = ACPServerInfo(name: "nawa", title: "Nawa Agent Harness", version: "0.5.1")
+    public static let nawa = ACPServerInfo(name: "nawa", title: "Nawa Agent Harness", version: "0.5.2")
 
     public var json: JSON {
         .object([

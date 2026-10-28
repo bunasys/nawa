@@ -100,8 +100,8 @@ Prebuilt binaries are on the
 | Linux, x86-64 | `nawa-<version>-linux-amd64.tar.gz` | nothing: fully static |
 
 ```sh
-shasum -a 256 -c nawa-0.5.1-macos-arm64.tar.gz.sha256   # optional: check the download
-tar xzf nawa-0.5.1-macos-arm64.tar.gz   # or …-linux-amd64.tar.gz
+shasum -a 256 -c nawa-0.5.2-macos-arm64.tar.gz.sha256   # optional: check the download
+tar xzf nawa-0.5.2-macos-arm64.tar.gz   # or …-linux-amd64.tar.gz
 sudo mv nawa /usr/local/bin/
 nawa --version
 ```
