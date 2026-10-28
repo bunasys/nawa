@@ -121,6 +121,16 @@ public actor MCPClient {
         return text.isEmpty ? "(no content)" : text
     }
 
+    /// A client nobody holds any more (its session was closed or unloaded)
+    /// takes its server down with it.
+    deinit {
+        stdout.fileHandleForReading.readabilityHandler = nil
+        if process.isRunning {
+            try? stdin.fileHandleForWriting.close()
+            process.terminate()
+        }
+    }
+
     public func stop() {
         try? stdin.fileHandleForWriting.close()
         process.terminate()

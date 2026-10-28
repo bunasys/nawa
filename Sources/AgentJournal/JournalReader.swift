@@ -94,3 +94,78 @@ public struct JournalContents: Sendable {
         return (rebuilt, tools)
     }
 }
+
+// MARK: Replay
+
+extension JournalContents {
+    /// The session that isn't a sub-agent's, i.e. the one the file was opened for.
+    public var mainSessionID: String? {
+        for entry in entries {
+            if case .sessionStarted(let start) = entry.record, start.parent == nil {
+                return entry.session
+            }
+        }
+        return nil
+    }
+
+    /// Rebuilds what a loop needs to go on with `session` (by default the
+    /// main session) where the journal leaves it. Nil when the journal
+    /// never started that session.
+    public func replay(session: String? = nil) -> SessionState? {
+        guard let sessionID = session ?? mainSessionID else { return nil }
+        var start: SessionStart?
+        var model: String?
+        var notes: [String] = []
+        var usage = Usage.zero
+        var helperUsage = Usage.zero
+        var contextTokens = 0
+        var subAgentSessions: Set<String> = []
+
+        for entry in entries {
+            if entry.session != sessionID {
+                // Sub-agents spend on the parent's account, as the loop counts them.
+                if case .sessionStarted(let child) = entry.record, child.parent?.session == sessionID {
+                    subAgentSessions.insert(entry.session)
+                }
+                if subAgentSessions.contains(entry.session), case .modelCall(let call) = entry.record {
+                    usage.accumulate(call.usage)
+                    helperUsage.accumulate(call.usage)
+                }
+                continue
+            }
+            switch entry.record {
+            case .sessionStarted(let started):
+                // A resumed session has one per process; the first says where it began.
+                if start == nil { start = started }
+                model = started.model
+            case .modelChanged(_, let to):
+                model = to
+            case .noteSaved(let note):
+                notes.append(note)
+            case .modelCall(let call):
+                usage.accumulate(call.usage)
+                if call.purpose == .compaction {
+                    helperUsage.accumulate(call.usage)
+                } else if call.response != nil {
+                    contextTokens = call.usage.total
+                }
+            case .contextRewrite(let rewrite) where rewrite.reason != .toolResultsCleared:
+                // The loop waits for the next call to report the new size.
+                contextTokens = 0
+            default:
+                break
+            }
+        }
+        guard let start else { return nil }
+        return SessionState(
+            sessionID: sessionID,
+            cwd: start.cwd,
+            model: model,
+            messages: context(ofSession: sessionID),
+            notes: notes,
+            usage: usage,
+            helperUsage: helperUsage,
+            contextTokens: contextTokens
+        )
+    }
+}

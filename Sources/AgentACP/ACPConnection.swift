@@ -18,6 +18,18 @@ public protocol ACPSessionFactory: Sendable {
     ///   - mcpServers: MCP server configs the client asked the agent to connect.
     /// - Returns: A configured agent loop.
     func makeLoop(sessionID: String, cwd: String, mcpServers: [MCPServerConfig]) async throws -> AgentLoop
+
+    /// Rebuilds a session from its journal (proposal 0005), for
+    /// `session/load` and for a session unloaded while idle.
+    /// - Returns: The restored loop, or nil when the session is unknown.
+    func restoreLoop(sessionID: String, cwd: String, mcpServers: [MCPServerConfig]) async throws -> AgentLoop?
+}
+
+extension ACPSessionFactory {
+    /// Factories without journals can't restore sessions.
+    public func restoreLoop(sessionID: String, cwd: String, mcpServers: [MCPServerConfig]) async throws -> AgentLoop? {
+        nil
+    }
 }
 
 /// How a connection delivers its outbound messages.
@@ -47,7 +59,17 @@ public actor ACPConnection {
 
     private let connectionStream = ACPEventStream()
     private var sessionStreams: [String: ACPEventStream] = [:]
+    /// Sessions in memory. An idle one may be dropped from here and rebuilt
+    /// from its journal on its next request (see `unloadIdleSessions`).
     private var sessions: [String: ACPSession] = [:]
+    /// How every session of this connection was set up, loaded or not.
+    private var setups: [String: SessionSetup] = [:]
+    private var idleSweeper: Task<Void, Never>?
+
+    private struct SessionSetup {
+        var cwd: String
+        var mcpServers: [MCPServerConfig]
+    }
 
     public init(
         connectionID: String,
@@ -61,6 +83,10 @@ public actor ACPConnection {
         self.info = info
         self.capabilities = capabilities
         self.routing = routing
+    }
+
+    deinit {
+        idleSweeper?.cancel()
     }
 
     /// The connection-scoped outbound stream (for SSE GET handlers).
@@ -148,6 +174,7 @@ public actor ACPConnection {
     private func handleNotification(_ notification: JSONRPCMethod) async {
         switch notification.method {
         case "session/cancel":
+            // An unloaded session has no prompt running, so it isn't rebuilt.
             if let sessionID = notification.params?.objectValue?["sessionId"]?.stringValue {
                 await sessions[sessionID]?.cancel()
             }
@@ -166,11 +193,7 @@ public actor ACPConnection {
 
         do {
             let loop = try await factory.makeLoop(sessionID: sessionID, cwd: cwd, mcpServers: mcpServers)
-            let sink = ConnectionSink(connection: self)
-            let session = ACPSession(sessionID: sessionID, cwd: cwd, loop: loop, sink: sink)
-            sessions[sessionID] = session
-            // Ensure the session stream exists.
-            _ = sessionOutbound(for: sessionID)
+            addSession(sessionID, loop: loop, setup: SessionSetup(cwd: cwd, mcpServers: mcpServers))
             connectionStream.publish(
                 .makeSuccess(id: request.id, result: .object(["sessionId": .string(sessionID)]))
             )
@@ -181,23 +204,40 @@ public actor ACPConnection {
         }
     }
 
+    /// Brings back a session, from memory or from its journal, and sends
+    /// its conversation as `session/update` notifications before the reply,
+    /// as the ACP spec asks.
     private func loadSession(request: JSONRPCRequest) async {
-        guard capabilities.loadSession,
-              let sessionID = request.params?.objectValue?["sessionId"]?.stringValue,
-              sessions[sessionID] != nil
-        else {
+        let params = request.params?.objectValue ?? [:]
+        guard capabilities.loadSession, let sessionID = params["sessionId"]?.stringValue else {
             connectionStream.publish(
-                .makeError(id: request.id, code: .invalidParams, message: "session not found or loadSession unsupported")
+                .makeError(id: request.id, code: .invalidParams, message: "session/load needs a sessionId and a server that keeps sessions")
             )
             return
         }
-        connectionStream.publish(.makeSuccess(id: request.id, result: .object(["sessionId": .string(sessionID)])))
+        let setup = SessionSetup(
+            cwd: params["cwd"]?.stringValue ?? FileManager.default.currentDirectoryPath,
+            mcpServers: decodeMCPServers(params["mcpServers"])
+        )
+        let session: ACPSession
+        do {
+            guard let found = try await liveSession(sessionID, setupIfUnknown: setup) else {
+                connectionStream.publish(.makeError(id: request.id, code: .invalidParams, message: "session \(sessionID) not found"))
+                return
+            }
+            session = found
+        } catch {
+            connectionStream.publish(.makeError(id: request.id, code: .internalError, message: "session/load failed: \(error)"))
+            return
+        }
+        await session.sendHistory()
+        connectionStream.publish(.makeSuccess(id: request.id, result: .object([:])))
     }
 
     private func prompt(request: JSONRPCRequest) async {
         guard let params = request.params?.objectValue,
               let sessionID = params["sessionId"]?.stringValue,
-              let session = sessions[sessionID]
+              let session = try? await liveSession(sessionID)
         else {
             connectionStream.publish(
                 .makeError(id: request.id, code: .invalidParams, message: "unknown session")
@@ -212,7 +252,7 @@ public actor ACPConnection {
         guard let params = request.params?.objectValue,
               let sessionID = params["sessionId"]?.stringValue,
               let modelID = params["modelId"]?.stringValue,
-              let session = sessions[sessionID]
+              let session = try? await liveSession(sessionID)
         else {
             connectionStream.publish(
                 .makeError(id: request.id, code: .invalidParams, message: "session/set_model needs a known sessionId and a modelId")
@@ -221,6 +261,59 @@ public actor ACPConnection {
         }
         await session.setModel(modelID)
         connectionStream.publish(.makeSuccess(id: request.id, result: .object([:])))
+    }
+
+    // MARK: - Sessions in memory
+
+    private func addSession(_ sessionID: String, loop: AgentLoop, setup: SessionSetup) {
+        let sink = ConnectionSink(connection: self)
+        sessions[sessionID] = ACPSession(sessionID: sessionID, cwd: setup.cwd, loop: loop, sink: sink)
+        setups[sessionID] = setup
+        // Ensure the session stream exists.
+        _ = sessionOutbound(for: sessionID)
+    }
+
+    /// The session, rebuilt from its journal when it was unloaded. A session
+    /// this connection never had is restored only with `setupIfUnknown`
+    /// (`session/load` says where it runs). Nil when there is none to find.
+    private func liveSession(_ sessionID: String, setupIfUnknown: SessionSetup? = nil) async throws -> ACPSession? {
+        if let session = sessions[sessionID] { return session }
+        guard let setup = setups[sessionID] ?? setupIfUnknown else { return nil }
+        guard let loop = try await factory.restoreLoop(sessionID: sessionID, cwd: setup.cwd, mcpServers: setup.mcpServers) else {
+            return nil
+        }
+        // Another request may have restored it while this one waited.
+        if let session = sessions[sessionID] { return session }
+        addSession(sessionID, loop: loop, setup: setup)
+        return sessions[sessionID]
+    }
+
+    /// Drops the sessions with no prompt running for `idle`: their loops,
+    /// messages and MCP servers go, their ids stay, and the next request
+    /// rebuilds them from their journals. Only when sessions can be loaded.
+    public func unloadIdleSessions(idleFor idle: Duration) async {
+        guard capabilities.loadSession else { return }
+        for (sessionID, session) in sessions where await session.isIdle(for: idle) {
+            sessions[sessionID] = nil
+        }
+    }
+
+    /// Checks for idle sessions every minute (or `interval`) until the
+    /// connection goes away.
+    public func startUnloadingIdleSessions(after idle: Duration, checkingEvery interval: Duration = .seconds(60)) {
+        idleSweeper?.cancel()
+        idleSweeper = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard let self else { return }
+                await self.unloadIdleSessions(idleFor: idle)
+            }
+        }
+    }
+
+    /// Whether `sessionID` is in memory now, for tests.
+    func isLoaded(_ sessionID: String) -> Bool {
+        sessions[sessionID] != nil
     }
 
     // MARK: - Helpers

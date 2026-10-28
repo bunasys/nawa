@@ -17,11 +17,15 @@ public struct ChatSession: Sendable {
     public var contextLimit: Int?
     /// Names of the tools the agent can call (`/tools`).
     public var tools: [String]
+    /// The conversation so far, for a resumed session (`repl --resume`):
+    /// its last prompts are shown under the header.
+    public var history: [Message]
 
     public init(
         header: SessionHeader,
         contextLimit: Int? = nil,
         tools: [String] = [],
+        history: [Message] = [],
         send: @escaping @Sendable (String) -> AsyncThrowingStream<AgentEvent, any Error>,
         reset: @escaping @Sendable () -> Void = {},
         removeDeclinedRequest: @escaping @Sendable () -> Bool = { false }
@@ -29,6 +33,7 @@ public struct ChatSession: Sendable {
         self.header = header
         self.contextLimit = contextLimit
         self.tools = tools
+        self.history = history
         self.send = send
         self.reset = reset
         self.removeDeclinedRequest = removeDeclinedRequest

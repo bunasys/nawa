@@ -1,6 +1,6 @@
 # 0005: Session journal: durable sessions for analysis and resume
 
-- Status: Accepted (steps 1–3 implemented)
+- Status: Implemented (steps 1–5; step 6 is in the Hafez repo)
 - Depends on: none
 
 ## Summary
@@ -287,16 +287,16 @@ group by session order by cost desc;
 - `JournalFile` appends one line per record with a single `write`, and
   `fsync`s after `run_finished` and on close. A crash loses at most what
   the OS hadn't flushed; the reader skips a cut-off last line.
-- If a write fails, the journal reports it once through the loop's
-  `onEvent` hook as an informational event and stops recording. The run
-  goes on. (In `acp` mode nothing is printed: stdout is the protocol.)
+- If a write fails, the journal reports it once through `JournalFile`'s
+  `onFailure` and stops recording. The run goes on. The CLI prints it on
+  stderr (never stdout: in `acp` mode that is the protocol).
 - Files are created `0600` in a `0700` directory.
 
 ### Where each mode puts it
 
 | Mode | Journal file | Restored by |
 | --- | --- | --- |
-| `repl` | state directory (below) | `nawa repl --resume [id]` (no id: the newest session for this directory) |
+| `repl` | state directory (below) | `nawa repl --resume [id]` (no id: the newest repl session in this directory) |
 | `acp` (Zed, Waku) | state directory, named by the ACP session id | `session/load` |
 | `serve` | state directory on the server host | `session/load`; idle unloading |
 | Waku one-shot (`--prompt`) | state directory | not restored (one prompt) |

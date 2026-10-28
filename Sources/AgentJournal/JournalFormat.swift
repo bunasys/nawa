@@ -54,7 +54,8 @@ public enum JournalFormat {
                 ("cwd", .string(start.cwd)),
                 ("model", start.model.map(JSON.string)),
                 ("options", start.options),
-                ("parent", start.parent.map { .object(["session": .string($0.session), "call_id": .string($0.callID)]) })
+                ("parent", start.parent.map { .object(["session": .string($0.session), "call_id": .string($0.callID)]) }),
+                ("resumed", start.resumed ? .bool(true) : nil)
             )
         case .message(let message, let appendedToContext):
             return object(
@@ -133,7 +134,8 @@ public enum JournalFormat {
                 cwd: try fields.string("cwd"),
                 model: fields.optionalString("model"),
                 options: fields.raw["options"] ?? .object([:]),
-                parent: parent
+                parent: parent,
+                resumed: fields.raw["resumed"]?.boolValue ?? false
             )
             return .sessionStarted(start)
         case "message":

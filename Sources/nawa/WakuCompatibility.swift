@@ -1,5 +1,6 @@
 import AgentCore
 import AgentGateway
+import AgentJournal
 import AgentLoop
 import AgentTools
 import Foundation
@@ -60,14 +61,17 @@ enum WakuCompatibility {
 
     /// `nawa --prompt <text> [--model <id>] [--output-format text]`: answer
     /// one prompt with no tools and print the reply.
-    static func oneShotPrompt(arguments: [String]) async throws {
+    static func oneShotPrompt(arguments: [String], sessions: SessionStore? = nil) async throws {
         guard let prompt = value(after: "--prompt", in: arguments) else {
             throw WakuCompatibilityError.missingValue("--prompt")
         }
+        let sessionID = UUID().uuidString
         let loop = AgentLoop(
             gateway: try AgentCLI.resolveGateway(),
             tools: ToolRegistry([]),
-            options: LoopOptions(maxTurns: 1, sendTools: false, streamReplies: false)  // prints the reply only once it is done
+            options: LoopOptions(maxTurns: 1, sendTools: false, streamReplies: false),  // prints the reply only once it is done
+            sessionID: sessionID,
+            journal: sessions.map { AgentCLI.journal(at: $0.newJournalURL(sessionID: sessionID), mode: "waku") }
         )
         loop.model = value(after: "--model", in: arguments)
 

@@ -277,6 +277,46 @@ public struct Transcript: Sendable {
     }
 }
 
+extension Transcript {
+    /// A resumed conversation's last `prompts` prompts and what followed
+    /// them, as blocks to show under the header. Earlier ones are counted
+    /// in a note.
+    public static func blocks(replaying messages: [Message], prompts: Int = 3) -> [Block] {
+        let promptIndices = messages.indices.filter { messages[$0].role == .user && !messages[$0].text.isEmpty }
+        guard !promptIndices.isEmpty else { return [] }
+        let shown = promptIndices.suffix(prompts)
+        let start = shown.first!
+
+        var results: [String: ToolCallResult] = [:]
+        for message in messages {
+            for case .toolResult(let result) in message.content { results[result.callID] = result }
+        }
+
+        var blocks: [Block] = []
+        let hidden = promptIndices.count - shown.count
+        if hidden > 0 {
+            blocks.append(.note(hidden == 1 ? "1 earlier prompt" : "\(hidden) earlier prompts"))
+        }
+        for message in messages[start...] {
+            switch message.role {
+            case .user where !message.text.isEmpty:
+                blocks.append(.prompt(message.text))
+            case .assistant:
+                let text = message.text.trimmingTrailingWhitespace
+                if !text.isEmpty { blocks.append(.assistant(text)) }
+                for call in message.toolCalls {
+                    let summary = results[call.id].map(ResultSummary.init)
+                    blocks.append(.tool(ToolBlock(label: ToolLabel(call), summary: summary)))
+                }
+            default:
+                break
+            }
+        }
+        blocks.append(.note("resumed: the conversation goes on from here"))
+        return blocks
+    }
+}
+
 extension SubAgentTrace {
     mutating func record(_ event: AgentEvent) {
         switch event {

@@ -21,17 +21,23 @@ public struct ACPServerConfiguration: Sendable {
     public var port: Int
     public var info: ACPServerInfo
     public var capabilities: ACPCapabilities
+    /// Unload a session after this long without a prompt, keeping only its
+    /// id; it is rebuilt from its journal when needed. Needs
+    /// `capabilities.loadSession`. Nil keeps every session in memory.
+    public var idleSessionTimeout: Duration?
 
     public init(
         hostname: String = "127.0.0.1",
         port: Int = 7878,
         info: ACPServerInfo = .nawa,
-        capabilities: ACPCapabilities = .init()
+        capabilities: ACPCapabilities = .init(),
+        idleSessionTimeout: Duration? = nil
     ) {
         self.hostname = hostname
         self.port = port
         self.info = info
         self.capabilities = capabilities
+        self.idleSessionTimeout = idleSessionTimeout
     }
 }
 
@@ -88,6 +94,7 @@ public struct ACPServer: Sendable {
                 factory: self.factory,
                 info: self.configuration.info,
                 capabilities: self.configuration.capabilities,
+                idleSessionTimeout: self.configuration.idleSessionTimeout,
                 routing: .singleStream
             )
             socketBox.connection = connection
@@ -134,7 +141,8 @@ public struct ACPServer: Sendable {
             let connection = await registry.createConnection(
                 factory: factory,
                 info: configuration.info,
-                capabilities: configuration.capabilities
+                capabilities: configuration.capabilities,
+                idleSessionTimeout: configuration.idleSessionTimeout
             )
             let result = await connection.initializeResult()
             let responseMessage = JSONRPCMessage.makeSuccess(id: req.id, result: result)
@@ -244,12 +252,16 @@ public actor ACPRegistry {
         factory: any ACPSessionFactory,
         info: ACPServerInfo,
         capabilities: ACPCapabilities,
+        idleSessionTimeout: Duration? = nil,
         routing: ACPOutboundRouting = .perSession
-    ) -> ACPConnection {
+    ) async -> ACPConnection {
         let id = "conn_\(UUID().uuidString.prefix(12))"
         let connection = ACPConnection(
             connectionID: id, factory: factory, info: info, capabilities: capabilities, routing: routing
         )
+        if let idleSessionTimeout {
+            await connection.startUnloadingIdleSessions(after: idleSessionTimeout)
+        }
         connections[id] = connection
         return connection
     }

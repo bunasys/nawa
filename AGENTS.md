@@ -61,7 +61,10 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   format (snake_case, nils left out; change both sides together and keep
   `modelCallUsesTheDocumentedFieldNames` passing), `JournalFile` the
   writer (0600, one line per record, never fails a run), `JournalReader`
-  the reader (skips cut-off lines, rebuilds requests and contexts).
+  the reader (skips cut-off lines, rebuilds requests and contexts;
+  `replay()` gives the `SessionState` that `AgentLoop(restoring:)` goes
+  on from). `SessionStore` is the CLI's sessions directory: file names,
+  lookup by listing (never by joining an id into a path), pruning.
   `AgentLoop(journal:)` writes it; nil records nothing. A message's id
   must always mean the same content: rewriting a message gives it a new id.
 - `Sources/AgentLoop` — `AgentLoop`: the Runner/Event loop. Drives a session
@@ -117,10 +120,15 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   stdin/stdout), plus the JSON-RPC frames. `ACPConnection` owns dispatch;
   each transport picks its `ACPOutboundRouting` (`.perSession` SSE streams
   for HTTP, `.singleStream` for stdio/WebSocket) and feeds raw frames to
-  `handle(text:)`, which also answers unparseable ones.
+  `handle(text:)`, which also answers unparseable ones. With
+  `ACPCapabilities.loadSession`, `session/load` rebuilds a session through
+  `ACPSessionFactory.restoreLoop` and replays its conversation as
+  `session/update`s, and `serve` unloads sessions idle for
+  `ACPServerConfiguration.idleSessionTimeout`, rebuilding them on their
+  next request.
 - `Sources/nawa` — executable: `serve` (ACP server), `acp` (ACP over stdio),
-  `repl` (interactive), and `config` (interactive per-directory provider setup,
-  `ConfigCommand.swift`). `WakuCompatibility.swift` implements the Kimi Code
+  `repl` (interactive), `config` (interactive per-directory provider setup,
+  `ConfigCommand.swift`), and `sessions` (`SessionsCommand.swift`). `WakuCompatibility.swift` implements the Kimi Code
   CLI commands Waku calls, so Nawa can stand in for Kimi Code inside Waku.
   In `acp` mode stdout carries the protocol: never `print` there.
   `repl` builds a `ChatSession` from an `AgentLoop` (a fresh one on
@@ -244,6 +252,24 @@ No answer ends the run as `AgentResultKind.refused` (ACP: `refusal`).
 the prompt or remove it with `AgentLoop.removeDeclinedRequest`, which also
 returns to the original model. A declined prompt left in the context is
 resent with every request and can get later prompts declined too.
+
+## Session journals
+
+Every CLI session is recorded as a JSON Lines journal (proposal 0005):
+`repl`, `acp`, `serve` and Waku's one-shot prompts, one file per session
+named `<started-at>-<id>.jsonl`, in `$NAWA_SESSIONS_DIR`, else
+`$XDG_STATE_HOME/nawa/sessions`, else `~/.local/state/nawa/sessions`.
+`NAWA_SESSIONS=off` turns recording off (and with it resuming and
+`session/load`). Journals hold everything the model saw, secrets in tool
+output included, so they are `0600` in a `0700` directory.
+- `nawa repl --resume [id]` goes on with a session (no id: this
+  directory's newest repl session), showing its last prompts.
+- ACP advertises `loadSession`; `serve` unloads a session after
+  `NAWA_SESSION_IDLE_MINUTES` (default 30) without a prompt.
+- `nawa sessions list [--all]`, `show <id>`, `path <id>` (for `jq` or
+  DuckDB), `prune --older-than 30d`. Nothing is deleted automatically.
+- A journal that can't be written says so once on stderr and stops; the
+  session goes on.
 
 ## Token costs
 

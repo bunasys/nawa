@@ -82,6 +82,9 @@ public final class AgentLoop: @unchecked Sendable {
     private var _tookTurnCapGrace = false
     /// Whether `session_started` is written; nothing is recorded before it.
     private var _journalStarted = false
+    /// Set by `init(restoring:)`: the session's messages are already in
+    /// the journal, so starting it again must not record them twice.
+    private var _isRestored = false
     /// The tool set last recorded, so an unchanged set isn't written again.
     private var _recordedTools: (definitions: [ToolDefinition], id: String)?
 
@@ -127,6 +130,8 @@ public final class AgentLoop: @unchecked Sendable {
     ///   - systemPrompt: Optional instructions prepended to every conversation.
     ///   - options: Optional limits (maxTurns, loop check, maxBudgetUSD).
     ///   - cwd: Working directory for tools; defaults to the process cwd.
+    ///   - sessionID: The session's id, also its id in the journal. ACP
+    ///     passes its own session id so the two match.
     ///   - journal: Where to record the session; nil records nothing.
     ///   - onEvent: Observability hook; fires for every event the loop yields.
     public init(
@@ -135,6 +140,7 @@ public final class AgentLoop: @unchecked Sendable {
         systemPrompt: String? = nil,
         options: LoopOptions = LoopOptions(),
         cwd: String = WorkingDirectory().url.path,
+        sessionID: String = UUID().uuidString,
         journal: (any SessionJournal)? = nil,
         onEvent: (@Sendable (AgentEvent) -> Void)? = nil
     ) {
@@ -145,7 +151,7 @@ public final class AgentLoop: @unchecked Sendable {
         self.cwd = cwd
         self.journal = journal
         self.onEvent = onEvent
-        var session = Session(id: UUID().uuidString, cwd: cwd)
+        var session = Session(id: sessionID, cwd: cwd)
         if let systemPrompt, !systemPrompt.isEmpty {
             session.append(Message(role: .system, text: systemPrompt))
         }
@@ -153,6 +159,42 @@ public final class AgentLoop: @unchecked Sendable {
         self._usage = .zero
         self._turnCounter = 0
         self._loopDetector = LoopDetector(checkAfterTurns: options.loopCheckAfterTurns)
+    }
+
+    /// A loop that goes on with a session rebuilt from its journal
+    /// (`JournalReader.replay`): same id, context, model, notes and totals.
+    ///
+    /// Pass the journal the state was read from: the restored loop appends
+    /// to it and doesn't record the old messages again. `systemPrompt` is
+    /// for sub-agents only; the session keeps the system prompt it had.
+    /// Continue it with `run(prompt:continuing: true)`.
+    public convenience init(
+        restoring state: SessionState,
+        gateway: any LanguageModel,
+        tools: ToolRegistry,
+        systemPrompt: String? = nil,
+        options: LoopOptions = LoopOptions(),
+        journal: (any SessionJournal)? = nil,
+        onEvent: (@Sendable (AgentEvent) -> Void)? = nil
+    ) {
+        self.init(
+            gateway: gateway,
+            tools: tools,
+            systemPrompt: systemPrompt,
+            options: options,
+            cwd: state.cwd,
+            sessionID: state.sessionID,
+            journal: journal,
+            onEvent: onEvent
+        )
+        _session.messages = state.messages
+        _model = state.model
+        _notes = state.notes
+        _usage = state.usage
+        // Helper usage only counts apart when there is a helper to price it.
+        _helperUsage = options.helperModel == nil ? .zero : state.helperUsage
+        _contextTokens = state.contextTokens
+        _isRestored = true
     }
 
     /// Tell the agent something while it works, e.g. "wrap up and answer now".
@@ -766,9 +808,18 @@ public final class AgentLoop: @unchecked Sendable {
         lock.lock()
         _journalStarted = true
         lock.unlock()
-        let start = SessionStart(origin: journal.origin, cwd: cwd, model: model, options: journalOptions, parent: journalParent)
+        let start = SessionStart(
+            origin: journal.origin,
+            cwd: cwd,
+            model: model,
+            options: journalOptions,
+            parent: journalParent,
+            resumed: _isRestored
+        )
         record(.sessionStarted(start))
-        recordAppended(_session.messages)
+        if !_isRestored {
+            recordAppended(_session.messages)
+        }
     }
 
     private func record(_ record: JournalRecord) {

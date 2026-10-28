@@ -680,3 +680,57 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
             """)
     }
 }
+
+@Suite struct ResumedHistoryTests {
+    static func conversation(prompts: Int) -> [Message] {
+        var messages = [Message(role: .system, text: "Be brief.")]
+        for number in 1...prompts {
+            messages.append(Message(role: .user, text: "prompt \(number)"))
+            messages.append(Message(role: .assistant, text: "answer \(number)"))
+        }
+        return messages
+    }
+
+    @Test func theLastPromptsAreShownAndEarlierOnesCounted() {
+        let blocks = Transcript.blocks(replaying: Self.conversation(prompts: 5))
+        #expect(blocks == [
+            .note("2 earlier prompts"),
+            .prompt("prompt 3"), .assistant("answer 3"),
+            .prompt("prompt 4"), .assistant("answer 4"),
+            .prompt("prompt 5"), .assistant("answer 5"),
+            .note("resumed: the conversation goes on from here"),
+        ])
+    }
+
+    @Test func toolCallsShowWithTheirResults() {
+        let call = ToolCall(id: "c1", name: "read_file", arguments: .object(["path": .string("a.swift")]))
+        let messages = [
+            Message(role: .user, text: "read it"),
+            Message(role: .assistant, content: [.toolCall(call)]),
+            ToolCallResult(callID: "c1", name: "read_file", content: "let a = 1").asMessage,
+            Message(role: .assistant, text: "Read."),
+        ]
+        let blocks = Transcript.blocks(replaying: messages)
+        let tool = ToolBlock(label: ToolLabel(call), summary: ResultSummary(ToolCallResult(callID: "c1", name: "read_file", content: "let a = 1")))
+        #expect(blocks == [.prompt("read it"), .tool(tool), .assistant("Read."), .note("resumed: the conversation goes on from here")])
+    }
+
+    @Test func aNewSessionShowsNothing() {
+        #expect(Transcript.blocks(replaying: []).isEmpty)
+        #expect(Transcript.blocks(replaying: [Message(role: .system, text: "Be brief.")]).isEmpty)
+    }
+
+    @Test func plainChatShowsTheHistoryUnderTheHeader() async {
+        var output = ""
+        let session = ChatSession(
+            header: SessionHeader(provider: nil, model: nil, directory: "~", hasInstructions: false),
+            history: Self.conversation(prompts: 1),
+            send: { _ in AsyncThrowingStream { $0.finish() } }
+        )
+        let chat = PlainChat(session: session, layout: Layout(columns: 80), echoPrompts: true) { output += $0 }
+        await chat.run { nil }
+        #expect(output.contains("prompt 1"))
+        #expect(output.contains("answer 1"))
+        #expect(output.contains("resumed"))
+    }
+}

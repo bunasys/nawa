@@ -79,13 +79,60 @@ public struct SessionStart: Sendable, Hashable {
     public var options: JSON
     /// Set for a sub-agent: the session and `task` call it works for.
     public var parent: JournalParent?
+    /// True when a loop restored from this journal picked the session up
+    /// again (`AgentLoop(restoring:)`): its messages are already recorded.
+    public var resumed: Bool
 
-    public init(origin: JournalOrigin, cwd: String, model: String?, options: JSON, parent: JournalParent? = nil) {
+    public init(origin: JournalOrigin, cwd: String, model: String?, options: JSON, parent: JournalParent? = nil, resumed: Bool = false) {
         self.origin = origin
         self.cwd = cwd
         self.model = model
         self.options = options
         self.parent = parent
+        self.resumed = resumed
+    }
+}
+
+/// What a session needs to go on where it stopped, rebuilt from its journal
+/// (`JournalReader.replay`) and handed to `AgentLoop(restoring:)`.
+///
+/// Not included, because they belong to a run or a process: a pending
+/// steer, a declined prompt waiting to be removed, gateway cooldowns.
+public struct SessionState: Sendable, Hashable {
+    public var sessionID: String
+    public var cwd: String
+    public var model: String?
+    /// The context as the last record left it, system prompt first.
+    public var messages: [Message]
+    /// Notes saved with the `remember` tool.
+    public var notes: [String]
+    /// Everything the session spent, its sub-agents included.
+    public var usage: Usage
+    /// The part of `usage` spent on summaries and sub-agents, which run on
+    /// the helper model when one is set.
+    public var helperUsage: Usage
+    /// Prompt plus reply of the last turn, the signal for compaction; 0
+    /// after a rewrite that shrank the context.
+    public var contextTokens: Int
+
+    public init(
+        sessionID: String,
+        cwd: String,
+        model: String?,
+        messages: [Message],
+        notes: [String] = [],
+        usage: Usage = .zero,
+        helperUsage: Usage = .zero,
+        contextTokens: Int = 0
+    ) {
+        self.sessionID = sessionID
+        self.cwd = cwd
+        self.model = model
+        self.messages = messages
+        self.notes = notes
+        self.usage = usage
+        self.helperUsage = helperUsage
+        self.contextTokens = contextTokens
     }
 }
 

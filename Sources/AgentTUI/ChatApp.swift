@@ -126,6 +126,7 @@ final class InlineChat {
             inputs.yield(.keysEnded)
         }
         committed.append(layout.header(session.header))
+        commit(Transcript.blocks(replaying: session.history))
         render()
 
         for await input in stream {
