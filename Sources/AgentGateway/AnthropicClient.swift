@@ -27,6 +27,8 @@ public struct AnthropicClient: LanguageModel, Sendable {
     public let serverFallbacks: Bool
     /// Seconds a request may wait for its reply; see `defaultRequestTimeout`.
     public let requestTimeout: TimeInterval
+    /// Sent as `output_config.effort`; see `ProviderConfig.reasoningEffort`.
+    public let reasoningEffort: String?
     public let session: URLSession
 
     static let apiVersion = "2023-06-01"
@@ -48,8 +50,10 @@ public struct AnthropicClient: LanguageModel, Sendable {
         workloadIdentity: WorkloadIdentityConfig? = nil,
         serverFallbacks: Bool = false,
         requestTimeout: TimeInterval = Self.defaultRequestTimeout,
+        reasoningEffort: String? = nil,
         session: URLSession = .shared
     ) {
+        self.reasoningEffort = reasoningEffort
         self.providerName = providerName
         self.baseURL = Self.versionedBaseURL(baseURL)
         self.apiKey = apiKey
@@ -64,7 +68,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
         let (data, wire) = try await withServerFallbacks(request) { fallbacks in
-            let body = try Self.requestBody(request, serverFallbacks: fallbacks)
+            let body = try Self.requestBody(request, serverFallbacks: fallbacks, effort: reasoningEffort)
             return try await send(method: "POST", url: messagesURL, body: body, serverFallbacks: fallbacks)
         }
         let reply: JSON
@@ -105,7 +109,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     }
 
     private func openStream(_ request: ModelRequest, serverFallbacks: Bool) async throws -> (HTTPResponseBytes, WireFacts) {
-        var body = try Self.requestBody(request, serverFallbacks: serverFallbacks).objectValue ?? [:]
+        var body = try Self.requestBody(request, serverFallbacks: serverFallbacks, effort: reasoningEffort).objectValue ?? [:]
         body["stream"] = .bool(true)
         let urlRequest = try await makeRequest(method: "POST", url: messagesURL, body: .object(body), serverFallbacks: serverFallbacks)
         let (bytes, response) = try await session.streamBytes(for: urlRequest)
@@ -156,7 +160,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     /// caches the whole prefix up to each breakpoint, so a turn pays full
     /// price only for what changed since the previous one; cache reads cost
     /// about a tenth of fresh input. (The API allows four breakpoints.)
-    static func requestBody(_ request: ModelRequest, serverFallbacks: Bool = false) throws -> JSON {
+    static func requestBody(_ request: ModelRequest, serverFallbacks: Bool = false, effort: String? = nil) throws -> JSON {
         var body: [String: JSON] = [
             "model": .string(try request.requiredModel()),
             "max_tokens": .int(request.maxOutputTokens ?? defaultMaxTokens),
@@ -184,6 +188,9 @@ public struct AnthropicClient: LanguageModel, Sendable {
         }
         if serverFallbacks {
             body["fallbacks"] = .string("default")
+        }
+        if let effort {
+            body["output_config"] = .object(["effort": .string(effort)])
         }
         // Current Claude models reject sampling parameters, so only send one
         // when the caller explicitly asked for it.

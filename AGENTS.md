@@ -40,7 +40,10 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `ModelResponse.providerName`/`replacedProvider` say who answered) and auto
   model discovery (`GET /v1/models`), `ProviderConfig` (its
   `requestTimeout`, 600 s by default, is how long a call waits before it
-  fails over),
+  fails over; its `reasoningEffort` is sent as given, as `reasoning_effort`
+  on OpenAI-compatible APIs and `output_config.effort` on Anthropic's,
+  and nil sends nothing, the provider's default, which is the maximum on
+  some),
   `AgentConfigStore` (the per-directory config file written by `nawa config`).
 - `Sources/AgentJSONRPC` — JSON-RPC 2.0 envelope shared by MCP and ACP.
 - `Sources/AgentTools` — built-in tools: `ShellTool`, `ReadFileTool`,

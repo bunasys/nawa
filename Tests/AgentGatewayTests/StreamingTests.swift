@@ -644,3 +644,37 @@ struct StreamLimitTests {
         }
     }
 }
+
+struct ReasoningEffortTests {
+    /// OpenAI-compatible APIs take it as a top-level `reasoning_effort`.
+    @Test
+    func openAIRequestsCarryTheEffortOnlyWhenSet() throws {
+        let set = OpenAIRequest(model: "m", messages: [], reasoningEffort: "low")
+        let unset = OpenAIRequest(model: "m", messages: [])
+
+        #expect(String(decoding: try JSONEncoder().encode(set), as: UTF8.self).contains(#""reasoning_effort":"low""#))
+        #expect(!String(decoding: try JSONEncoder().encode(unset), as: UTF8.self).contains("reasoning_effort"))
+    }
+
+    /// Anthropic's Messages API takes it as `output_config.effort`.
+    @Test
+    func anthropicRequestsCarryItInOutputConfig() throws {
+        let request = ModelRequest(model: "claude-opus-5-5", messages: [Message(role: .user, text: "hi")])
+
+        let set = try AnthropicClient.requestBody(request, effort: "medium").objectValue!
+        let unset = try AnthropicClient.requestBody(request).objectValue!
+
+        #expect(set["output_config"] == .object(["effort": .string("medium")]))
+        #expect(unset["output_config"] == nil)
+    }
+
+    /// Saved with the provider, so `nawa config` files can set it too.
+    @Test
+    func providerConfigKeepsItThroughJSON() throws {
+        let provider = ProviderConfig(name: "runinfra", baseURL: URL(string: "https://api.runinfra.ai/v1")!, model: "m", reasoningEffort: "low")
+
+        let decoded = try JSONDecoder().decode(ProviderConfig.self, from: try JSONEncoder().encode(provider))
+
+        #expect(decoded.reasoningEffort == "low")
+    }
+}

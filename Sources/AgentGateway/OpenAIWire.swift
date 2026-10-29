@@ -10,11 +10,14 @@ struct OpenAIRequest: Encodable {
     let temperature: Double?
     let maxTokens: Int?
     let streamOptions: [String: Bool]?
+    /// Left out when nil (the provider's default).
+    let reasoningEffort: String?
 
     enum CodingKeys: String, CodingKey {
         case model, messages, tools, stream, temperature
         case maxTokens = "max_tokens"
         case streamOptions = "stream_options"
+        case reasoningEffort = "reasoning_effort"
     }
 
     init(
@@ -24,7 +27,8 @@ struct OpenAIRequest: Encodable {
         stream: Bool = false,
         temperature: Double? = nil,
         maxTokens: Int? = nil,
-        streamOptions: [String: Bool]? = nil
+        streamOptions: [String: Bool]? = nil,
+        reasoningEffort: String? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -33,6 +37,7 @@ struct OpenAIRequest: Encodable {
         self.temperature = temperature
         self.maxTokens = maxTokens
         self.streamOptions = streamOptions
+        self.reasoningEffort = reasoningEffort
     }
 }
 

@@ -67,6 +67,7 @@ public struct Gateway: LanguageModel, Sendable {
             return OpenAICompatibleClient(
                 providerName: provider.name, baseURL: provider.baseURL, apiKey: apiKey,
                 requestTimeout: provider.requestTimeout ?? OpenAICompatibleClient.defaultRequestTimeout,
+                reasoningEffort: provider.reasoningEffort,
                 session: session
             )
         case .anthropic:
@@ -82,6 +83,7 @@ public struct Gateway: LanguageModel, Sendable {
                 workloadIdentity: workloadIdentity,
                 serverFallbacks: provider.usesServerFallbacks,
                 requestTimeout: provider.requestTimeout ?? AnthropicClient.defaultRequestTimeout,
+                reasoningEffort: provider.reasoningEffort,
                 session: session
             )
         }

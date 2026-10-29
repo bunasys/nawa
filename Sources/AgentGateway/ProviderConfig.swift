@@ -45,6 +45,13 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
     /// knows its replies are quick sets less, so a provider that hangs costs
     /// minutes rather than ten.
     public var requestTimeout: TimeInterval?
+    /// How hard the model reasons before it answers, as the provider names
+    /// it: `reasoning_effort` on OpenAI-compatible APIs (OpenAI: `minimal`
+    /// to `high`; RunInfra: `none` to `max`) and `output_config.effort` on
+    /// Anthropic's (`low` to `max`). Sent as given; nil sends nothing, which
+    /// is the provider's default, the maximum on some. Reasoning tokens are
+    /// most of a reply's time and cost, so this is the main speed lever.
+    public var reasoningEffort: String?
 
     public init(
         name: String,
@@ -57,7 +64,8 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
         workspaceID: String? = nil,
         workloadIdentity: WorkloadIdentityConfig? = nil,
         serverFallbacks: Bool? = nil,
-        requestTimeout: TimeInterval? = nil
+        requestTimeout: TimeInterval? = nil,
+        reasoningEffort: String? = nil
     ) {
         self.name = name
         self.api = api
@@ -70,6 +78,7 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
         self.workloadIdentity = workloadIdentity
         self.serverFallbacks = serverFallbacks
         self.requestTimeout = requestTimeout
+        self.reasoningEffort = reasoningEffort
     }
 
     /// Whether requests to this provider ask for server-side fallbacks.

@@ -16,6 +16,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
     public let apiKey: String?
     /// Seconds a request may wait for its reply; see `defaultRequestTimeout`.
     public let requestTimeout: TimeInterval
+    /// Sent as `reasoning_effort`; see `ProviderConfig.reasoningEffort`.
+    public let reasoningEffort: String?
     public let session: URLSession
 
     public init(
@@ -23,12 +25,14 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         baseURL: URL,
         apiKey: String? = nil,
         requestTimeout: TimeInterval = Self.defaultRequestTimeout,
+        reasoningEffort: String? = nil,
         session: URLSession = .shared
     ) {
         self.providerName = providerName
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.requestTimeout = requestTimeout
+        self.reasoningEffort = reasoningEffort
         self.session = session
     }
 
@@ -41,7 +45,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             tools: Self.openAITools(request.tools),
             stream: false,
             temperature: request.temperature,
-            maxTokens: request.maxOutputTokens
+            maxTokens: request.maxOutputTokens,
+            reasoningEffort: reasoningEffort
         )
         let (data, wire) = try await Self.post(session: session, url: chatCompletionsURL, apiKey: apiKey, sessionID: request.sessionID, timeout: requestTimeout, body: body)
         do {
@@ -112,7 +117,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             stream: true,
             temperature: request.temperature,
             maxTokens: request.maxOutputTokens,
-            streamOptions: askForUsage ? ["include_usage": true] : nil
+            streamOptions: askForUsage ? ["include_usage": true] : nil,
+            reasoningEffort: reasoningEffort
         )
         var urlRequest = URLRequest(url: chatCompletionsURL)
         // Assigned, not passed to init: on Linux only the setter marks the
