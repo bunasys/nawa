@@ -811,7 +811,7 @@ public final class AgentLoop: @unchecked Sendable {
                 request: summary,
                 response: reply,
                 usage: usage,
-                costUSD: response == nil ? nil : cost(of: usage, purpose: purpose),
+                costUSD: response == nil ? nil : cost(of: usage, purpose: purpose, model: request.model),
                 startedAt: startedAt,
                 firstChunkMS: firstChunkAt.map { Int(($0.timeIntervalSince(startedAt) * 1000).rounded()) },
                 durationMS: millisecondsSince(startedAt),
@@ -913,16 +913,30 @@ public final class AgentLoop: @unchecked Sendable {
         for message in summarizerPrompt {
             record(.message(message, appendedToContext: false))
         }
-        let request = ModelRequest(
-            model: options.helperModel ?? model,
+        let helperModel = options.helperModel
+        var request = ModelRequest(
+            model: helperModel ?? model,
             messages: summarizerPrompt,
             maxOutputTokens: options.maxOutputTokens,
             temperature: options.temperature,
             mayFailOver: mayFailOver
         )
-        let (response, callID) = try await callModel(request, purpose: .compaction, stream: false)
+        // A helper model the provider doesn't serve (a typo, a model since
+        // retired) must not end the run: summarize with the session's model
+        // instead, and say so once in the events.
+        let response: ModelResponse
+        let callID: String
+        var usedHelper = helperModel != nil
+        do {
+            (response, callID) = try await callModel(request, purpose: .compaction, stream: false)
+        } catch where helperModel != nil && !(error is CancellationError) && !Task.isCancelled {
+            report(.informational("The helper model \(helperModel ?? "") couldn't summarize (\(error)); summarizing with the session's model instead."))
+            request.model = model
+            usedHelper = false
+            (response, callID) = try await callModel(request, purpose: .compaction, stream: false)
+        }
         record(.message(response.message, appendedToContext: false))
-        recordUsage(response.usage, helper: true)
+        recordUsage(response.usage, helper: usedHelper)
         try checkAnsweringProvider(response, report: report)
 
         let summary = ContextShrinking.summaryText(
@@ -1036,9 +1050,10 @@ public final class AgentLoop: @unchecked Sendable {
     }
 
     /// One call's estimated cost, priced the way `totalCost` prices it.
-    private func cost(of usage: Usage, purpose: ModelCallRecord.Purpose) -> Double? {
+    /// A summary that fell back to the session's model is priced as that model.
+    private func cost(of usage: Usage, purpose: ModelCallRecord.Purpose, model: String?) -> Double? {
         guard let pricing = options.pricing else { return nil }
-        let isHelperCall = purpose == .compaction && options.helperModel != nil
+        let isHelperCall = purpose == .compaction && options.helperModel != nil && model == options.helperModel
         let callPricing = isHelperCall ? (options.helperPricing ?? pricing) : pricing
         return callPricing.cost(of: usage)
     }

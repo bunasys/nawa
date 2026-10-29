@@ -110,7 +110,9 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   what each result was),
   `compaction` (summarize older messages; adds a `remember` tool whose notes
   survive), `subAgents` (a `task` tool running a fresh child loop), and
-  `helperModel` (cheaper model for both, priced with `helperPricing`). See
+  `helperModel` (cheaper model for both, priced with `helperPricing`; a
+  summary the helper can't make, e.g. a model the provider doesn't serve,
+  is made by the session's model instead, with an informational event). See
   `ContextShrinking.swift`. Always on:
   - A tool result identical to one still whole in the context reaches the
     model as a pointer to it; events, the UI and the loop check still see

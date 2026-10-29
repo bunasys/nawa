@@ -188,3 +188,61 @@ struct CompactionSummaryTests {
         #expect(read.last == "f99")
     }
 }
+
+/// Rejects requests for one model, like a provider that doesn't serve it;
+/// answers the rest from a script.
+private final class RejectsOneModel: LanguageModel, @unchecked Sendable {
+    let providerName = "rejecting"
+    let rejected: String
+    let script: ScriptedModel
+    var requestedModels: [String?] = []
+
+    init(rejecting rejected: String, script: ScriptedModel) {
+        self.rejected = rejected
+        self.script = script
+    }
+
+    struct UnknownModel: Error {}
+
+    func complete(_ request: ModelRequest) async throws -> ModelResponse {
+        requestedModels.append(request.model)
+        if request.model == rejected { throw UnknownModel() }
+        return try await script.complete(request)
+    }
+
+    func stream(_ request: ModelRequest) -> AsyncThrowingStream<StreamChunk, any Error> {
+        completeAsStream(request)
+    }
+
+    func listModels() async throws -> [ModelSummary] { [] }
+}
+
+struct HelperModelFallbackTests {
+    /// A helper model nobody serves must not end the run: the summary is
+    /// made by the session's model instead, and the events say so.
+    @Test
+    func aHelperModelThatFailsFallsBackToTheSessionsModel() async throws {
+        let script = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("x")])), usage: Usage(inputTokens: 50)),
+            toolCallResponse(ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("y")])), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, text: "SUMMARY")),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let model = RejectsOneModel(rejecting: "typo-model", script: script)
+        let options = LoopOptions(compaction: Compaction(atContextTokens: 400, keepRecentMessages: 2), helperModel: "typo-model")
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+        loop.model = "main"
+
+        var notes: [String] = []
+        var final: AgentResult?
+        for try await event in loop.run(prompt: "go") {
+            if case .informational(let text) = event { notes.append(text) }
+            if case .result(let result) = event { final = result }
+        }
+
+        #expect(final?.text == "done")
+        #expect(model.requestedModels == ["main", "main", "typo-model", "main", "main"])
+        #expect(notes.first?.hasPrefix("The helper model typo-model couldn't summarize") == true)
+        #expect(loop.session.messages.contains { $0.text.contains("SUMMARY") })
+    }
+}
