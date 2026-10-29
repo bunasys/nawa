@@ -40,3 +40,4 @@ module, domain types in `AgentCore`, transports that only speak
 | [0003](0003-terminal-ui.md) | A terminal UI for `nawa repl` | Implemented |
 | [0004](0004-streaming-progress.md) | Show progress while the model thinks | Implemented |
 | [0005](0005-session-journal.md) | Session journal: durable sessions for analysis and resume | Implemented (steps 1–5; step 6 is in the Hafez repo) |
+| [0006](0006-skills-and-system-prompt.md) | Skills, a default system prompt, and smaller tool output | Implemented |

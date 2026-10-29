@@ -61,7 +61,7 @@ private func session(_ events: [AgentEvent], removals: Removals) -> ChatSession 
         _ = transcript.submit("scan")
         var final = result(.refused)
         final.refusal = RefusalNotice(declinedBy: "big", category: "cyber")
-        #expect(transcript.reduce(.result(final)) == [.note("no other model answered; NAWA_FALLBACK_MODEL names one to retry on")])
+        #expect(transcript.reduce(.result(final)) == [.note("no other model answered; /config set fallback_model <model> names one to retry on")])
     }
 }
 

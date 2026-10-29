@@ -2,6 +2,10 @@ import Foundation
 
 /// The instructions a project gives to agents, loaded from `AGENTS.md`.
 ///
+/// A directory without an `AGENTS.md` may have a `CLAUDE.md` instead: many
+/// projects only have the one Claude Code reads, and it holds the same kind
+/// of guidance. A directory with both uses its `AGENTS.md`.
+///
 /// Implements the https://agents.md/ standard:
 /// - One markdown file per directory level, named `AGENTS.md`.
 /// - Agents read the *nearest* `AGENTS.md` to the file they are working on;
@@ -29,16 +33,20 @@ public struct ProjectInstructions: Sendable, Hashable {
 
     /// Load the instructions chain for the given start directory.
     ///
-    /// Searches `start` and every parent directory for `AGENTS.md`. Results are
+    /// Searches `start` and every parent directory for `AGENTS.md` (or, where
+    /// there is none, `CLAUDE.md`). Results are
     /// ordered root-most first, nearest last, so that a nested AGENTS.md takes
     /// precedence over its parents' instructions (the standard's "nearest wins").
     public static func load(from start: URL) throws -> ProjectInstructions? {
         var directory = URL(fileURLWithPath: start.path).standardizedFileURL
         var files: [URL] = []
         while true {
-            let candidate = directory.appendingPathComponent("AGENTS.md")
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                files.append(candidate)
+            let agentsMD = directory.appendingPathComponent("AGENTS.md")
+            let claudeMD = directory.appendingPathComponent("CLAUDE.md")
+            if FileManager.default.fileExists(atPath: agentsMD.path) {
+                files.append(agentsMD)
+            } else if FileManager.default.fileExists(atPath: claudeMD.path) {
+                files.append(claudeMD)
             }
             guard directory.path != "/" else { break }
             let parent = directory.deletingLastPathComponent()

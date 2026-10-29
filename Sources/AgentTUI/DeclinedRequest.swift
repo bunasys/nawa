@@ -57,6 +57,6 @@ enum DeclinedRequest {
         if notice?.category == "reasoning_extraction" {
             return .note("no other model will help: reword the prompt so it doesn't ask for the model's reasoning")
         }
-        return .note("no other model answered; NAWA_FALLBACK_MODEL names one to retry on")
+        return .note("no other model answered; /config set fallback_model <model> names one to retry on")
     }
 }

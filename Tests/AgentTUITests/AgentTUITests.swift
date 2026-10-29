@@ -1,3 +1,4 @@
+import Synchronization
 import Testing
 import AgentCore
 @testable import AgentTUI
@@ -525,17 +526,19 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
     }
 
     @Test func headerAndFooter() {
-        let facts = SessionHeader(provider: "anthropic", model: "claude-sonnet-4-5", directory: "~/src/nawa", hasInstructions: true)
+        let facts = SessionHeader(provider: "anthropic", model: "claude-sonnet-4-5", directory: "~/src/nawa", instructionsFile: "AGENTS.md")
         #expect(Layout(columns: 80).header(facts).text == " nawa · anthropic · claude-sonnet-4-5 · ~/src/nawa · AGENTS.md")
         #expect(layout.header(facts).text.hasSuffix("AGENT…"))  // cut to one row
         #expect(layout.header(SessionHeader(directory: "/tmp")).text == " nawa · /tmp")
+        let withSkills = SessionHeader(directory: "/tmp", instructionsFile: "CLAUDE.md", skillCount: 3)
+        #expect(Layout(columns: 80).header(withSkills).text == " nawa · /tmp · CLAUDE.md · 3 skills")
 
         var stats = SessionStats()
         stats.usage = Usage(inputTokens: 17_100, outputTokens: 0, cacheReadTokens: 31_000)
         stats.cost = 0.031
         stats.contextTokens = 27_600
-        #expect(layout.footer(stats, contextLimit: 120_000, extra: "/help").text == " 48.1k tokens (31k cached) · $0.031 · context 23% · /help")
-        #expect(layout.footer(SessionStats(), contextLimit: nil).text == " 0 tokens")
+        #expect(Layout(columns: 100).footer(stats, contextLimit: 120_000, extra: "/help").text == " 48.1k tokens used (31k cached) · $0.031 · context 27.6k/120k (23%) · /help")
+        #expect(layout.footer(SessionStats(), contextLimit: nil).text == " 0 tokens used")
     }
 }
 
@@ -576,7 +579,7 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
               ⏺ shell  ls
                 └ exit 0 · 2 lines
             ● Two files.
-             250 tokens · $0.0020 · context 25%
+             250 tokens used · $0.0020 · context 250/1k (25%)
 
             """)
     }
@@ -587,7 +590,7 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
              nawa · ~/p
             Type a prompt and press Enter; /help lists commands, Ctrl-D quits.
             ● Hi.
-             10 tokens · context 1%
+             10 tokens used · context 10/1k (1%)
 
 
             """)
@@ -650,7 +653,7 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         stats.usage = Usage(inputTokens: 2100, outputTokens: 500, cacheReadTokens: 9800)
         stats.cost = 0.012
         stats.contextTokens = 90
-        #expect(SlashCommand.costReport(stats, contextLimit: 1000) == "12.4k tokens: 2.1k input, 9.8k cached, 500 output · $0.012 · context 9%")
+        #expect(SlashCommand.costReport(stats, contextLimit: 1000) == "12.4k tokens: 2.1k input, 9.8k cached, 500 output · $0.012 · context 90/1k (9%)")
         #expect(SlashCommand.costReport(SessionStats(), contextLimit: nil) == "nothing spent yet")
     }
 
@@ -723,7 +726,7 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
     @Test func plainChatShowsTheHistoryUnderTheHeader() async {
         var output = ""
         let session = ChatSession(
-            header: SessionHeader(provider: nil, model: nil, directory: "~", hasInstructions: false),
+            header: SessionHeader(provider: nil, model: nil, directory: "~"),
             history: Self.conversation(prompts: 1),
             send: { _ in AsyncThrowingStream { $0.finish() } }
         )
@@ -732,5 +735,53 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         #expect(output.contains("prompt 1"))
         #expect(output.contains("answer 1"))
         #expect(output.contains("resumed"))
+    }
+}
+
+@Suite struct ConfigCommandTests {
+    @Test func configKeepsItsWords() {
+        #expect(SlashCommand("/config") == .config([]))
+        #expect(SlashCommand("/config set compact_at 200k") == .config(["set", "compact_at", "200k"]))
+        #expect(SlashCommand("/CONFIG  unset   stream") == .config(["unset", "stream"]))
+        #expect(SlashCommand("/cost extra words") == .cost)
+    }
+
+    @Test func configRunsTheSessionsHookAndShowsItsLines() {
+        let received = Mutex<[String]>([])
+        let session = ChatSession(
+            header: SessionHeader(directory: "~"),
+            send: { _ in AsyncThrowingStream { $0.finish() } },
+            configure: { arguments in
+                received.withLock { $0 = arguments }
+                return ["compact_at = 200k; takes effect now"]
+            }
+        )
+
+        let (blocks, effect) = SlashCommand.config(["set", "compact_at", "200k"]).perform(stats: SessionStats(), session: session, busy: true)
+
+        #expect(received.withLock { $0 } == ["set", "compact_at", "200k"])
+        #expect(blocks == [.note("compact_at = 200k; takes effect now")])
+        #expect(effect == .none)
+    }
+
+    @Test func withoutAHookConfigSaysSo() {
+        let session = ChatSession(header: SessionHeader(directory: "~"), send: { _ in AsyncThrowingStream { $0.finish() } })
+
+        let (blocks, _) = SlashCommand.config([]).perform(stats: SessionStats(), session: session, busy: false)
+
+        #expect(blocks == [.warning("this session has no settings to change")])
+    }
+
+    @Test func theFooterFollowsALiveContextLimit() {
+        let limit = Mutex(120_000)
+        let session = ChatSession(
+            header: SessionHeader(directory: "~"),
+            contextLimit: 1,
+            send: { _ in AsyncThrowingStream { $0.finish() } },
+            liveContextLimit: { limit.withLock { $0 } }
+        )
+        #expect(session.contextLimit == 120_000)
+        limit.withLock { $0 = 600_000 }
+        #expect(session.contextLimit == 600_000)
     }
 }

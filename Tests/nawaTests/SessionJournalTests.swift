@@ -1,3 +1,4 @@
+import AgentInstructions
 @testable import AgentACP
 import AgentCore
 import AgentGateway
@@ -128,7 +129,12 @@ struct SessionJournalTests {
         #expect(replayed == [["user_message_chunk", "hi"], ["agent_message_chunk", "ok"]])
 
         #expect(await second.prompt(sessionID, "again") == "end_turn")
-        let sent = try #require(model.requests.last).messages.map(\.text)
+        // Every session starts with the system prompt (proposal 0006); it comes back with the rest.
+        let sentMessages = try #require(model.requests.last).messages
+        #expect(sentMessages.first?.role == .system)
+        #expect(sentMessages.first?.text.hasPrefix(SystemPrompt.firstPrinciples) == true)
+        #expect(sentMessages.first?.text.contains("You are Nawa") == true)
+        let sent = sentMessages.filter { $0.role != .system }.map(\.text)
         #expect(sent == ["hi", "ok", "again"])
     }
 
@@ -163,7 +169,7 @@ struct SessionJournalTests {
 
         #expect(await acp.prompt(sessionID, "again") == "end_turn")
         #expect(await acp.connection.isLoaded(sessionID))
-        #expect(try #require(model.requests.last).messages.map(\.text) == ["hi", "ok", "again"])
+        #expect(try #require(model.requests.last).messages.filter { $0.role != .system }.map(\.text) == ["hi", "ok", "again"])
     }
 
     @Test
@@ -196,12 +202,15 @@ struct SessionJournalTests {
 
     @Test
     func theIdleTimeoutIsReadInMinutes() {
-        #expect(AgentCLI.idleSessionTimeout(env: [:]) == .seconds(30 * 60))
-        #expect(AgentCLI.idleSessionTimeout(env: ["NAWA_SESSION_IDLE_MINUTES": "5"]) == .seconds(5 * 60))
-        #expect(AgentCLI.idleSessionTimeout(env: ["NAWA_SESSION_IDLE_MINUTES": "0.5"]) == .seconds(30))
-        // Nonsense falls back to the default (with a warning on stderr).
-        #expect(AgentCLI.idleSessionTimeout(env: ["NAWA_SESSION_IDLE_MINUTES": "soon"]) == .seconds(30 * 60))
-        #expect(AgentCLI.idleSessionTimeout(env: ["NAWA_SESSION_IDLE_MINUTES": "-1"]) == .seconds(30 * 60))
+        let fromEnvironment = { (value: String) in
+            AgentCLI.idleSessionTimeout(minutes: Settings.fromEnvironment(["NAWA_SESSION_IDLE_MINUTES": value], reportProblems: false).sessionIdleMinutes)
+        }
+        #expect(AgentCLI.idleSessionTimeout(minutes: nil) == .seconds(30 * 60))
+        #expect(fromEnvironment("5") == .seconds(5 * 60))
+        #expect(fromEnvironment("0.5") == .seconds(30))
+        // Nonsense falls back to the default.
+        #expect(fromEnvironment("soon") == .seconds(30 * 60))
+        #expect(fromEnvironment("-1") == .seconds(30 * 60))
     }
 
     @Test
@@ -247,7 +256,7 @@ struct SessionJournalTests {
 
         let named = try #require(try AgentCLI.resumedSession(arguments: ["--resume", sessionID], sessions: sessions))
         #expect(named.state.sessionID == sessionID)
-        #expect(named.state.messages.map(\.text) == ["hi", "ok"])
+        #expect(named.state.messages.filter { $0.role != .system }.map(\.text) == ["hi", "ok"])
 
         // Without an id, only repl sessions are picked up.
         #expect(throws: CLIError.self) {

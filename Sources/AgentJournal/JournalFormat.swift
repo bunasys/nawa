@@ -190,7 +190,7 @@ public enum JournalFormat {
                 stopReason: fields.optionalString("stop_reason").flatMap(StopReason.init(rawValue:)),
                 costEstimate: fields.optionalDouble("cost_usd"),
                 errorMessage: fields.optionalString("error"),
-                refusal: try fields.optionalObject("refusal").map(refusal)
+                refusal: fields.optionalObject("refusal").map(refusal)
             )
             return .runFinished(result)
         default:

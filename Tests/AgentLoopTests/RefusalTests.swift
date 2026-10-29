@@ -1,5 +1,6 @@
 import AgentCore
 @testable import AgentGateway
+import AgentInstructions
 @testable import AgentLoop
 import Foundation
 import Testing
@@ -47,7 +48,7 @@ struct RefusalTests {
         #expect(loop.model == "small")
         // The declined reply is gone: its tool call never ran, its text isn't kept.
         #expect(tool.calls == 0)
-        #expect(loop.session.messages.map(\.text) == ["scan my server", "Done."])
+        #expect(loop.session.messages.filter { $0.role != .system }.map(\.text) == ["scan my server", "Done."])
         #expect(result?.usage.inputTokens == 20)
     }
 
@@ -117,7 +118,7 @@ struct RefusalTests {
 
         #expect(loop.removeDeclinedRequest())
         #expect(loop.model == "big")
-        #expect(loop.session.messages.map(\.text) == ["Be brief.", "hi", "Hello."])
+        #expect(loop.session.messages.map(\.text) == [SystemPrompt.composed("Be brief."), "hi", "Hello."])
         // Only once: there is nothing left to remove.
         #expect(!loop.removeDeclinedRequest())
 

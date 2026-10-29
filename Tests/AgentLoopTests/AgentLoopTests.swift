@@ -1,5 +1,6 @@
 import AgentCore
 @testable import AgentGateway
+import AgentInstructions
 @testable import AgentLoop
 import AgentTools
 import Foundation
@@ -372,7 +373,7 @@ struct AgentLoopTests {
         #expect(result.text == "done")
         #expect(result.usage.inputTokens == 111)
         #expect(model.requests[1].model == "small")
-        #expect(model.requests[1].messages.map(\.text) == ["find X"])
+        #expect(model.requests[1].messages.map(\.text) == [SystemPrompt.firstPrinciples, AgentLoop.subAgentPrompt(job: "find X", context: nil)])
         #expect(loop.session.messages.last { $0.role == .tool }?.content.first == ToolCall.result(ToolCall(id: "c1", name: "task"), content: "X is in a.swift"))
     }
 
@@ -467,7 +468,7 @@ struct AgentLoopTests {
         #expect(model.requests[2].tools == nil)
         #expect(model.requests[2].messages.last?.text.contains("tests live in Tests/") == true)
         let messages = loop.session.messages
-        #expect(messages[0].text == "SYS")
+        #expect(messages[0].text == SystemPrompt.composed("SYS"))
         #expect(messages[1].text.contains("SUMMARY"))
         #expect(messages[1].text.contains("- tests live in Tests/"))
         // The kept part starts at the assistant's echo call, never at an orphaned tool result.
@@ -484,7 +485,8 @@ struct AgentLoopTests {
 
         let cleared = ContextShrinking.clearingOldToolResults(results(5), keep: 2)
         let contents = cleared.map { $0.content.first.flatMap { if case .toolResult(let r) = $0 { r.content } else { nil } } }
-        #expect(contents == [ContextShrinking.elidedResult, ContextShrinking.elidedResult, ContextShrinking.elidedResult, "output 3", "output 4"])
+        let note = "[elided to save context: t returned 1 line; run it again if you need it]"
+        #expect(contents == [note, note, note, "output 3", "output 4"])
         // Cleared results do not count again, so the next clearing waits for a new batch.
         let oneMore = cleared + results(1)
         #expect(ContextShrinking.clearingOldToolResults(oneMore, keep: 2) == oneMore)

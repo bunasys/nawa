@@ -1,19 +1,29 @@
 import AgentCore
 
 /// Facts shown once at startup:
-/// ` nawa · anthropic · claude-sonnet-4-5 · ~/src/nawa · AGENTS.md`.
+/// ` nawa · anthropic · claude-sonnet-4-5 · ~/src/nawa · AGENTS.md · 12 skills`.
 public struct SessionHeader: Sendable, Hashable {
     public var provider: String?
     public var model: String?
     public var directory: String
-    /// Whether AGENTS.md instructions were loaded.
-    public var hasInstructions: Bool
+    /// The name of the nearest instructions file loaded (`AGENTS.md` or
+    /// `CLAUDE.md`), if any.
+    public var instructionsFile: String?
+    /// How many skills the session can use.
+    public var skillCount: Int
 
-    public init(provider: String? = nil, model: String? = nil, directory: String, hasInstructions: Bool = false) {
+    public init(
+        provider: String? = nil,
+        model: String? = nil,
+        directory: String,
+        instructionsFile: String? = nil,
+        skillCount: Int = 0
+    ) {
         self.provider = provider
         self.model = model
         self.directory = directory
-        self.hasInstructions = hasInstructions
+        self.instructionsFile = instructionsFile
+        self.skillCount = skillCount
     }
 }
 
@@ -91,20 +101,28 @@ extension Layout {
         if let provider = header.provider { parts.append(provider) }
         if let model = header.model { parts.append(model) }
         parts.append(header.directory)
-        if header.hasInstructions { parts.append("AGENTS.md") }
+        if let file = header.instructionsFile { parts.append(file) }
+        if header.skillCount > 0 { parts.append(header.skillCount == 1 ? "1 skill" : "\(header.skillCount) skills") }
         return row(parts.joined(separator: " · "), style: .dim, prefix: StyledSpan(" "))
     }
 
-    /// ` 48.1k tokens (31k cached) · $0.031 · context 23%`, plus `extra`
+    /// ` 48.1k tokens used (31k cached) · $0.031 · context 27.6k/120k (23%)`,
+    /// plus `extra`
     /// (for example a `/help` hint).
     public func footer(_ stats: SessionStats, contextLimit: Int?, extra: String? = nil) -> StyledLine {
         var parts: [String] = []
-        var tokens = "\(Format.tokens(stats.usage.total)) tokens"
+        // Everything sent and received so far, summed over all model calls.
+        // Each call resends the conversation, so this grows much faster than
+        // the context and can pass the model's window; it is spend, not size.
+        var tokens = "\(Format.tokens(stats.usage.total)) tokens used"
         if stats.usage.cacheReadTokens > 0 { tokens += " (\(Format.tokens(stats.usage.cacheReadTokens)) cached)" }
         parts.append(tokens)
         if let cost = stats.cost { parts.append(Format.cost(cost)) }
+        // The conversation's size at the last call against the point where
+        // older messages get summarized (not the model's window).
         if let contextLimit, contextLimit > 0 {
-            parts.append("context \(min(stats.contextTokens * 100 / contextLimit, 999))%")
+            let percent = min(stats.contextTokens * 100 / contextLimit, 999)
+            parts.append("context \(Format.tokens(stats.contextTokens))/\(Format.tokens(contextLimit)) (\(percent)%)")
         }
         if let extra { parts.append(extra) }
         return row(parts.joined(separator: " · "), style: .dim, prefix: StyledSpan(" "))

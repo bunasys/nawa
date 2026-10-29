@@ -10,6 +10,8 @@ public enum SlashCommand: Sendable, Hashable {
     case clear
     case cost
     case tools
+    /// `/config`, with the words after it (`set compact_at 200k`).
+    case config([String])
     case exit
     /// `/name` that isn't a command.
     case unknown(String)
@@ -20,16 +22,22 @@ public enum SlashCommand: Sendable, Hashable {
         (.clear, "/clear", "start a new conversation"),
         (.cost, "/cost", "tokens and cost so far"),
         (.tools, "/tools", "the tools the agent can use"),
+        (.config([]), "/config", "list settings; /config set <key> <value>, /config unset <key>"),
         (.exit, "/exit", "quit (also ctrl-d)"),
     ]
 
-    /// The command `text` asks for, or nil when it is a prompt. Anything
-    /// after the command name is ignored.
+    /// The command `text` asks for, or nil when it is a prompt. Words after
+    /// the command name are ignored, except `/config`'s.
     public init?(_ text: String) {
         let trimmed = text.drop { $0.isWhitespace }
         guard trimmed.first == "/" else { return nil }
-        let name = String(trimmed.prefix { !$0.isWhitespace })
+        let words = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        let name = words[0]
         guard name.dropFirst().contains("/") == false, name.count > 1 else { return nil }
+        if name.lowercased() == "/config" {
+            self = .config(Array(words.dropFirst()))
+            return
+        }
         self = Self.all.first { $0.name == name.lowercased() }?.command ?? .unknown(name)
     }
 
@@ -62,6 +70,11 @@ public enum SlashCommand: Sendable, Hashable {
         case .tools:
             let names = session.tools
             return ([.note(names.isEmpty ? "no tools" : "\(names.count) tools: " + names.joined(separator: ", "))], .none)
+        case .config(let arguments):
+            guard let configure = session.configure else {
+                return ([.warning("this session has no settings to change")], .none)
+            }
+            return (configure(arguments).map(Block.note), .none)
         case .exit:
             return ([], .quit)
         case .unknown(let name):
@@ -80,9 +93,10 @@ public enum SlashCommand: Sendable, Hashable {
             (usage.outputTokens, "output"),
         ].filter { $0.0 > 0 }.map { "\(Format.tokens($0.0)) \($0.1)" }
         var parts = ["\(Format.tokens(usage.total)) tokens: " + kinds.joined(separator: ", ")]
-        parts.append(stats.cost.map(Format.cost) ?? "no cost estimate without prices (NAWA_PRICE)")
+        parts.append(stats.cost.map(Format.cost) ?? "no cost estimate without prices (/config set price <input,output>)")
         if let contextLimit, contextLimit > 0 {
-            parts.append("context \(min(stats.contextTokens * 100 / contextLimit, 999))%")
+            let percent = min(stats.contextTokens * 100 / contextLimit, 999)
+            parts.append("context \(Format.tokens(stats.contextTokens))/\(Format.tokens(contextLimit)) (\(percent)%)")
         }
         return parts.joined(separator: " · ")
     }

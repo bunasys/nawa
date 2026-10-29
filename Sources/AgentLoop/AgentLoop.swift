@@ -1,5 +1,6 @@
 import AgentCore
 import AgentGateway
+import AgentInstructions
 import Foundation
 
 /// The working directory for tools in a session. Defaults to the process's
@@ -37,10 +38,20 @@ public final class AgentLoop: @unchecked Sendable {
     public let gateway: any LanguageModel
     /// The tools the loop can invoke.
     public let tools: ToolRegistry
-    /// The system prompt injected at the start of every session.
+    /// The caller's instructions: they follow Nawa's first principles in the
+    /// session's system message (`SystemPrompt.composed`), never replace them.
     public let systemPrompt: String?
-    /// Optional per-run limits.
-    public let options: LoopOptions
+    /// Limits and token savers. Can be changed while a run goes on (the
+    /// repl's `/config set`): each turn reads the current value. Which tools
+    /// are offered (`subAgents`, `compaction` on or off) should stay as the
+    /// session started, or the request prefix stops being cacheable.
+    public var options: LoopOptions {
+        get { optionsLock.withLock { _options } }
+        set { optionsLock.withLock { _options = newValue } }
+    }
+    private var _options: LoopOptions
+    /// Its own lock, apart from `lock`: code holding `lock` reads options.
+    private let optionsLock = NSLock()
     /// The working directory for the session's tools.
     public let cwd: String
     /// A hook invoked for every event (instrumentation/telemetry).
@@ -127,7 +138,8 @@ public final class AgentLoop: @unchecked Sendable {
     /// - Parameters:
     ///   - gateway: Language model to use.
     ///   - tools: Tool registry the model may call.
-    ///   - systemPrompt: Optional instructions prepended to every conversation.
+    ///   - systemPrompt: Instructions added after Nawa's first principles
+    ///     (`SystemPrompt.firstPrinciples`), which every session starts with.
     ///   - options: Optional limits (maxTurns, loop check, maxBudgetUSD).
     ///   - cwd: Working directory for tools; defaults to the process cwd.
     ///   - sessionID: The session's id, also its id in the journal. ACP
@@ -147,14 +159,12 @@ public final class AgentLoop: @unchecked Sendable {
         self.gateway = gateway
         self.tools = tools
         self.systemPrompt = systemPrompt
-        self.options = options
+        self._options = options
         self.cwd = cwd
         self.journal = journal
         self.onEvent = onEvent
         var session = Session(id: sessionID, cwd: cwd)
-        if let systemPrompt, !systemPrompt.isEmpty {
-            session.append(Message(role: .system, text: systemPrompt))
-        }
+        session.append(Message(role: .system, text: SystemPrompt.composed(systemPrompt)))
         self._session = session
         self._usage = .zero
         self._turnCounter = 0
@@ -373,7 +383,10 @@ public final class AgentLoop: @unchecked Sendable {
                         for result in results {
                             self.emit(.toolResult(result))
                         }
-                        let resultMessages = results.map { $0.asMessage }
+                        // The context gets a pointer for output it already has;
+                        // events and the loop check above see the real results.
+                        let contextResults = ContextShrinking.dedupingRepeatedResults(results, against: self._session.messages)
+                        let resultMessages = contextResults.map { $0.asMessage }
                         self._session.messages.append(contentsOf: resultMessages)
                         self.recordAppended(resultMessages)
                         continuation.yield(.toolResults(results))
@@ -520,33 +533,54 @@ public final class AgentLoop: @unchecked Sendable {
         return definitions
     }
 
-    /// Run each requested tool, collecting results. Tools run sequentially for
-    /// predictability; results are gathered in call order.
+    /// Run each requested tool, collecting results in call order.
+    ///
+    /// Tools run one after another, for predictability: an edit and a test
+    /// run must not overlap. The exception is several `task` calls in one
+    /// turn: sub-agents only report back, so they run at the same time
+    /// (after the turn's other calls).
     /// `progress` receives events produced while a tool runs (sub-agents).
     private func runTools(_ toolCalls: [ToolCall], progress: (AgentEvent) -> Void) async -> [ToolCallResult] {
-        var results: [ToolCallResult] = []
-        for call in toolCalls {
+        let runsTasksTogether = toolCalls.filter(isTaskCall).count > 1
+        var resultsByIndex: [Int: ToolCallResult] = [:]
+        for (index, call) in toolCalls.enumerated() {
+            if runsTasksTogether && isTaskCall(call) { continue }
             let startedAt = Date()
             let result = await runTool(call, progress: progress)
-            let run = ToolRunRecord(
-                callID: call.id,
-                name: call.name,
-                startedAt: startedAt,
-                durationMS: millisecondsSince(startedAt),
-                outputChars: result.content.count,
-                isError: result.isError
-            )
-            record(.toolRun(run))
-            results.append(result)
+            recordToolRun(call, result: result, startedAt: startedAt, durationMS: millisecondsSince(startedAt))
+            resultsByIndex[index] = result
         }
-        return results
+        if runsTasksTogether {
+            let tasks = toolCalls.enumerated().filter { isTaskCall($0.element) }.map { (index: $0.offset, call: $0.element) }
+            for (index, result) in await runSubAgentsTogether(tasks, progress: progress) {
+                resultsByIndex[index] = result
+            }
+        }
+        return toolCalls.indices.compactMap { resultsByIndex[$0] }
+    }
+
+    private func isTaskCall(_ call: ToolCall) -> Bool {
+        options.subAgents && call.name == Self.taskDefinition.name
+    }
+
+    private func recordToolRun(_ call: ToolCall, result: ToolCallResult, startedAt: Date, durationMS: Int) {
+        let run = ToolRunRecord(
+            callID: call.id,
+            name: call.name,
+            startedAt: startedAt,
+            durationMS: durationMS,
+            outputChars: result.content.count,
+            isError: result.isError
+        )
+        record(.toolRun(run))
     }
 
     private func runTool(_ call: ToolCall, progress: (AgentEvent) -> Void) async -> ToolCallResult {
-        let isTask = options.subAgents && call.name == Self.taskDefinition.name
         let isRemember = options.compaction != nil && call.name == Self.rememberDefinition.name
-        if isTask {
-            return await runSubAgent(call, progress: progress)
+        if isTaskCall(call) {
+            let outcome = await runSubAgent(call, budgetShare: 1, progress: progress)
+            if let usage = outcome.usage { recordUsage(usage, helper: true) }
+            return outcome.result
         }
         if isRemember {
             let note = call.arguments.objectValue?["note"]?.stringValue ?? ""
@@ -570,14 +604,19 @@ public final class AgentLoop: @unchecked Sendable {
         and the same tools (except task). Only its final answer comes back, so use it for \
         exploration whose intermediate output you do not need, e.g. "find where session \
         cancellation is handled and list the files and functions involved". Say exactly \
-        what the answer should contain.
+        what the answer should contain, and pass what you already know as context so it \
+        doesn't read the same files again. Several task calls in one turn run at the same time.
         """,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([
                 "prompt": .object([
                     "type": .string("string"),
-                    "description": .string("The complete job description; the sub-agent sees nothing else."),
+                    "description": .string("The job: what to find or do, and what the answer should contain."),
+                ]),
+                "context": .object([
+                    "type": .string("string"),
+                    "description": .string("What you already know that the job needs: findings, file paths and line numbers, what was ruled out. The sub-agent sees nothing else of this conversation."),
                 ]),
             ]),
             "required": .array([.string("prompt")]),
@@ -599,17 +638,62 @@ public final class AgentLoop: @unchecked Sendable {
         ])
     )
 
+    /// What a sub-agent run gives back: the `task` result, and the usage
+    /// to add to this session's totals (nil when the child never finished).
+    /// The caller records the usage, so sub-agents running at the same time
+    /// never write this loop's totals.
+    struct SubAgentOutcome: Sendable {
+        var result: ToolCallResult
+        var usage: Usage?
+    }
+
+    /// At most this many sub-agents run at once.
+    static let maxParallelSubAgents = 4
+    /// A sub-agent's answer joins this conversation and is resent with every
+    /// later request, so a runaway answer is cut to head and tail.
+    static let maxSubAgentAnswerChars = 24_000
+
+    static let subAgentBrief = """
+    You are a sub-agent. Only your final answer goes back to the agent that started you; it \
+    doesn't see your tool calls or their output. Answer exactly what the job asks: findings \
+    first, with path:line references and the commands or data that back them, then anything \
+    you couldn't verify. Be concise.
+    """
+
+    /// The child's first message: the brief, then the parent's context, then
+    /// the job. The brief comes first so sub-agents share a request prefix.
+    static func subAgentPrompt(job: String, context: String?) -> String {
+        var parts = [subAgentBrief]
+        if let context, !context.isEmpty {
+            parts.append("What the agent that started you already knows:\n\(context)")
+        }
+        parts.append("Your job:\n\(job)")
+        return parts.joined(separator: "\n\n")
+    }
+
+    static func cappedSubAgentAnswer(_ text: String) -> String {
+        guard text.count > maxSubAgentAnswerChars else { return text }
+        let tailChars = maxSubAgentAnswerChars / 3
+        let headChars = maxSubAgentAnswerChars - tailChars
+        let omitted = text.count - maxSubAgentAnswerChars
+        return text.prefix(headChars) + "\n[… \(omitted) characters of the sub-agent's answer left out …]\n" + text.suffix(tailChars)
+    }
+
     /// Run a `task` call in a fresh loop. Its tool output never enters this
     /// conversation; only the final answer does. Its events are forwarded to
-    /// `progress` as they happen, tagged with the call id. Its spend counts
-    /// here, so the budget cap and totals include it, and it may only spend
-    /// what is left of the budget.
-    private func runSubAgent(_ call: ToolCall, progress: (AgentEvent) -> Void) async -> ToolCallResult {
-        let prompt = call.arguments.objectValue?["prompt"]?.stringValue ?? ""
-        if prompt.isEmpty {
-            return ToolCallResult(callID: call.id, name: call.name, content: "missing string argument 'prompt'", isError: true)
+    /// `progress` as they happen, tagged with the call id. It may only spend
+    /// its share of what is left of the budget (`budgetShare` children
+    /// running together split it evenly).
+    private func runSubAgent(_ call: ToolCall, budgetShare: Int, progress: (AgentEvent) -> Void) async -> SubAgentOutcome {
+        func failure(_ message: String) -> SubAgentOutcome {
+            SubAgentOutcome(result: ToolCallResult(callID: call.id, name: call.name, content: message, isError: true))
         }
-        let child = AgentLoop(gateway: gateway, tools: tools, systemPrompt: systemPrompt, options: childOptions, cwd: cwd, journal: journal)
+        let fields = call.arguments.objectValue ?? [:]
+        let job = fields["prompt"]?.stringValue ?? ""
+        if job.isEmpty { return failure("missing string argument 'prompt'") }
+        let prompt = Self.subAgentPrompt(job: job, context: fields["context"]?.stringValue)
+
+        let child = AgentLoop(gateway: gateway, tools: tools, systemPrompt: systemPrompt, options: childOptions(budgetShare: budgetShare), cwd: cwd, journal: journal)
         child.journalParent = JournalParent(session: _session.id, callID: call.id)
         let childModel = options.helperModel ?? model
         child.model = childModel
@@ -621,20 +705,70 @@ public final class AgentLoop: @unchecked Sendable {
                 progress(.subAgent(SubAgentUpdate(callID: call.id, model: childModel, event: event)))
             }
         } catch {
-            return ToolCallResult(callID: call.id, name: call.name, content: "sub-agent failed: \(error)", isError: true)
+            return failure("sub-agent failed: \(error)")
         }
-        if Task.isCancelled {
-            return ToolCallResult(callID: call.id, name: call.name, content: "sub-agent cancelled", isError: true)
-        }
-        guard let childResult else {
-            return ToolCallResult(callID: call.id, name: call.name, content: "sub-agent ended without a result", isError: true)
-        }
-        recordUsage(childResult.usage, helper: true)
+        if Task.isCancelled { return failure("sub-agent cancelled") }
+        guard let childResult else { return failure("sub-agent ended without a result") }
+
         guard childResult.isSuccess else {
             let reason = childResult.errorMessage ?? childResult.kind.rawValue
-            return ToolCallResult(callID: call.id, name: call.name, content: "sub-agent stopped: \(reason)", isError: true)
+            var outcome = failure("sub-agent stopped: \(reason)")
+            outcome.usage = childResult.usage
+            return outcome
         }
-        return ToolCallResult(callID: call.id, name: call.name, content: childResult.text ?? "")
+        let answer = Self.cappedSubAgentAnswer(childResult.text ?? "")
+        return SubAgentOutcome(result: ToolCallResult(callID: call.id, name: call.name, content: answer), usage: childResult.usage)
+    }
+
+    /// Run several `task` calls at the same time, at most
+    /// `maxParallelSubAgents` at once. Their events reach `progress` live,
+    /// through a stream, because `progress` may only be called from this task.
+    private func runSubAgentsTogether(_ calls: [(index: Int, call: ToolCall)], progress: (AgentEvent) -> Void) async -> [(Int, ToolCallResult)] {
+        let (events, sink) = AsyncStream.makeStream(of: AgentEvent.self)
+        let budgetShare = min(calls.count, Self.maxParallelSubAgents)
+        async let finished = runInBatches(calls, budgetShare: budgetShare, sink: sink)
+        for await event in events { progress(event) }
+
+        var results: [(Int, ToolCallResult)] = []
+        for item in await finished.sorted(by: { $0.index < $1.index }) {
+            if let usage = item.outcome.usage { recordUsage(usage, helper: true) }
+            recordToolRun(item.call, result: item.outcome.result, startedAt: item.startedAt, durationMS: item.durationMS)
+            results.append((item.index, item.outcome.result))
+        }
+        return results
+    }
+
+    private struct FinishedSubAgent: Sendable {
+        var index: Int
+        var call: ToolCall
+        var outcome: SubAgentOutcome
+        var startedAt: Date
+        var durationMS: Int
+    }
+
+    private func runInBatches(
+        _ calls: [(index: Int, call: ToolCall)],
+        budgetShare: Int,
+        sink: AsyncStream<AgentEvent>.Continuation
+    ) async -> [FinishedSubAgent] {
+        var finished: [FinishedSubAgent] = []
+        var batchStart = 0
+        while batchStart < calls.count {
+            let batch = calls[batchStart..<min(batchStart + Self.maxParallelSubAgents, calls.count)]
+            await withTaskGroup(of: FinishedSubAgent.self) { group in
+                for (index, call) in batch {
+                    group.addTask {
+                        let startedAt = Date()
+                        let outcome = await self.runSubAgent(call, budgetShare: budgetShare) { sink.yield($0) }
+                        return FinishedSubAgent(index: index, call: call, outcome: outcome, startedAt: startedAt, durationMS: millisecondsSince(startedAt))
+                    }
+                }
+                for await done in group { finished.append(done) }
+            }
+            batchStart += Self.maxParallelSubAgents
+        }
+        sink.finish()
+        return finished
     }
 
     /// One model call, recorded in the journal whether it succeeds or not.
@@ -716,9 +850,9 @@ public final class AgentLoop: @unchecked Sendable {
     }
 
     /// A sub-agent's options: no further sub-agents, no streaming (only its
-    /// result is shown), the helper's pricing
-    /// when it runs on the helper model, and what is left of the budget.
-    private var childOptions: LoopOptions {
+    /// result is shown), the helper's pricing when it runs on the helper
+    /// model, and its share of what is left of the budget.
+    private func childOptions(budgetShare: Int) -> LoopOptions {
         var child = options
         child.subAgents = false
         child.streamReplies = false
@@ -726,7 +860,7 @@ public final class AgentLoop: @unchecked Sendable {
             child.pricing = options.helperPricing ?? options.pricing
         }
         if let maxBudget = options.maxBudgetUSD {
-            child.maxBudgetUSD = max(0, maxBudget - (totalCost ?? 0))
+            child.maxBudgetUSD = max(0, maxBudget - (totalCost ?? 0)) / Double(max(1, budgetShare))
         }
         return child
     }
@@ -745,9 +879,14 @@ public final class AgentLoop: @unchecked Sendable {
     /// `report` gets the `.informational` note a compaction leaves; unlike
     /// the loop's other notes it says something the result won't.
     private func shrinkContext(report: (AgentEvent) -> Void) async throws {
-        if let keep = options.keepToolResults {
+        let clearsToolResults = options.keepToolResults != nil || options.keepToolResultChars != nil
+        if clearsToolResults {
             let before = _session.messages
-            _session.messages = ContextShrinking.clearingOldToolResults(before, keep: keep)
+            _session.messages = ContextShrinking.clearingOldToolResults(
+                before,
+                keep: options.keepToolResults,
+                maxChars: options.keepToolResultChars
+            )
             recordRewrite(.toolResultsCleared, before: before)
         }
         guard let compaction = options.compaction, _contextTokens >= compaction.atContextTokens else { return }
@@ -786,10 +925,11 @@ public final class AgentLoop: @unchecked Sendable {
         recordUsage(response.usage, helper: true)
         try checkAnsweringProvider(response, report: report)
 
-        var summary = "Summary of the conversation so far (older messages were compacted):\n\n\(response.message.text)"
-        if !_notes.isEmpty {
-            summary += "\n\nNotes you saved with remember:\n" + _notes.map { "- \($0)" }.joined(separator: "\n")
-        }
+        let summary = ContextShrinking.summaryText(
+            response.message.text,
+            notes: _notes,
+            files: ContextShrinking.fileLists(in: Array(older))
+        )
         _session.messages = Array(systemMessages) + [Message(role: .user, text: summary)] + messages[cut...]
         recordRewrite(.compaction, before: messages, modelCallID: callID)
         // Message positions moved, and the declined prompt may be in the summary.
@@ -881,6 +1021,7 @@ public final class AgentLoop: @unchecked Sendable {
         if let tokens = options.maxOutputTokens { fields["max_output_tokens"] = .int(tokens) }
         if let temperature = options.temperature { fields["temperature"] = .double(temperature) }
         if let keep = options.keepToolResults { fields["keep_tool_results"] = .int(keep) }
+        if let chars = options.keepToolResultChars { fields["keep_tool_result_chars"] = .int(chars) }
         if let compaction = options.compaction {
             fields["compaction"] = .object([
                 "at_context_tokens": .int(compaction.atContextTokens),
@@ -1006,6 +1147,36 @@ public struct Pricing: Sendable, Codable, Equatable {
     }
 }
 
+extension Pricing {
+    /// A price given per million tokens, as `LoopSettings` carries it.
+    public init(_ price: TokenPrice) {
+        self.init(inputPer1K: price.inputPerMillion / 1000, outputPer1K: price.outputPerMillion / 1000)
+    }
+}
+
+extension LoopOptions {
+    /// These options with `settings` applied: every setting that is set
+    /// replaces its option; nil leaves the option as it is.
+    ///
+    /// How a program combines its own choices with the ones a person or a
+    /// server made: build the options in code, then apply the settings.
+    /// `compactAt` turns compaction on when it was off.
+    public func applying(_ settings: LoopSettings) -> LoopOptions {
+        var options = self
+        if let tokens = settings.compactAt {
+            let keepRecent = compaction?.keepRecentMessages ?? Compaction(atContextTokens: tokens).keepRecentMessages
+            options.compaction = Compaction(atContextTokens: tokens, keepRecentMessages: keepRecent)
+        }
+        if let model = settings.helperModel { options.helperModel = model }
+        if let price = settings.price { options.pricing = Pricing(price) }
+        if let price = settings.helperPrice { options.helperPricing = Pricing(price) }
+        if let budget = settings.maxBudgetUSD { options.maxBudgetUSD = budget }
+        if let model = settings.fallbackModel { options.fallbackModel = model }
+        if let stream = settings.stream { options.streamReplies = stream }
+        return options
+    }
+}
+
 /// When to summarize the older part of a conversation.
 public struct Compaction: Sendable {
     /// Compact once a model call's prompt plus reply reaches this many tokens.
@@ -1038,8 +1209,12 @@ public struct LoopOptions: Sendable {
     /// Per-model pricing, if cost is to be surfaced.
     public var pricing: Pricing?
     /// Keep only this many recent tool results in full; older ones are
-    /// replaced with a marker. Nil = keep everything.
+    /// replaced with a one-line note. Nil = no count limit.
     public var keepToolResults: Int?
+    /// Clear old tool results once the whole ones add up to more than this
+    /// many characters, down to half of it. Nil = no size limit. Works with
+    /// `keepToolResults`: whichever limit is passed first starts a clearing.
+    public var keepToolResultChars: Int?
     /// Summarize long conversations. Also offers the model a `remember` tool
     /// whose notes survive the summary. Nil = never summarize.
     public var compaction: Compaction?
@@ -1067,6 +1242,7 @@ public struct LoopOptions: Sendable {
         sendTools: Bool = true,
         pricing: Pricing? = nil,
         keepToolResults: Int? = nil,
+        keepToolResultChars: Int? = nil,
         compaction: Compaction? = nil,
         subAgents: Bool = false,
         helperModel: String? = nil,
@@ -1082,6 +1258,7 @@ public struct LoopOptions: Sendable {
         self.sendTools = sendTools
         self.pricing = pricing
         self.keepToolResults = keepToolResults
+        self.keepToolResultChars = keepToolResultChars
         self.compaction = compaction
         self.subAgents = subAgents
         self.helperModel = helperModel

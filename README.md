@@ -4,7 +4,7 @@
 
 **Nawa** (نواة, "kernel") is the agent harness at the core of Buna Systems' agent work, built as
 a SwiftPM package. It embeds the agent loop, a configurable multi-provider AI
-gateway, tools + MCP, AGENTS.md loading, and the ACP protocol (streamable HTTP
+gateway, tools + MCP, AGENTS.md loading, skills, and the ACP protocol (streamable HTTP
 + WebSocket transport) as the way agents communicate with users and clients.
 
 ## Why we built it
@@ -40,11 +40,11 @@ into bigger systems.
 | `AgentJSONRPC` | JSON-RPC 2.0 envelope shared by MCP and ACP | `AgentCore` |
 | `AgentGateway` | `LanguageModel` protocol, OpenAI-compatible client (streaming + tool calls), Anthropic Messages client, Gateway with multiple providers + auto model discovery | `AgentCore` |
 | `AgentTools` | Built-in tools: `CurrentTimeTool`, `EchoTool`, `ShellTool` | `AgentCore` |
-| `AgentInstructions` | `AGENTS.md` discovery/loading per agents.md | `AgentCore` |
+| `AgentInstructions` | The system prompt: Nawa's default, `SOUL.md`, `AGENTS.md` (or `CLAUDE.md`) per agents.md, and the skills list | `AgentCore` |
 | `AgentLoop` | The Runner/Event loop driving a session to completion | Core, Gateway, Tools, Instructions |
 | `AgentMCP` | MCP client: spawn MCP servers, list + call their tools | Core, JSONRPC, Tools |
 | `AgentACP` | ACP server over streamable HTTP + WebSocket (Hummingbird), and ACP over stdio | all of the above |
-| `nawa` | Executable: `serve` (ACP server), `acp` (ACP over stdio), `repl`, or `config` (per-directory provider setup) | everything |
+| `nawa` | Executable: `serve` (ACP server), `acp` (ACP over stdio), `repl`, `config` (per-directory provider setup), `sessions`, or `prompt` (print the system prompt) | everything |
 
 ## Design principles (CUPID)
 
@@ -74,7 +74,10 @@ into bigger systems.
 - ✅ **Agent loop** — the full cycle with best-practice limits and result subtypes.
 - ✅ **Tool calls & MCP protocol** — `ToolRegistry` + built-in tools + an MCP
   client (stdlib transport, JSON-RPC 2.0) surfacing remote tools.
-- ✅ **AGENTS.md standard** — `ProjectInstructions` discovers and loads AGENTS.md.
+- ✅ **AGENTS.md standard** — `ProjectInstructions` discovers and loads AGENTS.md
+  (or CLAUDE.md where a folder has no AGENTS.md).
+- ✅ **Skills** — agentskills.io `SKILL.md` folders from the project and your
+  home, listed in the system prompt and read on demand.
 - ✅ **Predictable** loop — the agent loop yields typed events and is testable
   with a scripted model.
 
@@ -125,13 +128,75 @@ In `repl`, Enter sends (prompts typed during a turn wait their turn),
 Alt-Enter or Ctrl-J adds a newline, Esc or Ctrl-C interrupts, and Ctrl-D
 on an empty prompt quits. `/help` lists the commands: `/clear` starts a
 new conversation, `/cost` shows tokens and cost so far, `/tools` lists
-the agent's tools, `/exit` quits.
+the agent's tools, `/config` lists and changes settings (below), `/exit`
+quits.
 
 Replies stream: while the model works, `repl` shows whether it is
 thinking or writing, a running token estimate and the newest lines of
 its reasoning or reply, and ACP clients get `agent_thought_chunk` /
-`agent_message_chunk` updates as they arrive. Set `NAWA_STREAM=0` to
-wait for whole replies instead.
+`agent_message_chunk` updates as they arrive. Set `stream` to `off` (see
+Settings) to wait for whole replies instead.
+
+The footer reads `1.9M tokens used · context 80k/120k (67%)`. The first
+number is everything sent and received over all model calls (each call
+resends the conversation), so it grows far past the context. The second is
+the last request's size against `compact_at`, where older messages get
+summarized, not the model's window.
+
+## Settings
+
+Settings are saved per directory in the same file as its providers. List
+them with `/config` in the repl or `nawa config settings` (also shown by
+`nawa config list`), and change them with `/config set compact_at 200k` or
+`nawa config set …`; `unset` restores the default. In the repl a change
+applies at once (`skills` and `project_skills` on `/clear`, the session
+ones the next time nawa starts).
+
+| Setting | Default | What it does |
+|---|---|---|
+| `compact_at` | 120k | summarize older messages once a request reaches this many tokens (`200k`, `1.5M`) |
+| `helper_model` | the session's model | cheaper model for sub-agents and summaries (same provider) |
+| `price`, `helper_price` | none | `"input,output"` USD per million tokens, for cost estimates |
+| `max_budget_usd` | none | stop a prompt once the session's estimated cost reaches it (needs `price`) |
+| `fallback_model` | provider's recommendation | model to retry on when the model declines a prompt |
+| `stream` | on | show replies as they arrive |
+| `skills`, `project_skills` | on | offer skills; `project_skills off` keeps only yours |
+| `sessions`, `sessions_dir` | on, `~/.local/state/nawa/sessions` | record session journals, and where |
+| `session_idle_minutes` | 30 | `serve`: unload a session idle this long |
+
+Each setting also has an environment variable (`NAWA_` plus the key in
+capitals, e.g. `NAWA_COMPACT_AT`) for scripts and CI; when one is set it
+wins over the saved value, and `/config` says so.
+
+## System prompt, SOUL.md and skills
+
+Every session starts with Nawa's first principles (working style,
+accuracy, safety), then adds what the directory provides. `nawa prompt
+[dir]` prints the result. The principles come first in every session,
+also in programs that link Nawa as a library: their `systemPrompt` is
+added after them and can't replace them.
+
+- **`SOUL.md`** sets who the agent is and how it talks.
+  - Yours, in `~/.config/nawa/SOUL.md` (or `$XDG_CONFIG_HOME/nawa/SOUL.md`),
+    replaces Nawa's persona and reply style.
+  - A repository's `SOUL.md` (the nearest, up to the git root) is added
+    after the safety rules.
+  - The safety rules are always kept, so a cloned repository can't remove
+    them.
+- **`AGENTS.md`**: the chain from the filesystem root to the directory, nearest
+  last. A folder without one uses its `CLAUDE.md`.
+- **Skills** are folders with a `SKILL.md` (frontmatter `name` and
+  `description`). Nawa looks in:
+  - `.agents/skills`, `.claude/skills` and `.nawa/skills`, from the
+    directory up to the git root;
+  - `~/.config/nawa/skills`, `~/.agents/skills` and `~/.claude/skills`.
+
+  The nearest skill with a given name wins. The list of names and
+  descriptions is held to ~2.5K tokens: descriptions are shortened to fit,
+  and then a `skill_search` tool is added. The model reads a skill's
+  `SKILL.md` with `read_file` when a task matches.
+  The `project_skills off` setting keeps only your own skills (for
+  repositories you don't trust); `skills off` turns skills off.
 
 ## Configuring a provider per directory
 

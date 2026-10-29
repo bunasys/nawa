@@ -1,3 +1,4 @@
+import AgentCore
 @testable import AgentGateway
 import Foundation
 import Testing
@@ -133,5 +134,43 @@ struct AgentConfigStoreTests {
         // The saved gateway config is directly usable.
         let gateway = try #require(loaded.gatewayConfig(for: dir)).makeGateway()
         #expect(gateway.activeProvider?.model == "gpt-4o-mini")
+    }
+}
+
+@Suite struct DirectorySettingsTests {
+    /// The file keeps the loop's fields beside the CLI's, under the contract's names.
+    @Test func savesFlatSnakeCaseFields() throws {
+        let settings = DirectorySettings(
+            loop: LoopSettings(compactAt: 600_000, price: TokenPrice(inputPerMillion: 3, outputPerMillion: 15), stream: false),
+            skills: false,
+            sessionsDirectory: "/j"
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+
+        let json = String(decoding: try encoder.encode(settings), as: UTF8.self)
+
+        #expect(json == #"{"compact_at":600000,"price":{"input_per_million":3,"output_per_million":15},"sessions_dir":"\/j","skills":false,"stream":false}"#)
+        #expect(try JSONDecoder().decode(DirectorySettings.self, from: Data(json.utf8)) == settings)
+    }
+
+    @Test func laterSettingsWinFieldByField() {
+        let saved = DirectorySettings(loop: LoopSettings(compactAt: 1, helperModel: "a"), skills: true)
+        let environment = DirectorySettings(loop: LoopSettings(helperModel: "b"), sessions: false)
+
+        let merged = saved.overlaid(by: environment)
+
+        #expect(merged == DirectorySettings(loop: LoopSettings(compactAt: 1, helperModel: "b"), skills: true, sessions: false))
+    }
+
+    @Test func aDirectoryWithNothingSetLeavesTheFile() {
+        let directory = URL(fileURLWithPath: "/p")
+        var store = AgentConfigStore()
+        store.updateSettings(for: directory) { $0.skills = false }
+        #expect(store.settings.count == 1)
+
+        store.updateSettings(for: directory) { $0.skills = nil }
+
+        #expect(store.settings.isEmpty)
     }
 }

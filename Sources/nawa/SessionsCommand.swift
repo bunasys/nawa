@@ -230,7 +230,7 @@ enum SessionsError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .recordingOff: return "sessions aren't recorded: NAWA_SESSIONS is off"
+        case .recordingOff: return "sessions aren't recorded: the sessions setting is off"
         case .missingID: return "which session? nawa sessions list shows their ids"
         case .unknown(let id): return "no recorded session \(id)"
         case .badAge(let text): return "prune needs --older-than <age> like 30d, 12h or 2w\(text.map { ", not \($0)" } ?? "")"

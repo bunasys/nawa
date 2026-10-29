@@ -25,6 +25,9 @@ import Foundation
 ///         { "name": "localhost", "baseURL": "http://localhost:11434/v1", "model": "llama3.2" }
 ///       ]
 ///     }
+///   },
+///   "settings": {
+///     "/Users/me/projects/app": { "compact_at": 600000, "helper_model": "gpt-4o-mini", "skills": true }
 ///   }
 /// }
 /// ```
@@ -34,10 +37,32 @@ public struct AgentConfigStore: Codable, Sendable, Equatable {
     public var version: Int
     /// Keyed by the standardized absolute path of the directory.
     public var directories: [String: GatewayConfig]
+    /// `nawa config set` values, keyed like `directories`.
+    ///
+    /// Added without a version bump: older builds ignore the field. They
+    /// would drop it if they saved the file (`nawa config add/use/remove`),
+    /// which is better than a bump that would stop them reading their
+    /// providers at all.
+    public var settings: [String: DirectorySettings]
 
-    public init(version: Int = AgentConfigStore.currentVersion, directories: [String: GatewayConfig] = [:]) {
+    public init(
+        version: Int = AgentConfigStore.currentVersion,
+        directories: [String: GatewayConfig] = [:],
+        settings: [String: DirectorySettings] = [:]
+    ) {
         self.version = version
         self.directories = directories
+        self.settings = settings
+    }
+
+    private enum CodingKeys: String, CodingKey { case version, directories, settings }
+
+    /// Files written before settings existed have no `settings` field.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        directories = try container.decode([String: GatewayConfig].self, forKey: .directories)
+        settings = try container.decodeIfPresent([String: DirectorySettings].self, forKey: .settings) ?? [:]
     }
 
     // MARK: Location
@@ -102,6 +127,20 @@ public struct AgentConfigStore: Codable, Sendable, Equatable {
 
     // MARK: Per-directory access
 
+    /// The settings saved for `directory` (none set when nothing was saved).
+    public func settings(for directory: URL) -> DirectorySettings {
+        settings[Self.key(for: directory)] ?? DirectorySettings()
+    }
+
+    /// Change `directory`'s settings in place; a directory left with
+    /// nothing set is removed from the file.
+    public mutating func updateSettings(for directory: URL, _ change: (inout DirectorySettings) -> Void) {
+        let key = Self.key(for: directory)
+        var values = settings[key] ?? DirectorySettings()
+        change(&values)
+        settings[key] = values == DirectorySettings() ? nil : values
+    }
+
     /// The gateway configuration for `directory`, if any has been saved.
     public func gatewayConfig(for directory: URL) -> GatewayConfig? {
         directories[Self.key(for: directory)]
@@ -145,6 +184,83 @@ public struct AgentConfigStore: Codable, Sendable, Equatable {
             config.activeProvider = config.providers.first?.name
         }
         directories[key] = config.providers.isEmpty ? nil : config
+    }
+}
+
+/// What `nawa config set` saves for one directory: the agent loop's
+/// settings (`LoopSettings`, the contract other programs use too) and the
+/// CLI's own. Nil means "not set": the default, or the environment, decides.
+///
+/// In the file, the loop's fields sit next to the CLI's, not nested:
+/// `{ "compact_at": 600000, "skills": false }`.
+public struct DirectorySettings: Codable, Sendable, Equatable {
+    public var loop: LoopSettings
+    /// Offer skills to the model.
+    public var skills: Bool?
+    /// Include the project's skills, not only the user's.
+    public var projectSkills: Bool?
+    /// Record sessions as journals.
+    public var sessions: Bool?
+    /// Where journals go.
+    public var sessionsDirectory: String?
+    /// `serve`: unload a session idle this long.
+    public var sessionIdleMinutes: Double?
+
+    public init(
+        loop: LoopSettings = LoopSettings(),
+        skills: Bool? = nil,
+        projectSkills: Bool? = nil,
+        sessions: Bool? = nil,
+        sessionsDirectory: String? = nil,
+        sessionIdleMinutes: Double? = nil
+    ) {
+        self.loop = loop
+        self.skills = skills
+        self.projectSkills = projectSkills
+        self.sessions = sessions
+        self.sessionsDirectory = sessionsDirectory
+        self.sessionIdleMinutes = sessionIdleMinutes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case skills
+        case projectSkills = "project_skills"
+        case sessions
+        case sessionsDirectory = "sessions_dir"
+        case sessionIdleMinutes = "session_idle_minutes"
+    }
+
+    // The loop's fields are read from and written to the same JSON object.
+    public init(from decoder: any Decoder) throws {
+        loop = try LoopSettings(from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        skills = try container.decodeIfPresent(Bool.self, forKey: .skills)
+        projectSkills = try container.decodeIfPresent(Bool.self, forKey: .projectSkills)
+        sessions = try container.decodeIfPresent(Bool.self, forKey: .sessions)
+        sessionsDirectory = try container.decodeIfPresent(String.self, forKey: .sessionsDirectory)
+        sessionIdleMinutes = try container.decodeIfPresent(Double.self, forKey: .sessionIdleMinutes)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        try loop.encode(to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(skills, forKey: .skills)
+        try container.encodeIfPresent(projectSkills, forKey: .projectSkills)
+        try container.encodeIfPresent(sessions, forKey: .sessions)
+        try container.encodeIfPresent(sessionsDirectory, forKey: .sessionsDirectory)
+        try container.encodeIfPresent(sessionIdleMinutes, forKey: .sessionIdleMinutes)
+    }
+
+    /// These settings with every field `other` sets replacing this one's.
+    public func overlaid(by other: DirectorySettings) -> DirectorySettings {
+        DirectorySettings(
+            loop: loop.overlaid(by: other.loop),
+            skills: other.skills ?? skills,
+            projectSkills: other.projectSkills ?? projectSkills,
+            sessions: other.sessions ?? sessions,
+            sessionsDirectory: other.sessionsDirectory ?? sessionsDirectory,
+            sessionIdleMinutes: other.sessionIdleMinutes ?? sessionIdleMinutes
+        )
     }
 }
 

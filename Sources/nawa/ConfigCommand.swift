@@ -9,6 +9,9 @@ import Foundation
 /// nawa config list         # show the providers configured for this directory
 /// nawa config use <name>   # switch the active provider for this directory
 /// nawa config remove <name>
+/// nawa config settings     # list this directory's settings (also /config in the repl)
+/// nawa config set <key> <value>
+/// nawa config unset <key>
 /// ```
 enum ConfigCommand {
     static func run(arguments: [String]) async throws {
@@ -33,17 +36,21 @@ enum ConfigCommand {
             try store.removeProvider(named: arguments[1], for: directory)
             try store.save(to: location)
             print("Removed provider \"\(arguments[1])\" from \(directory.path).")
+        case "settings", "set", "unset":
+            for line in Settings.command(arguments, directory: directory, location: location) { print(line) }
         default:
             usage()
         }
     }
 
     static func usage() {
-        print("Usage: nawa config [add|list|use <name>|remove <name>]")
+        print("Usage: nawa config [add|list|use <name>|remove <name>|settings|set <key> <value>|unset <key>]")
         print("  add            — (default) interactively add a provider for the current directory")
         print("  list           — show the providers configured for the current directory")
         print("  use <name>     — make <name> the active provider for the current directory")
         print("  remove <name>  — delete <name> from the current directory's configuration")
+        print("  settings       — list the current directory's settings (in the repl: /config)")
+        print("  set <key> <value> / unset <key> — change one; saved for the current directory")
     }
 
     // MARK: add
@@ -227,19 +234,23 @@ enum ConfigCommand {
 
     // MARK: list
 
+    /// The directory's providers, then its settings.
     static func list(_ store: AgentConfigStore, directory: URL, location: URL) {
-        guard let config = store.gatewayConfig(for: directory), !config.providers.isEmpty else {
+        if let config = store.gatewayConfig(for: directory), !config.providers.isEmpty {
+            print("Providers for \(directory.path) (\(location.path)):")
+            for provider in config.providers {
+                let marker = provider.name == config.activeProvider ? "*" : " "
+                var key = provider.apiKey.map { $0.hasPrefix("env:") ? $0 : "(stored)" } ?? "(none)"
+                if provider.apiKey == nil, provider.workloadIdentity != nil { key = "(workload identity)" }
+                let api = (provider.api ?? .openAI).rawValue
+                print("  \(marker) \(provider.name)  \(api)  \(provider.baseURL.absoluteString)  model=\(provider.model ?? "auto")  key=\(key)")
+            }
+        } else {
             print("No providers configured for \(directory.path). Run `nawa config` to add one.")
-            return
         }
-        print("Providers for \(directory.path) (\(location.path)):")
-        for provider in config.providers {
-            let marker = provider.name == config.activeProvider ? "*" : " "
-            var key = provider.apiKey.map { $0.hasPrefix("env:") ? $0 : "(stored)" } ?? "(none)"
-            if provider.apiKey == nil, provider.workloadIdentity != nil { key = "(workload identity)" }
-            let api = (provider.api ?? .openAI).rawValue
-            print("  \(marker) \(provider.name)  \(api)  \(provider.baseURL.absoluteString)  model=\(provider.model ?? "auto")  key=\(key)")
-        }
+        print()
+        let environment = ProcessInfo.processInfo.environment
+        for line in Settings.report(store: store, directory: directory, location: location, environment: environment) { print(line) }
     }
 }
 

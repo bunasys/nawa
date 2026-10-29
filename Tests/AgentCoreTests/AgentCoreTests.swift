@@ -71,3 +71,28 @@ struct AgentCoreTests {
         #expect(registry.definitions.count == 1)
     }
 }
+
+/// `LoopSettings` is a published contract: other programs send it as JSON.
+@Suite struct LoopSettingsContractTests {
+    @Test func keysAreTheDocumentedSnakeCaseNames() throws {
+        let json = """
+        {"compact_at": 600000, "helper_model": "small", "price": {"input_per_million": 3, "output_per_million": 15},
+         "helper_price": {"input_per_million": 0.25, "output_per_million": 2}, "max_budget_usd": 2,
+         "fallback_model": "other", "stream": false}
+        """
+
+        let settings = try JSONDecoder().decode(LoopSettings.self, from: Data(json.utf8))
+
+        #expect(settings == LoopSettings(
+            compactAt: 600_000,
+            helperModel: "small",
+            price: TokenPrice(inputPerMillion: 3, outputPerMillion: 15),
+            helperPrice: TokenPrice(inputPerMillion: 0.25, outputPerMillion: 2),
+            maxBudgetUSD: 2,
+            fallbackModel: "other",
+            stream: false
+        ))
+        #expect(try JSONDecoder().decode(LoopSettings.self, from: Data("{}".utf8)) == LoopSettings())
+        #expect(String(decoding: try JSONEncoder().encode(LoopSettings()), as: UTF8.self) == "{}")
+    }
+}

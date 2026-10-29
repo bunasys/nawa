@@ -13,8 +13,8 @@ import Foundation
 // MARK: - A simple session factory that composes the whole harness
 
 /// The default `ACPSessionFactory`: composes the gateway, built-in tools, any
-/// MCP servers requested by the client, and the project's AGENTS.md
-/// instructions into a ready-to-run `AgentLoop`, recorded in a journal in
+/// MCP servers requested by the client, and the system prompt (Nawa's
+/// default, SOUL.md, AGENTS.md and skills) into a ready-to-run `AgentLoop`, recorded in a journal in
 /// `sessions` so `session/load` can bring it back.
 ///
 /// The gateway and the built-in tools are made per session from the
@@ -22,7 +22,13 @@ import Foundation
 /// directory and one ACP process may serve sessions in several projects.
 public struct HarnessSessionFactory: ACPSessionFactory {
     public let gatewayForDirectory: @Sendable (URL) throws -> any LanguageModel
-    public let loopOptions: LoopOptions
+    /// The settings a session in a directory runs with: its saved settings
+    /// and the environment (`Settings.resolved`). They decide the system
+    /// prompt (skills) and, unless `loopOptions` was given, the loop options.
+    public let settingsForDirectory: @Sendable (URL) -> DirectorySettings
+    /// Fixed loop options for every session; nil builds them per directory
+    /// from `settingsForDirectory`.
+    public let loopOptions: LoopOptions?
     /// Where journals go; nil records nothing and can't restore.
     public let sessions: SessionStore?
     /// `acp` or `serve`, for the journal.
@@ -34,24 +40,26 @@ public struct HarnessSessionFactory: ACPSessionFactory {
 
     public init(
         gatewayForDirectory: @escaping @Sendable (URL) throws -> any LanguageModel,
-        loopOptions: LoopOptions = .init(),
+        loopOptions: LoopOptions? = nil,
+        settingsForDirectory: @escaping @Sendable (URL) -> DirectorySettings = { _ in DirectorySettings() },
         sessions: SessionStore? = nil,
         mode: String = "acp"
     ) {
         self.gatewayForDirectory = gatewayForDirectory
         self.loopOptions = loopOptions
+        self.settingsForDirectory = settingsForDirectory
         self.sessions = sessions
         self.mode = mode
     }
 
     public func makeLoop(sessionID: String, cwd: String, mcpServers: [MCPServerConfig]) async throws -> AgentLoop {
-        let (gateway, tools, systemPrompt) = try await parts(cwd: cwd, mcpServers: mcpServers)
+        let (gateway, tools, systemPrompt, options) = try await parts(cwd: cwd, mcpServers: mcpServers)
         let journal = sessions.map { AgentCLI.journal(at: $0.newJournalURL(sessionID: sessionID), mode: mode) }
         return AgentLoop(
             gateway: gateway,
             tools: tools,
             systemPrompt: systemPrompt,
-            options: loopOptions,
+            options: options,
             cwd: cwd,
             sessionID: sessionID,
             journal: journal
@@ -65,21 +73,23 @@ public struct HarnessSessionFactory: ACPSessionFactory {
               let state = JournalReader.read(url).replay(),
               state.sessionID == sessionID
         else { return nil }
-        let (gateway, tools, systemPrompt) = try await parts(cwd: state.cwd, mcpServers: mcpServers)
+        let (gateway, tools, systemPrompt, options) = try await parts(cwd: state.cwd, mcpServers: mcpServers)
         return AgentLoop(
             restoring: state,
             gateway: gateway,
             tools: tools,
             systemPrompt: systemPrompt,
-            options: loopOptions,
+            options: options,
             journal: AgentCLI.journal(at: url, mode: mode)
         )
     }
 
     /// What a session in `cwd` runs with: its directory's gateway, the
-    /// built-in and MCP tools, and its AGENTS.md.
-    private func parts(cwd: String, mcpServers: [MCPServerConfig]) async throws -> (any LanguageModel, ToolRegistry, String?) {
+    /// built-in and MCP tools, its system prompt (see `SystemPrompt`), and
+    /// its loop options.
+    private func parts(cwd: String, mcpServers: [MCPServerConfig]) async throws -> (any LanguageModel, ToolRegistry, String?, LoopOptions) {
         let directory = URL(fileURLWithPath: cwd)
+        let settings = settingsForDirectory(directory)
         let gateway = try gatewayForDirectory(directory)
         var tools = ToolRegistry(AgentCLI.builtInTools(workingDirectory: directory))
 
@@ -105,9 +115,10 @@ public struct HarnessSessionFactory: ACPSessionFactory {
             tools.register(contentsOf: mcpTools)
         }
 
-        // Load AGENTS.md from the session's working directory.
-        let instructions = try? ProjectInstructions.load(from: directory)
-        return (gateway, tools, instructions?.text)
+        // The default prompt, SOUL.md, AGENTS.md and skills for the session's directory.
+        let prompt = AgentCLI.systemPrompt(for: directory, settings: settings)
+        tools.register(contentsOf: prompt.tools)
+        return (gateway, tools, prompt.text, loopOptions ?? AgentCLI.defaultLoopOptions(settings: settings.loop))
     }
 }
 
@@ -149,13 +160,18 @@ struct AgentCLI {
         let args = Array(CommandLine.arguments.dropFirst())
         let command = args.first ?? "serve"
 
-        let loopOptions = defaultLoopOptions()
-        // Every session is recorded unless NAWA_SESSIONS=off (proposal 0005).
-        let sessions = SessionStore.fromEnvironment()
+        // Process-wide settings (session recording) come from the directory
+        // nawa starts in; each session's own from its directory.
+        let startSettings = Settings.resolved(for: WorkingDirectory.defaultURL)
+        if let problem = Settings.problem(with: startSettings) {
+            FileHandle.standardError.write(Data("nawa: \(problem)\n".utf8))
+        }
+        // Every session is recorded unless the `sessions` setting is off (proposal 0005).
+        let sessions = sessionStore(startSettings)
         func sessionFactory(mode: String) -> HarnessSessionFactory {
             HarnessSessionFactory(
                 gatewayForDirectory: { directory in try resolveGateway(directory: directory) },
-                loopOptions: loopOptions,
+                settingsForDirectory: { directory in Settings.resolved(for: directory) },
                 sessions: sessions,
                 mode: mode
             )
@@ -176,7 +192,7 @@ struct AgentCLI {
         case "serve":
             let configuration = ACPServerConfiguration(
                 capabilities: capabilities,
-                idleSessionTimeout: sessions == nil ? nil : idleSessionTimeout()
+                idleSessionTimeout: sessions == nil ? nil : idleSessionTimeout(minutes: startSettings.sessionIdleMinutes)
             )
             let server = ACPServer(configuration: configuration, factory: sessionFactory(mode: "serve"))
             let app = server.buildApplication()
@@ -193,19 +209,29 @@ struct AgentCLI {
             // A resumed session runs where it was recorded, with that directory's provider.
             let directory = resume.map { URL(fileURLWithPath: $0.state.cwd) } ?? WorkingDirectory.defaultURL
             let gateway = try resolveGateway(directory: directory)
-            try await repl(gateway: gateway, options: loopOptions, mode: plain ? .plain : .auto, directory: directory, sessions: sessions, resume: resume)
+            try await repl(gateway: gateway, mode: plain ? .plain : .auto, directory: directory, sessions: sessions, resume: resume)
         case "config":
             try await ConfigCommand.run(arguments: Array(args.dropFirst()))
         case "sessions":
             try SessionsCommand.run(arguments: Array(args.dropFirst()), sessions: sessions)
+        case "prompt":
+            // What a session started here would tell the model, to check
+            // SOUL.md, AGENTS.md and skills without starting one.
+            let directory = args.count > 1 ? URL(fileURLWithPath: args[1]) : WorkingDirectory.defaultURL
+            let prompt = systemPrompt(for: directory, settings: Settings.resolved(for: directory))
+            print(SystemPrompt.composed(prompt.text))
+            let extraTools = prompt.tools.map(\.definition.name).joined(separator: ", ")
+            let summary = "\(SystemPrompt.composed(prompt.text).count) chars, \(prompt.skills.skills.count) skills" + (extraTools.isEmpty ? "" : ", adds \(extraTools)")
+            FileHandle.standardError.write(Data("\n[\(summary)]\n".utf8))
         default:
-            print("Usage: nawa [serve|acp|repl|config|provider list]")
+            print("Usage: nawa [serve|acp|repl|config|sessions|prompt|provider list]")
             print("  serve  — start the ACP server (streamable HTTP + WebSocket) on :7878")
             print("  acp    — speak ACP over stdio (for editors and Waku that launch the agent)")
             print("  repl [--plain] [--resume [id]] — chat with the agent in the terminal (--plain: line mode;")
             print("         --resume: go on with a recorded session, by default this directory's newest; /help inside lists commands)")
-            print("  sessions list|show|path|prune — the recorded sessions (NAWA_SESSIONS=off turns recording off)")
-            print("  config — configure a provider (OpenAI-compatible or Anthropic) for the current directory")
+            print("  sessions list|show|path|prune — the recorded sessions (nawa config set sessions off turns recording off)")
+            print("  prompt [dir] — print the system prompt a session in this directory would get")
+            print("  config [settings|set|unset] — configure providers (OpenAI-compatible or Anthropic) and settings for the current directory")
             print("  provider list [--json] — list the active provider's models")
         }
     }
@@ -222,14 +248,31 @@ struct AgentCLI {
 
     /// How long a `serve` session may sit without a prompt before it is
     /// unloaded: `NAWA_SESSION_IDLE_MINUTES`, 30 by default.
-    static func idleSessionTimeout(env: [String: String] = ProcessInfo.processInfo.environment) -> Duration {
-        let defaultMinutes = 30.0
-        guard let text = env["NAWA_SESSION_IDLE_MINUTES"] else { return .seconds(defaultMinutes * 60) }
-        guard let minutes = Double(text), minutes > 0 else {
-            FileHandle.standardError.write(Data("nawa: ignoring NAWA_SESSION_IDLE_MINUTES=\(text); expected a positive number\n".utf8))
-            return .seconds(defaultMinutes * 60)
+    static func idleSessionTimeout(minutes: Double?) -> Duration {
+        .seconds((minutes ?? 30) * 60)
+    }
+
+    /// Where sessions are recorded: nil when the `sessions` setting is off,
+    /// else `sessions_dir`, else the default (`SessionStore.fromEnvironment`
+    /// without the variables the settings already read).
+    static func sessionStore(_ settings: DirectorySettings, environment: [String: String] = ProcessInfo.processInfo.environment) -> SessionStore? {
+        if settings.sessions == false { return nil }
+        if let directory = settings.sessionsDirectory {
+            return SessionStore(directory: URL(fileURLWithPath: directory))
         }
-        return .seconds(minutes * 60)
+        var defaultsOnly = environment
+        defaultsOnly["NAWA_SESSIONS"] = nil
+        defaultsOnly["NAWA_SESSIONS_DIR"] = nil
+        return SessionStore.fromEnvironment(defaultsOnly)
+    }
+
+    /// The system prompt for a session in `directory`, with its skills settings.
+    static func systemPrompt(for directory: URL, settings: DirectorySettings) -> SystemPrompt {
+        SystemPrompt.load(
+            for: directory,
+            skills: settings.skills ?? true,
+            projectSkills: settings.projectSkills ?? true
+        )
     }
 
     /// The session `repl --resume [id]` goes on with: the one named (from
@@ -268,48 +311,19 @@ struct AgentCLI {
         ]
     }
 
-    /// Token-saving defaults for interactive sessions. `NAWA_HELPER_MODEL`
-    /// names a cheaper model for sub-agents and summaries; it must be served
-    /// by the same provider as the main model. `NAWA_PRICE` and
-    /// `NAWA_HELPER_PRICE` (`"input,output"` USD per million tokens) turn on
-    /// cost estimates. `NAWA_MAX_BUDGET_USD` stops a prompt once the session's
-    /// estimated cost reaches it, so it needs `NAWA_PRICE`. Replies stream
-    /// (progress while the model thinks) unless `NAWA_STREAM=0`.
-    /// `NAWA_FALLBACK_MODEL` names the model to retry on when the session's
-    /// model declines a prompt (same provider).
-    static func defaultLoopOptions(env: [String: String] = ProcessInfo.processInfo.environment) -> LoopOptions {
-        LoopOptions(
-            maxBudgetUSD: maxBudget(env),
-            pricing: pricing(env, "NAWA_PRICE"),
+    /// Token-saving defaults for `repl`, `acp` and `serve`, with `settings`
+    /// (the `nawa config set` ones, `LoopSettings`) applied over them.
+    static func defaultLoopOptions(settings: LoopSettings = LoopSettings()) -> LoopOptions {
+        let defaults = LoopOptions(
             keepToolResults: 20,
+            // ~60K tokens of tool output; clearing goes back to half of it.
+            keepToolResultChars: 240_000,
+            // 120K: past it, on most models every request costs more than a
+            // summary saves. `compact_at` gives large-window models more room.
             compaction: Compaction(atContextTokens: 120_000, keepRecentMessages: 20),
-            subAgents: true,
-            helperModel: env["NAWA_HELPER_MODEL"],
-            helperPricing: pricing(env, "NAWA_HELPER_PRICE"),
-            streamReplies: env["NAWA_STREAM"] != "0",
-            fallbackModel: env["NAWA_FALLBACK_MODEL"]
+            subAgents: true
         )
-    }
-
-    private static func maxBudget(_ env: [String: String]) -> Double? {
-        guard let text = env["NAWA_MAX_BUDGET_USD"] else { return nil }
-        guard let budget = Double(text), budget > 0 else {
-            FileHandle.standardError.write(Data("nawa: ignoring NAWA_MAX_BUDGET_USD=\(text); expected a positive number of USD\n".utf8))
-            return nil
-        }
-        if env["NAWA_PRICE"] == nil {
-            FileHandle.standardError.write(Data("nawa: NAWA_MAX_BUDGET_USD has no effect without NAWA_PRICE\n".utf8))
-        }
-        return budget
-    }
-
-    private static func pricing(_ env: [String: String], _ name: String) -> Pricing? {
-        guard let text = env[name] else { return nil }
-        guard let pricing = Pricing(perMillionTokens: text) else {
-            FileHandle.standardError.write(Data("nawa: ignoring \(name)=\(text); expected \"input,output\" USD per million tokens\n".utf8))
-            return nil
-        }
-        return pricing
+        return defaults.applying(settings)
     }
 
     /// Build the gateway for this run. Precedence:
@@ -362,9 +376,11 @@ struct AgentCLI {
         return Gateway(providers: [provider], activeProviderName: "default")
     }
 
+    /// The chat in the terminal. Settings come from `directory`'s saved
+    /// settings plus the environment (`Settings.resolved`), read again
+    /// for every new conversation; `/config` changes them while it runs.
     static func repl(
         gateway: Gateway,
-        options: LoopOptions,
         mode: ChatApp.Mode = .auto,
         directory: URL = WorkingDirectory.defaultURL,
         sessions: SessionStore? = nil,
@@ -372,30 +388,46 @@ struct AgentCLI {
     ) async throws {
         // Everything runs in `directory`: a resumed session's, which can
         // differ from where `nawa repl` was started.
-        let instructions = try? ProjectInstructions.load(from: directory)
-        let tools = ToolRegistry(builtInTools(workingDirectory: directory))
+        struct Conversation {
+            var options: LoopOptions
+            var prompt: SystemPrompt
+            var tools: ToolRegistry
+        }
+        // What a new conversation starts with. Read again on `/clear`, so
+        // settings that change the system prompt (skills) apply then.
+        @Sendable func conversationSettings() -> Conversation {
+            let settings = Settings.resolved(for: directory)
+            let prompt = systemPrompt(for: directory, settings: settings)
+            return Conversation(
+                options: defaultLoopOptions(settings: settings.loop),
+                prompt: prompt,
+                tools: ToolRegistry(builtInTools(workingDirectory: directory) + prompt.tools)
+            )
+        }
         // No turn cap, like Claude Code: the loop check (LoopOptions.loopCheckAfterTurns)
-        // stops a stuck run, and NAWA_MAX_BUDGET_USD caps the spend.
+        // stops a stuck run, and max_budget_usd caps the spend.
         @Sendable func makeLoop() -> AgentLoop {
             let sessionID = UUID().uuidString
+            let conversation = conversationSettings()
             return AgentLoop(
                 gateway: gateway,
-                tools: tools,
-                systemPrompt: instructions?.text,
-                options: options,
+                tools: conversation.tools,
+                systemPrompt: conversation.prompt.text,
+                options: conversation.options,
                 cwd: directory.path,
                 sessionID: sessionID,
                 journal: sessions.map { journal(at: $0.newJournalURL(sessionID: sessionID), mode: "repl") }
             )
         }
+        let start = conversationSettings()
         let firstLoop: AgentLoop
         if let resume {
             firstLoop = AgentLoop(
                 restoring: resume.state,
                 gateway: gateway,
-                tools: tools,
-                systemPrompt: instructions?.text,
-                options: options,
+                tools: start.tools,
+                systemPrompt: start.prompt.text,
+                options: start.options,
                 journal: journal(at: resume.url, mode: "repl")
             )
         } else {
@@ -408,16 +440,24 @@ struct AgentCLI {
                 provider: gateway.activeProvider?.name,
                 model: gateway.activeProvider?.model,
                 directory: displayPath(directory),
-                hasInstructions: instructions != nil
+                instructionsFile: start.prompt.instructions?.nearest.lastPathComponent,
+                skillCount: start.prompt.skills.skills.count
             ),
-            contextLimit: options.compaction?.atContextTokens,
             tools: loop.withLock { $0.toolDefinitions.map(\.name) },
             history: resume?.state.messages ?? [],
             send: { prompt in loop.withLock { $0 }.run(prompt: prompt, continuing: true) },
             reset: { loop.withLock { $0 = makeLoop() } },
-            removeDeclinedRequest: { loop.withLock { $0 }.removeDeclinedRequest() }
+            removeDeclinedRequest: { loop.withLock { $0 }.removeDeclinedRequest() },
+            liveContextLimit: { loop.withLock { $0 }.options.compaction?.atContextTokens },
+            configure: { arguments in
+                let lines = Settings.command(arguments, directory: directory, inSession: true)
+                // Apply what takes effect now to the running conversation.
+                let options = defaultLoopOptions(settings: Settings.resolved(for: directory).loop)
+                loop.withLock { $0 }.options = options
+                return lines
+            }
         )
-        try await ChatApp.run(session, mode: mode, maxTurns: options.maxTurns)
+        try await ChatApp.run(session, mode: mode, maxTurns: start.options.maxTurns)
     }
 
     /// `~/src/nawa` for a directory under the home directory.
@@ -444,7 +484,7 @@ enum CLIError: Error, LocalizedError {
         case .invalidGatewayURL(let value):
             return "NAWA_GATEWAY_URL=\(value) is not an absolute URL"
         case .resumeWithoutSessions:
-            return "--resume needs recorded sessions, but NAWA_SESSIONS is off"
+            return "--resume needs recorded sessions, but the sessions setting is off"
         case .noSessionToResume(let id?):
             return "no recorded session \(id) (nawa sessions list --all shows them)"
         case .noSessionToResume(nil):
