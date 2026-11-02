@@ -4,7 +4,7 @@ description: >
   only Nawa's own code instead of all ~30 dependency packages.
 inputs:
   platform:
-    description: macos, linux or linux-glibc (a different glibc base, so a different key). Release jobs use the same value as CI so they restore what CI saved on main.
+    description: macos or linux. Release jobs use the same value as CI so they restore what CI saved on main.
     required: true
 runs:
   using: composite
