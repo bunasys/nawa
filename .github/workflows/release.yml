@@ -1,6 +1,7 @@
 # Push a tag `vX.Y.Z` on main to publish a release: on each platform the
-# tests run, then the macOS arm64 and static Linux amd64 binaries are
-# built, checked and attached to the GitHub release `vX.Y.Z` (created with generated notes,
+# tests run, then the macOS arm64 binary and two Linux amd64 binaries (static
+# musl, and glibc dynamically linked) are built, checked and attached to the
+# GitHub release `vX.Y.Z` (created with generated notes,
 # or added to if it already exists). The tag is the version: it is written
 # into Sources/AgentACP/Version.swift before the build, and the check step
 # makes sure `nawa --version` prints it.
@@ -121,9 +122,68 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The glibc build: same compiler and sources as the job above, so the
+  # tests there cover it. Built on Ubuntu 22.04 (glibc 2.35) on purpose —
+  # the binary needs no newer glibc than the image it is built in, and
+  # building in swift:6.4.1 (Ubuntu 26.04, glibc 2.43) would limit it to the
+  # newest distributions. The Swift runtime is static, so the only shared
+  # libraries are the system's own: libc and libcurl.
+  linux-glibc:
+    name: Build Linux (amd64, glibc)
+    runs-on: ubuntu-latest
+    container: swift:6.4.1-jammy
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Stamp the version
+        if: github.ref_type == 'tag'
+        run: echo "let nawaVersion = \"${GITHUB_REF_NAME#v}\"" > Sources/AgentACP/Version.swift
+      # Not needed to pass: a cache miss only means compiling dependencies.
+      # Its own key: these objects are built against an older glibc than the
+      # static job's, so they must not be mixed with them.
+      - uses: ./.github/actions/swift-build-cache
+        with:
+          platform: linux-glibc
+      - name: Build
+        run: |
+          swift build -c release --product nawa --static-swift-stdlib
+          bin="$(swift build -c release --product nawa --static-swift-stdlib --show-bin-path)/nawa"
+          mkdir -p stage
+          strip -o stage/nawa "$bin"
+      - name: Check
+        run: |
+          bin=stage/nawa
+          # Dynamically linked against glibc, not static and not musl.
+          ldd "$bin" | grep -q 'libc\.so\.6 =>' || { ldd "$bin"; exit 1; }
+          # Nothing newer than the build image's glibc, so it runs on 22.04+.
+          newest="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)"
+          if [ "$(printf '%s\n2.35\n' "$newest" | sort -V | tail -n 1)" != "2.35" ]; then
+            echo "::error::needs glibc $newest, newer than the 2.35 baseline"; exit 1
+          fi
+          echo "needs glibc $newest"
+          version="$("$bin" --version | sed 's/^nawa //')"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match nawa --version ($version)"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}'
+          test "$(printf '%s\n' "$init" | timeout 10 "$bin" acp | grep -c '"result"')" = 1
+      - name: Package
+        run: |
+          name="nawa-$VERSION-linux-amd64-glibc"
+          mkdir -p dist
+          cp README.md LICENSE stage/
+          tar czf "dist/$name.tar.gz" --owner 0 --group 0 -C stage nawa README.md LICENSE
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-amd64-glibc
+          path: dist/*
+          if-no-files-found: error
+
   publish:
     name: Publish the release
-    needs: [macos, linux]
+    needs: [macos, linux, linux-glibc]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -170,10 +230,11 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           gh release download "$GITHUB_REF_NAME" --pattern '*.sha256' --dir sums
           macos_sha="$(cut -d ' ' -f 1 "sums/nawa-$version-macos-arm64.tar.gz.sha256")"
-          linux_sha="$(cut -d ' ' -f 1 "sums/nawa-$version-linux-amd64.tar.gz.sha256")"
+          glibc_sha="$(cut -d ' ' -f 1 "sums/nawa-$version-linux-amd64-glibc.tar.gz.sha256")"
+          static_sha="$(cut -d ' ' -f 1 "sums/nawa-$version-linux-amd64.tar.gz.sha256")"
           git clone --depth 1 "https://x-access-token:$TAP_TOKEN@github.com/bunasys/homebrew-tap.git" tap
           mkdir -p tap/Formula
-          scripts/homebrew-formula.sh "$version" "$macos_sha" "$linux_sha" > tap/Formula/nawa.rb
+          scripts/homebrew-formula.sh "$version" "$macos_sha" "$glibc_sha" "$static_sha" > tap/Formula/nawa.rb
           cd tap
           git add Formula/nawa.rb
           if git diff --cached --quiet; then echo "The formula is already up to date"; exit 0; fi

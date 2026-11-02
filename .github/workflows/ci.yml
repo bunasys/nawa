@@ -43,3 +43,41 @@ jobs:
           platform: linux
       - run: swift build --build-tests
       - run: swift test --skip-build
+
+  # The glibc release binary, built and checked on every pull request so a
+  # dependency that needs a newer glibc fails here and not at release time.
+  # Ubuntu 22.04 on purpose: see "CI and releases" in AGENTS.md.
+  linux-glibc:
+    name: Linux (amd64, glibc)
+    runs-on: ubuntu-latest
+    container: swift:6.4.1-jammy
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: swift --version
+      - uses: ./.github/actions/swift-build-cache
+        with:
+          # Its own key: these objects are built against an older glibc than
+          # the other Linux job's, so they must not be mixed with them.
+          platform: linux-glibc
+      # No version stamp: this is not a release build.
+      - name: Build
+        run: |
+          swift build -c release --product nawa --static-swift-stdlib
+          bin="$(swift build -c release --product nawa --static-swift-stdlib --show-bin-path)/nawa"
+          mkdir -p stage
+          strip -o stage/nawa "$bin"
+      - name: Check
+        run: |
+          bin=stage/nawa
+          # Dynamically linked against glibc, not static and not musl.
+          ldd "$bin" | grep -q 'libc\.so\.6 =>' || { ldd "$bin"; exit 1; }
+          # Needs nothing newer than the build image's glibc (2.35).
+          newest="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)"
+          if [ "$(printf '%s\n2.35\n' "$newest" | sort -V | tail -n 1)" != "2.35" ]; then
+            echo "::error::$bin needs glibc $newest, newer than the 2.35 floor"; exit 1
+          fi
+          echo "Needs glibc $newest"
+          "$bin" --version
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}'
+          test "$(printf '%s\n' "$init" | timeout 10 "$bin" acp | grep -c '"result"')" = 1
