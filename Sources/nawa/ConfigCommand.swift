@@ -276,6 +276,11 @@ enum Prompt {
         let suffix = defaultValue.map { " [\($0)]" } ?? ""
         while true {
             print("\(label)\(suffix): ", terminator: "")
+            // stdout is fully buffered when it isn't a terminal (a pipe, or a
+            // Linux console via musl): without this the question sits in the
+            // buffer while the process waits for the answer. Nil flushes every
+            // stream, which avoids naming the `stdout` global.
+            fflush(nil)
             guard let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else {
                 print()
                 throw ConfigCommandError.inputClosed
