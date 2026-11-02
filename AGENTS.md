@@ -218,13 +218,28 @@ GitHub Actions (`.github/workflows/`):
   dependencies only when they or the compiler change.
 - `release.yml` publishes a release when a tag `vX.Y.Z` is pushed: on each
   platform it runs the same tests as `ci.yml`, then builds `nawa-X.Y.Z-macos-arm64.tar.gz` (ad-hoc signed, not
-  notarized) and `nawa-X.Y.Z-linux-amd64.tar.gz` (fully static, Swift Static
-  Linux SDK / musl), each with a `.sha256`, checks `--version` and an ACP
-  `initialize` on both, then creates the GitHub release with generated notes
+  notarized) and two Linux amd64 binaries, each with a `.sha256`, checks
+  `--version` and an ACP `initialize` on each, then creates the GitHub
+  release with generated notes
   (or adds the files to one that already exists, e.g. written by hand),
   then pushes the new formula to the Homebrew tap
   github.com/bunasys/homebrew-tap (`brew install bunasys/tap/nawa`).
-  The formula comes from `scripts/homebrew-formula.sh`; pushing it needs
+  The two Linux builds differ only in how they reach libc:
+  - `nawa-X.Y.Z-linux-amd64-glibc.tar.gz`: built in the
+    `swift:6.4.1-jammy` container (Ubuntu 22.04) with
+    `--static-swift-stdlib`, so the Swift runtime is inside but libc and
+    libcurl are the system's. Dynamically linked, the normal build for a
+    normal distribution. The base image is deliberately old: the binary
+    needs no newer glibc than the image it is built in (2.35, checked with
+    `objdump -T`), and building in the current `swift:6.4.1` (Ubuntu 26.04,
+    glibc 2.43) would shut out most distributions. Moving the base image
+    forward raises the floor, so don't without meaning to.
+  - `nawa-X.Y.Z-linux-amd64.tar.gz`: fully static, Swift Static Linux SDK /
+    musl, for everything else (Alpine, older glibc).
+  The formula installs the glibc build when the glibc is ≥ 2.35 (the
+  system's or the one Homebrew itself provides) and stages the static
+  tarball as a resource otherwise. The formula comes from
+  `scripts/homebrew-formula.sh`; pushing it needs
   the `HOMEBREW_TAP_TOKEN` secret (a fine-grained token with Contents
   read & write on the tap repo). Without it the job warns and skips.
   Run it by hand from the Actions tab for a dry run that publishes nothing.
@@ -242,6 +257,11 @@ to a newer Swift, change the `swift:` image in both workflows together with
 SDK's `.sig` against swift.org's keys before taking its checksum).
 `--static-swift-stdlib` alone is not enough: that binary still needs
 `libcurl` on the user's machine.
+
+`ci.yml` has a job per Linux flavour: the glibc one builds the release
+binary in `swift:6.4.1-jammy` and checks the glibc floor, so a dependency
+that starts asking for a newer glibc fails on the pull request, not at
+release time.
 
 ## Running
 

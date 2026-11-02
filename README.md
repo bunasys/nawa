@@ -100,12 +100,19 @@ Prebuilt binaries are on the
 | Platform | File | Needs |
 | --- | --- | --- |
 | macOS, Apple Silicon | `nawa-<version>-macos-arm64.tar.gz` | macOS 15 or later |
-| Linux, x86-64 | `nawa-<version>-linux-amd64.tar.gz` | nothing: fully static |
+| Linux, x86-64 | `nawa-<version>-linux-amd64-glibc.tar.gz` | glibc 2.35 or later, libcurl |
+| Linux, x86-64, any distribution | `nawa-<version>-linux-amd64.tar.gz` | nothing: fully static |
+
+Take the `-glibc` binary on a normal distribution (Ubuntu 22.04+, Debian 12+,
+Fedora, RHEL 9+…): it is the ordinary dynamically linked build, smaller and
+using the system's own libcurl and certificate store. The fully static one
+runs on anything, including Alpine/musl and systems whose glibc is older
+than 2.35, at the price of bundling all of that.
 
 ```sh
 version=X.Y.Z   # the release you downloaded
 shasum -a 256 -c "nawa-$version-macos-arm64.tar.gz.sha256"   # optional: check the download
-tar xzf "nawa-$version-macos-arm64.tar.gz"   # or …-linux-amd64.tar.gz
+tar xzf "nawa-$version-macos-arm64.tar.gz"   # or …-linux-amd64-glibc.tar.gz / …-linux-amd64.tar.gz
 sudo mv nawa /usr/local/bin/
 nawa --version
 ```
