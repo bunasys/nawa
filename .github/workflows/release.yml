@@ -146,15 +146,27 @@ jobs:
           platform: linux-glibc
       - name: Build
         run: |
-          swift build -c release --product nawa --static-swift-stdlib
-          bin="$(swift build -c release --product nawa --static-swift-stdlib --show-bin-path)/nawa"
+          # Keeps libstdc++/libgcc_s out of the binary (see the script).
+          sh scripts/static-cxx-runtime.sh .build/no-cxx-runtime
+          swift build -c release --product nawa --static-swift-stdlib \
+            -Xlinker -L.build/no-cxx-runtime
+          bin="$(swift build -c release --product nawa --static-swift-stdlib \
+            -Xlinker -L.build/no-cxx-runtime --show-bin-path)/nawa"
           mkdir -p stage
           strip -o stage/nawa "$bin"
       - name: Check
         run: |
           bin=stage/nawa
+          ldd "$bin"
           # Dynamically linked against glibc, not static and not musl.
-          ldd "$bin" | grep -q 'libc\.so\.6 =>' || { ldd "$bin"; exit 1; }
+          ldd "$bin" | grep -q 'libc\.so\.6 =>' || { echo "::error::not linked against glibc"; exit 1; }
+          # Only the C library, libm and libcurl. A C++ runtime here means
+          # the link picked up libstdc++ after all.
+          unexpected="$(objdump -p "$bin" | awk '/NEEDED/{print $2}' \
+            | grep -vE '^(libc|libm|libcurl)\.so|^ld-linux' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::needs libraries beyond glibc/libm/libcurl: $unexpected"; exit 1
+          fi
           # Nothing newer than the build image's glibc, so it runs on 22.04+.
           newest="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)"
           if [ "$(printf '%s\n2.35\n' "$newest" | sort -V | tail -n 1)" != "2.35" ]; then

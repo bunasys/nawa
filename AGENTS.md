@@ -234,6 +234,17 @@ GitHub Actions (`.github/workflows/`):
     `objdump -T`), and building in the current `swift:6.4.1` (Ubuntu 26.04,
     glibc 2.43) would shut out most distributions. Moving the base image
     forward raises the floor, so don't without meaning to.
+    It needs **only** libc, libm and libcurl. Getting there takes
+    `scripts/static-cxx-runtime.sh`: Swift's
+    `/usr/lib/swift_static/linux/static-stdlib-args.lnk` ends with
+    `-lstdc++`, because static Foundation bundles ICU (C++), so a plain
+    `--static-swift-stdlib` link silently requires `libstdc++.so.6` and
+    `libgcc_s.so.1` — libraries a minimal system may not have. The file is
+    appended after any flags we pass, so `-Bstatic` can't reach it; the
+    script instead writes linker scripts named `libstdc++.so` and
+    `libgcc_s.so` into a directory passed as `-Xlinker -L`, which resolve
+    to the static archives. Both workflows then fail the build if
+    `objdump -p` shows any NEEDED library outside libc/libm/libcurl.
   - `nawa-X.Y.Z-linux-amd64.tar.gz`: fully static, Swift Static Linux SDK /
     musl, for everything else (Alpine, older glibc).
   The formula installs the glibc build when the glibc is ≥ 2.35 (the
