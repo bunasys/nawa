@@ -162,6 +162,18 @@ struct OpenAIStreamChunk: Decodable {
 
 struct OpenAIStreamError: Decodable {
     let message: String?
+
+    private enum CodingKeys: String, CodingKey { case message }
+
+    /// Usually `{"message": …}`, but some servers send the error as a bare
+    /// string (`{"error": "overloaded"}`).
+    init(from decoder: any Decoder) throws {
+        if let text = try? decoder.singleValueContainer().decode(String.self) {
+            message = text
+            return
+        }
+        message = try decoder.container(keyedBy: CodingKeys.self).decodeIfPresent(String.self, forKey: .message)
+    }
 }
 
 struct OpenAIStreamChoice: Decodable {

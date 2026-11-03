@@ -44,8 +44,8 @@ public enum ContentBlock: Sendable, Hashable, Codable {
         return nil
     }
 
-    /// The trailing text, concatenated across any `.text` blocks that this value
-    /// covers — used when a caller wants a single flat string.
+    /// This block's text if it is a `.text` block, else nil. To join the
+    /// text of a whole message, use `Message.text`.
     public var text: String? {
         if case .text(let t) = self { return t }
         return nil

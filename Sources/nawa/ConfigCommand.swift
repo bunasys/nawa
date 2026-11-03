@@ -1,4 +1,5 @@
 import AgentGateway
+import AgentTUI
 import Foundation
 
 /// `nawa config` — interactively configure a provider (OpenAI-compatible or
@@ -17,45 +18,54 @@ enum ConfigCommand {
     static func run(arguments: [String]) async throws {
         let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let location = AgentConfigStore.defaultLocation()
-        var store = try AgentConfigStore.load(from: location)
 
         switch arguments.first {
         case nil, "add":
-            try await add(to: &store, directory: directory)
-            try store.save(to: location)
+            // The questions are asked without holding the store's lock (they
+            // can take minutes); only the final change is made under it.
+            let provider = try await askForProvider(existing: try AgentConfigStore.load(from: location), directory: directory)
+            try AgentConfigStore.modify(at: location) { store in
+                store.addProvider(provider, for: directory, activate: true)
+            }
             print("Saved to \(location.path)")
         case "list":
-            list(store, directory: directory, location: location)
+            list(try AgentConfigStore.load(from: location), directory: directory, location: location)
         case "use":
-            guard arguments.count > 1 else { return usage() }
-            try store.activateProvider(named: arguments[1], for: directory)
-            try store.save(to: location)
+            guard arguments.count > 1 else { throw UsageError("config use needs a provider name\n" + usage) }
+            try AgentConfigStore.modify(at: location) { store in
+                try store.activateProvider(named: arguments[1], for: directory)
+            }
             print("Active provider for \(directory.path) is now \"\(arguments[1])\".")
         case "remove":
-            guard arguments.count > 1 else { return usage() }
-            try store.removeProvider(named: arguments[1], for: directory)
-            try store.save(to: location)
+            guard arguments.count > 1 else { throw UsageError("config remove needs a provider name\n" + usage) }
+            try AgentConfigStore.modify(at: location) { store in
+                try store.removeProvider(named: arguments[1], for: directory)
+            }
             print("Removed provider \"\(arguments[1])\" from \(directory.path).")
         case "settings", "set", "unset":
-            for line in Settings.command(arguments, directory: directory, location: location) { print(line) }
+            for line in try Settings.command(arguments, directory: directory, location: location) { print(line) }
+        case "help", "--help", "-h":
+            print(usage)
         default:
-            usage()
+            throw UsageError("unknown config command \(arguments[0])\n" + usage)
         }
     }
 
-    static func usage() {
-        print("Usage: nawa config [add|list|use <name>|remove <name>|settings|set <key> <value>|unset <key>]")
-        print("  add            — (default) interactively add a provider for the current directory")
-        print("  list           — show the providers configured for the current directory")
-        print("  use <name>     — make <name> the active provider for the current directory")
-        print("  remove <name>  — delete <name> from the current directory's configuration")
-        print("  settings       — list the current directory's settings (in the repl: /config)")
-        print("  set <key> <value> / unset <key> — change one; saved for the current directory")
-    }
+    static let usage = """
+        Usage: nawa config [add|list|use <name>|remove <name>|settings|set <key> <value>|unset <key>]
+          add            — (default) interactively add a provider for the current directory
+          list           — show the providers configured for the current directory
+          use <name>     — make <name> the active provider for the current directory
+          remove <name>  — delete <name> from the current directory's configuration
+          settings       — list the current directory's settings (in the repl: /config)
+          set <key> <value> / unset <key> — change one; saved for the current directory
+        """
 
     // MARK: add
 
-    static func add(to store: inout AgentConfigStore, directory: URL) async throws {
+    /// Asks for one provider; `existing` is the store as it was before the
+    /// questions, for the names already taken.
+    static func askForProvider(existing store: AgentConfigStore, directory: URL) async throws -> ProviderConfig {
         let existing = store.gatewayConfig(for: directory)
         print("Configuring a provider for \(directory.path)")
         if let existing, !existing.providers.isEmpty {
@@ -98,7 +108,6 @@ enum ConfigCommand {
             name: name, api: api, baseURL: baseURL, apiKey: apiKey?.stored, model: model,
             workspaceID: workspaceID, workloadIdentity: workloadIdentity
         )
-        store.addProvider(provider, for: directory, activate: true)
 
         print()
         print("Provider \"\(name)\" (\(api.rawValue)) → \(baseURL.absoluteString), model \(model), now active for this directory.")
@@ -107,6 +116,7 @@ enum ConfigCommand {
         } else if apiKey == nil {
             print("No API key stored; the provider will be called unauthenticated.")
         }
+        return provider
     }
 
     static func promptAPI() throws -> ProviderAPI {
@@ -240,8 +250,7 @@ enum ConfigCommand {
             print("Providers for \(directory.path) (\(location.path)):")
             for provider in config.providers {
                 let marker = provider.name == config.activeProvider ? "*" : " "
-                var key = provider.apiKey.map { $0.hasPrefix("env:") ? $0 : "(stored)" } ?? "(none)"
-                if provider.apiKey == nil, provider.workloadIdentity != nil { key = "(workload identity)" }
+                let key = keyLabel(provider)
                 let api = (provider.api ?? .openAI).rawValue
                 print("  \(marker) \(provider.name)  \(api)  \(provider.baseURL.absoluteString)  model=\(provider.model ?? "auto")  key=\(key)")
             }
@@ -251,6 +260,15 @@ enum ConfigCommand {
         print()
         let environment = ProcessInfo.processInfo.environment
         for line in Settings.report(store: store, directory: directory, location: location, environment: environment) { print(line) }
+    }
+
+    /// How a provider authenticates, without showing a stored secret.
+    static func keyLabel(_ provider: ProviderConfig) -> String {
+        guard let apiKey = provider.apiKey else {
+            return provider.workloadIdentity == nil ? "(none)" : "(workload identity)"
+        }
+        let isReference = apiKey.hasPrefix("env:")
+        return isReference ? apiKey : "(stored)"
     }
 }
 
@@ -277,11 +295,10 @@ enum Prompt {
         while true {
             print("\(label)\(suffix): ", terminator: "")
             // The question has no trailing newline, so it sits in stdout's
-            // buffer: fully buffered on a pipe, and line-buffered on musl's
-            // tty console (which doesn't flush output before reading stdin).
-            // Linux console via musl): without this the question sits in the
-            // buffer while the process waits for the answer. Nil flushes every
-            // stream, which avoids naming the `stdout` global.
+            // buffer (fully buffered on a pipe; on a terminal, musl doesn't
+            // flush stdout before reading stdin) while the process waits for
+            // the answer. Nil flushes every stream, which avoids naming the
+            // `stdout` global.
             fflush(nil)
             guard let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) else {
                 print()
@@ -292,13 +309,12 @@ enum Prompt {
         }
     }
 
-    /// Ask for a secret; echo is disabled when stdin is a terminal.
+    /// Ask for a secret; echo is disabled when stdin is a terminal. Not
+    /// `getpass(3)`: macOS cuts its answer at 128 characters, shorter than
+    /// some API keys.
     static func secret(_ label: String) throws -> String {
-        guard isatty(STDIN_FILENO) != 0 else {
-            return try line(label, default: "")
-        }
-        guard let raw = getpass("\(label): ") else { throw ConfigCommandError.inputClosed }
-        return String(cString: raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw = Terminal.readHiddenLine(prompt: "\(label): ") else { throw ConfigCommandError.inputClosed }
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func confirm(_ label: String, default defaultValue: Bool) throws -> Bool {

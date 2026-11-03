@@ -1,3 +1,10 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 import AgentCore
 import Foundation
 
@@ -8,8 +15,12 @@ import Foundation
 /// the OS hadn't flushed. The file is synced to disk when a run finishes.
 ///
 /// A journal that can't write reports it once through `onFailure` and stops
-/// recording; the run goes on. One writer per file: two processes appending
-/// to the same journal would interleave their sequence numbers.
+/// recording; the run goes on.
+///
+/// One writer per file: an open journal holds an exclusive `flock` until it
+/// is closed or released, so a second process (or a second `JournalFile`)
+/// can't interleave its records. `init(continuing:)` takes the lock up front
+/// and throws `JournalFileError.inUse` when another writer has it.
 public final class JournalFile: SessionJournal, @unchecked Sendable {
     public let url: URL
     public let origin: JournalOrigin
@@ -29,6 +40,19 @@ public final class JournalFile: SessionJournal, @unchecked Sendable {
         self.url = url
         self.origin = origin
         self.onFailure = onFailure
+    }
+
+    /// Opens an existing session's journal to go on with it, taking its
+    /// lock now: resuming must fail before the session starts, not lose
+    /// records later.
+    ///
+    /// - Throws: `JournalFileError.inUse` when another writer holds the
+    ///   journal, or the error opening it.
+    public init(continuing url: URL, origin: JournalOrigin, onFailure: (@Sendable (String) -> Void)? = nil) throws {
+        self.url = url
+        self.origin = origin
+        self.onFailure = onFailure
+        handle = try openedHandle()
     }
 
     deinit {
@@ -54,7 +78,8 @@ public final class JournalFile: SessionJournal, @unchecked Sendable {
         }
     }
 
-    /// Flushes and closes the file. Later records reopen it.
+    /// Flushes and closes the file, releasing its lock. Later records
+    /// reopen it.
     public func close() {
         lock.lock()
         defer { lock.unlock() }
@@ -63,35 +88,112 @@ public final class JournalFile: SessionJournal, @unchecked Sendable {
         handle = nil
     }
 
+    /// Whether another writer holds the journal at `url` right now. A
+    /// missing file is not in use.
+    public static func isInUse(_ url: URL) -> Bool {
+        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { return false }
+        let probe = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? probe.close() }
+        // flock locks belong to the open file, so this probe conflicts with
+        // a writer in this process too, and closing it drops only its own.
+        return flock(descriptor, LOCK_EX | LOCK_NB) != 0
+    }
+
     private func openedHandle() throws -> FileHandle {
         if let handle { return handle }
-        let fileManager = FileManager.default
-        // Journals hold everything the model saw: readable by their owner only.
-        try fileManager.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        if fileManager.fileExists(atPath: url.path) {
-            nextSeq = (JournalReader.read(url).lines.last?.seq ?? 0) + 1
-        } else {
-            guard fileManager.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
-                throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: url.path])
-            }
+        try Self.prepareDirectory(url.deletingLastPathComponent())
+        // O_APPEND puts every write at the end even if the file grew under
+        // us; the mode on O_CREAT makes a new file private from its first byte.
+        let descriptor = open(url.path, O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            try? handle.close()
+            throw JournalFileError.inUse(url)
         }
-        let handle = try FileHandle(forUpdating: url)
         let end = try handle.seekToEnd()
+        nextSeq = try Self.lastSequenceNumber(in: handle, size: end) + 1
         // A crash can leave a cut-off last line. Start on a fresh line so
         // only that line is lost, not the first new record too.
         if end > 0 {
             try handle.seek(toOffset: end - 1)
             let lastByte = try handle.read(upToCount: 1)
-            try handle.seekToEnd()
             if lastByte != Data([UInt8(ascii: "\n")]) {
                 try handle.write(contentsOf: Data([UInt8(ascii: "\n")]))
             }
         }
         self.handle = handle
         return handle
+    }
+
+    /// The `seq` of the last line that decodes, read backwards in blocks:
+    /// reopening a long session must not decode the whole file.
+    static func lastSequenceNumber(in handle: FileHandle, size: UInt64) throws -> Int {
+        let blockSize: UInt64 = 64 * 1024
+        let newline = UInt8(ascii: "\n")
+        var blockEnd = size
+        // The start of the line the previous block began in the middle of.
+        var carried = Data()
+        while blockEnd > 0 {
+            let blockStart = blockEnd > blockSize ? blockEnd - blockSize : 0
+            try handle.seek(toOffset: blockStart)
+            let block = try handle.read(upToCount: Int(blockEnd - blockStart)) ?? Data()
+            let buffer = block + carried
+            var lines = buffer.split(separator: newline, omittingEmptySubsequences: false)
+            // Unless this block starts the file, its first line may begin in an earlier block.
+            let reachedStart = blockStart == 0
+            carried = reachedStart ? Data() : Data(lines.removeFirst())
+            for line in lines.reversed() where !line.isEmpty {
+                if let decoded = try? JournalFormat.decode(Data(line)) { return decoded.seq }
+            }
+            blockEnd = blockStart
+        }
+        return 0
+    }
+
+    /// Creates the journal's directory readable by its owner only. An
+    /// existing one of ours is tightened to 0700 too: `createDirectory`
+    /// sets the mode only on the folders it creates. Someone else's is
+    /// used as it is, with a warning.
+    static func prepareDirectory(_ directory: URL) throws {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        var info = stat()
+        guard stat(directory.path, &info) == 0 else { return }
+        let isOurs = info.st_uid == getuid()
+        guard isOurs else {
+            warnOnce(about: directory, "nawa: sessions directory \(directory.path) belongs to another user; journals there may be readable by others")
+            return
+        }
+        let othersCanEnter = Int(info.st_mode) & 0o077 != 0
+        if othersCanEnter {
+            _ = chmod(directory.path, 0o700)
+        }
+    }
+
+    private static let warnedLock = NSLock()
+    nonisolated(unsafe) private static var warnedDirectories: Set<String> = []
+
+    private static func warnOnce(about directory: URL, _ message: String) {
+        warnedLock.lock()
+        defer { warnedLock.unlock() }
+        guard !warnedDirectories.contains(directory.path) else { return }
+        warnedDirectories.insert(directory.path)
+        FileHandle.standardError.write(Data((message + "\n").utf8))
+    }
+}
+
+public enum JournalFileError: Error, Equatable, LocalizedError {
+    /// Another writer (usually another nawa process) has the journal open.
+    case inUse(URL)
+
+    public var errorDescription: String? {
+        switch self {
+        case .inUse(let url): return "journal \(url.path) is open in another nawa"
+        }
     }
 }

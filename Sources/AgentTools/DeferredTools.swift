@@ -45,7 +45,10 @@ public struct ToolSearchTool: Tool {
         guard let query = arguments.objectValue?["query"]?.stringValue else {
             throw ToolError.argumentError("missing string argument 'query'")
         }
-        let words = query.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        // Scoring is by substring, so a one-letter word ("a", "x") would match every tool.
+        let words = query.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .filter { $0.count >= 2 }
         let scored = tools.map(\.definition).compactMap { definition -> (ToolDefinition, Int)? in
             let haystack = (definition.name + " " + definition.description).lowercased()
             let score = words.filter { haystack.contains($0) }.count

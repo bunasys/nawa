@@ -18,6 +18,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
     public let requestTimeout: TimeInterval
     /// Sent as `reasoning_effort`; see `ProviderConfig.reasoningEffort`.
     public let reasoningEffort: String?
+    /// Sent with every request; see `ProviderConfig.headers`.
+    public let headers: [String: String]
     public let session: URLSession
 
     public init(
@@ -26,6 +28,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         apiKey: String? = nil,
         requestTimeout: TimeInterval = Self.defaultRequestTimeout,
         reasoningEffort: String? = nil,
+        headers: [String: String] = [:],
         session: URLSession = .shared
     ) {
         self.providerName = providerName
@@ -33,6 +36,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         self.apiKey = apiKey
         self.requestTimeout = requestTimeout
         self.reasoningEffort = reasoningEffort
+        self.headers = headers
         self.session = session
     }
 
@@ -46,9 +50,10 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             stream: false,
             temperature: request.temperature,
             maxTokens: request.maxOutputTokens,
-            reasoningEffort: reasoningEffort
+            reasoningEffort: request.reasoningEffort ?? reasoningEffort
         )
-        let (data, wire) = try await Self.post(session: session, url: chatCompletionsURL, apiKey: apiKey, sessionID: request.sessionID, timeout: requestTimeout, body: body)
+        let urlRequest = try makeRequest(method: "POST", url: chatCompletionsURL, sessionID: request.sessionID, body: sortedJSON(body))
+        let (data, wire) = try await send(urlRequest)
         do {
             let response = try JSONDecoder().decode(OpenAIResponse.self, from: data)
             guard let choice = response.choices.first, let message = choice.message else {
@@ -73,7 +78,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
                     try await ServerSentEvents.forEachData(in: bytes) { payload in
                         for chunk in try assembler.consume(payload) { continuation.yield(chunk) }
                     }
-                    var response = assembler.response()
+                    var response = try assembler.response()
                     response.wire = wire
                     continuation.yield(.finished(response))
                     continuation.finish()
@@ -118,18 +123,9 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
             temperature: request.temperature,
             maxTokens: request.maxOutputTokens,
             streamOptions: askForUsage ? ["include_usage": true] : nil,
-            reasoningEffort: reasoningEffort
+            reasoningEffort: request.reasoningEffort ?? reasoningEffort
         )
-        var urlRequest = URLRequest(url: chatCompletionsURL)
-        // Assigned, not passed to init: on Linux only the setter marks the
-        // timeout as set, and otherwise URLSession uses the session's 60 s.
-        urlRequest.timeoutInterval = requestTimeout
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-        if let sessionID = request.sessionID { urlRequest.setValue(sessionID, forHTTPHeaderField: "x-session-id") }
-        urlRequest.httpBody = try sortedJSON(body)
-
+        let urlRequest = try makeRequest(method: "POST", url: chatCompletionsURL, sessionID: request.sessionID, body: sortedJSON(body))
         let (bytes, response) = try await session.streamBytes(for: urlRequest)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw GatewayError.httpError(statusCode: http.statusCode, body: try await collectText(bytes))
@@ -138,7 +134,7 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
     }
 
     public func listModels() async throws -> [ModelSummary] {
-        let data = try await Self.get(session: session, url: modelsURL, apiKey: apiKey)
+        let (data, _) = try await send(makeRequest(method: "GET", url: modelsURL))
         let list = try JSONDecoder().decode(OpenAIModelList.self, from: data)
         return list.data.map { ModelSummary(id: $0.id, ownedBy: $0.ownedBy) }
     }
@@ -205,13 +201,21 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         }
         for call in wire.toolCalls ?? [] {
             guard let id = call.id, let name = call.function?.name else { continue }
-            let args = (call.function?.arguments).flatMap { payload in
-                try? JSONDecoder().decode(JSON.self, from: Data(payload.utf8))
-            } ?? .object([:])
-            blocks.append(.toolCall(ToolCall(id: id, name: name, arguments: args)))
+            let arguments = toolArguments(call.function?.arguments ?? "")
+            blocks.append(.toolCall(ToolCall(id: id, name: name, arguments: arguments)))
         }
         if blocks.isEmpty { blocks.append(.text("")) }
         return Message(role: .assistant, content: blocks)
+    }
+
+    /// A tool call's arguments as the model wrote them. Text that isn't
+    /// JSON (most often cut off by `max_tokens`) stays a `.string`, so the
+    /// caller can tell the model instead of running the tool without them.
+    static func toolArguments(_ raw: String) -> JSON {
+        let hasNoArguments = raw.allSatisfy(\.isWhitespace)
+        if hasNoArguments { return .object([:]) }
+        guard let parsed = try? JSONDecoder().decode(JSON.self, from: Data(raw.utf8)) else { return .string(raw) }
+        return parsed
     }
 
     static func stopReason(from finishReason: String?) -> StopReason? {
@@ -229,7 +233,8 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
         let prompt = usage?.promptTokens ?? 0
         let cached = usage?.promptTokensDetails?.cachedTokens ?? 0
         return Usage(
-            inputTokens: prompt - cached,
+            // Some proxies report more cached tokens than prompt tokens.
+            inputTokens: max(0, prompt - cached),
             outputTokens: usage?.completionTokens ?? 0,
             cacheReadTokens: cached,
             reasoningTokens: usage?.completionTokensDetails?.reasoningTokens ?? 0
@@ -243,39 +248,31 @@ public struct OpenAICompatibleClient: LanguageModel, Sendable {
 
     // MARK: HTTP plumbing
 
-    static func post(
-        session: URLSession,
-        url: URL,
-        apiKey: String?,
-        sessionID: String? = nil,
-        timeout: TimeInterval = defaultRequestTimeout,
-        body: some Encodable
-    ) async throws -> (Data, WireFacts) {
+    /// Every request this client sends: the provider's own headers first,
+    /// so `apiKey` and the session id win over a configured copy.
+    private func makeRequest(method: String, url: URL, sessionID: String? = nil, body: Data? = nil) -> URLRequest {
         var urlRequest = URLRequest(url: url)
         // Assigned, not passed to init: on Linux only the setter marks the
         // timeout as set, and otherwise URLSession uses the session's 60 s.
-        urlRequest.timeoutInterval = timeout
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.timeoutInterval = requestTimeout
+        urlRequest.httpMethod = method
+        for (name, value) in headers { urlRequest.setValue(value, forHTTPHeaderField: name) }
         if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
         if let sessionID { urlRequest.setValue(sessionID, forHTTPHeaderField: "x-session-id") }
-        urlRequest.httpBody = try sortedJSON(body)
+        if let body {
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            urlRequest.httpBody = body
+        }
+        return urlRequest
+    }
+
+    /// Sends a non-streaming request; a non-2xx status is an `httpError`.
+    private func send(_ urlRequest: URLRequest) async throws -> (Data, WireFacts) {
         let (data, response) = try await session.data(for: urlRequest)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw GatewayError.httpError(statusCode: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
         }
         return (data, WireFacts(request: urlRequest, response: response))
-    }
-
-    static func get(session: URLSession, url: URL, apiKey: String?) async throws -> Data {
-        var urlRequest = URLRequest(url: url)
-        urlRequest.httpMethod = "GET"
-        if let apiKey { urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-        let (data, response) = try await session.data(for: urlRequest)
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            throw GatewayError.httpError(statusCode: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
-        }
-        return data
     }
 }
 
@@ -290,13 +287,27 @@ struct OpenAIStreamAssembler {
 
     private var text = ""
     private var calls: [Int: PendingToolCall] = [:]
+    private var newestCallIndex: Int?
     private var usage = Usage.zero
     private var finishReason: String?
+    /// `[DONE]` arrived. Together with `finishReason`, what tells a whole
+    /// reply from one whose connection dropped.
+    private var sawDone = false
 
     /// One `data:` payload in, the deltas it carries out.
     mutating func consume(_ payload: String) throws -> [StreamChunk] {
-        if payload == "[DONE]" { return [] }
-        guard let chunk = try? JSONDecoder().decode(OpenAIStreamChunk.self, from: Data(payload.utf8)) else { return [] }
+        if payload == "[DONE]" {
+            sawDone = true
+            return []
+        }
+        guard let chunk = try? JSONDecoder().decode(OpenAIStreamChunk.self, from: Data(payload.utf8)) else {
+            // An error in a shape we don't know is still an error; other
+            // payloads we can't read (keep-alives, vendor extras) carry nothing.
+            if payload.contains("\"error\"") {
+                throw GatewayError.invalidResponse("the server reported an error mid-stream: \(payload.prefix(300))")
+            }
+            return []
+        }
         if let error = chunk.error {
             throw GatewayError.invalidResponse(error.message ?? "the server reported an error mid-stream")
         }
@@ -314,7 +325,8 @@ struct OpenAIStreamAssembler {
             out.append(.textDelta(content))
         }
         for call in delta.toolCalls ?? [] {
-            let index = call.index ?? 0
+            let index = slot(for: call)
+            newestCallIndex = index
             if calls[index] == nil {
                 let pending = PendingToolCall(id: call.id ?? "call_\(index)", name: call.function?.name ?? "")
                 calls[index] = pending
@@ -331,11 +343,27 @@ struct OpenAIStreamAssembler {
         return out
     }
 
-    func response() -> ModelResponse {
+    /// Which pending call a delta belongs to. Servers that leave out
+    /// `index` (some proxies, one call per chunk) start each call with its
+    /// id: a new id opens a new call, no id continues the newest one.
+    private func slot(for call: OpenAIStreamToolCall) -> Int {
+        if let index = call.index { return index }
+        guard let newest = newestCallIndex else { return 0 }
+        let startsAnotherCall = call.id != nil && call.id != calls[newest]?.id
+        guard startsAnotherCall else { return newest }
+        return (calls.keys.max() ?? -1) + 1
+    }
+
+    /// The reply, once the server said it was complete. A stream that
+    /// stops before `[DONE]` or a `finish_reason` was cut off, and its
+    /// text and tool calls may be missing their end.
+    func response() throws -> ModelResponse {
+        let isComplete = sawDone || finishReason != nil
+        guard isComplete else { throw GatewayError.incompleteStream }
         var blocks: [ContentBlock] = []
         if !text.isEmpty { blocks.append(.text(text)) }
         for (_, call) in calls.sorted(by: { $0.key < $1.key }) {
-            let arguments = (try? JSONDecoder().decode(JSON.self, from: Data(call.arguments.utf8))) ?? .object([:])
+            let arguments = OpenAICompatibleClient.toolArguments(call.arguments)
             blocks.append(.toolCall(ToolCall(id: call.id, name: call.name, arguments: arguments)))
         }
         if blocks.isEmpty { blocks.append(.text("")) }

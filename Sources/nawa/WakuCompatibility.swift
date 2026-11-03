@@ -25,8 +25,7 @@ enum WakuCompatibility {
     /// Text shape: a `Default model: <id>` line followed by one id per line.
     static func providerCommand(arguments: [String]) async throws {
         guard arguments.first == "list" else {
-            print("Usage: nawa provider list [--json]")
-            return
+            throw UsageError("Usage: nawa provider list [--json]")
         }
         let gateway = try AgentCLI.resolveGateway()
         let defaultModel = gateway.activeProvider?.model
@@ -66,10 +65,12 @@ enum WakuCompatibility {
             throw WakuCompatibilityError.missingValue("--prompt")
         }
         let sessionID = UUID().uuidString
+        let directory = WorkingDirectory.defaultURL
         let loop = AgentLoop(
-            gateway: try AgentCLI.resolveGateway(),
+            gateway: try AgentCLI.resolveGateway(directory: directory),
             tools: ToolRegistry([]),
-            options: LoopOptions(maxTurns: 1, sendTools: false, streamReplies: false),  // prints the reply only once it is done
+            options: oneShotOptions(settings: Settings.resolved(for: directory).loop),
+            cwd: directory.path,
             sessionID: sessionID,
             journal: sessions.map { AgentCLI.journal(at: $0.newJournalURL(sessionID: sessionID), mode: "waku") }
         )
@@ -86,6 +87,18 @@ enum WakuCompatibility {
                 break
             }
         }
+    }
+
+    /// The directory's settings (price, fallback_model, …) with what a
+    /// one-shot needs on top: one turn, no tools, and the reply printed
+    /// only once it is done.
+    static func oneShotOptions(settings: LoopSettings) -> LoopOptions {
+        var options = AgentCLI.defaultLoopOptions(settings: settings)
+        options.maxTurns = 1
+        options.sendTools = false
+        options.streamReplies = false
+        options.subAgents = false
+        return options
     }
 
     private static func value(after flag: String, in arguments: [String]) -> String? {

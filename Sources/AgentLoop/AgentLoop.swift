@@ -32,7 +32,12 @@ public struct WorkingDirectory: Sendable {
 ///
 /// A reference type so that a long-lived session can be resumed: call
 /// `run(prompt:continuing:true)` to append to the accumulated conversation.
-/// Mutable state is guarded by a lock; concurrent `run` calls aren't supported.
+///
+/// Runs never overlap: a new run cancels the one still going (an
+/// interrupted prompt whose tools are still unwinding) and waits for it to
+/// end before it adds its prompt. State that other tasks read (`session`,
+/// `usage`, `model`, the declined prompt) is written under `lock`; what only
+/// the running run touches (turn count, loop check, notes) is not.
 public final class AgentLoop: @unchecked Sendable {
     /// The model the loop talks to.
     public let gateway: any LanguageModel
@@ -54,7 +59,7 @@ public final class AgentLoop: @unchecked Sendable {
     private let optionsLock = NSLock()
     /// The working directory for the session's tools.
     public let cwd: String
-    /// A hook invoked for every event (instrumentation/telemetry).
+    /// A hook that gets every event the run's stream yields, in the same order.
     public let onEvent: (@Sendable (AgentEvent) -> Void)?
     /// Where the session is recorded (proposal 0005); nil records nothing.
     public let journal: (any SessionJournal)?
@@ -63,10 +68,13 @@ public final class AgentLoop: @unchecked Sendable {
     var journalParent: JournalParent?
 
     private let lock = NSLock()
+    /// The session's id, which never changes; kept apart from `_session` so
+    /// reading it needs no lock.
+    private let sessionID: String
     private var _session: Session
     private var _usage: Usage
     private var _turnCounter: Int
-    private var _loopDetector: LoopDetector
+    private var _loopDetector = LoopDetector()
     private var _model: String?
     /// Size of the conversation at the last model call (prompt + reply), the
     /// signal for compaction.
@@ -77,22 +85,30 @@ public final class AgentLoop: @unchecked Sendable {
     /// The part of `_usage` spent on `options.helperModel` (sub-agents and
     /// summaries), priced with `options.helperPricing`.
     private var _helperUsage: Usage = .zero
-    /// Where the current run's prompt sits in `_session.messages`.
-    private var _runPromptIndex = 0
+    /// The id of the current run's prompt message. An id, not a position:
+    /// clearing and compaction move messages around.
+    private var _runPromptID = ""
+    /// Whether this run already asked another model after a refusal. One
+    /// retry per run, so two models recommending each other can't loop.
+    private var _retriedAfterRefusal = false
     /// The last refusal of the current run, reported with its result.
     private var _lastRefusal: RefusalNotice?
     /// The provider that wrote the last reply, when the gateway said so.
     private var _answeringProvider: String?
     /// The prompt a model declined in the last run, kept until the next run
-    /// or a compaction so `removeDeclinedRequest` can take it out.
+    /// so `removeDeclinedRequest` can take it out.
     private var _declined: DeclinedRequest?
     /// Messages from `steer`, waiting for the next model call.
     private var _steering: [String] = []
     /// Whether this run already took its one model call past `maxTurns` to
     /// answer a steer. One only, so steering can't lift the cap.
     private var _tookTurnCapGrace = false
+    /// The run in progress (or the last one), so the next run can wait for it.
+    private var _currentRun: Task<Void, Never>?
     /// Whether `session_started` is written; nothing is recorded before it.
+    /// Behind its own lock: `record` reads it, also from code holding `lock`.
     private var _journalStarted = false
+    private let journalLock = NSLock()
     /// Set by `init(restoring:)`: the session's messages are already in
     /// the journal, so starting it again must not record them twice.
     private var _isRestored = false
@@ -100,7 +116,7 @@ public final class AgentLoop: @unchecked Sendable {
     private var _recordedTools: (definitions: [ToolDefinition], id: String)?
 
     private struct DeclinedRequest {
-        var promptIndex: Int
+        var promptID: String
         /// The model the run started on, restored when the prompt is removed.
         var modelBefore: String?
     }
@@ -109,14 +125,14 @@ public final class AgentLoop: @unchecked Sendable {
     /// configured or discovered default. Clients may switch it between turns
     /// (ACP `session/set_model`).
     public var model: String? {
-        get { lock.lock(); defer { lock.unlock() }; return _model }
+        get { lock.withLock { _model } }
         set {
-            lock.lock()
-            let previous = _model
-            _model = newValue
-            let isRecording = _journalStarted
-            lock.unlock()
-            if isRecording && previous != newValue {
+            let previous = lock.withLock {
+                let previous = _model
+                _model = newValue
+                return previous
+            }
+            if previous != newValue {
                 record(.modelChanged(from: previous, to: newValue))
             }
         }
@@ -125,14 +141,12 @@ public final class AgentLoop: @unchecked Sendable {
     /// The session this loop has been driving. Resumption: keep it, then run
     /// again with `run(prompt:continuing:true)`.
     public var session: Session {
-        lock.lock(); defer { lock.unlock() }
-        return _session
+        lock.withLock { _session }
     }
 
     /// Running token/cost accounting for the current conversation.
     public var usage: Usage {
-        lock.lock(); defer { lock.unlock() }
-        return _usage
+        lock.withLock { _usage }
     }
 
     /// - Parameters:
@@ -145,7 +159,8 @@ public final class AgentLoop: @unchecked Sendable {
     ///   - sessionID: The session's id, also its id in the journal. ACP
     ///     passes its own session id so the two match.
     ///   - journal: Where to record the session; nil records nothing.
-    ///   - onEvent: Observability hook; fires for every event the loop yields.
+    ///   - onEvent: Observability hook; gets every event the run's stream
+    ///     yields, in the same order.
     public init(
         gateway: any LanguageModel,
         tools: ToolRegistry,
@@ -165,10 +180,10 @@ public final class AgentLoop: @unchecked Sendable {
         self.onEvent = onEvent
         var session = Session(id: sessionID, cwd: cwd)
         session.append(Message(role: .system, text: SystemPrompt.composed(systemPrompt)))
+        self.sessionID = sessionID
         self._session = session
         self._usage = .zero
         self._turnCounter = 0
-        self._loopDetector = LoopDetector(checkAfterTurns: options.loopCheckAfterTurns)
     }
 
     /// A loop that goes on with a session rebuilt from its journal
@@ -234,208 +249,256 @@ public final class AgentLoop: @unchecked Sendable {
     }
 
     private var hasSteering: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return !_steering.isEmpty
+        lock.withLock { !_steering.isEmpty }
     }
 
     /// Empties the steer queue: its messages as one text, or nil when empty.
     private func takeSteering() -> String? {
-        lock.lock(); defer { lock.unlock() }
-        guard !_steering.isEmpty else { return nil }
-        let text = _steering.joined(separator: "\n\n")
-        _steering = []
-        return text
+        lock.withLock {
+            guard !_steering.isEmpty else { return nil }
+            let text = _steering.joined(separator: "\n\n")
+            _steering = []
+            return text
+        }
     }
 
     /// Run a prompt, streaming `AgentEvent`s.
     public func run(prompt: String, continuing: Bool = false) -> AsyncThrowingStream<AgentEvent, any Error> {
         AsyncThrowingStream { continuation in
-            let task = Task { [self] in
-                do {
-                    self.startJournalIfNeeded()
-                    // Emit the init event once per *conversation*, not per run.
-                    if !continuing {
-                        let initEvent = AgentEvent.initEvent(self.session)
-                        self.emit(initEvent)
-                        continuation.yield(initEvent)
-                    }
-
-                    // Append the user's message to the live session.
-                    self.appendUser(prompt)
-                    self.record(.runStarted(promptMessageID: self._session.messages[self._runPromptIndex].id, model: self.model))
-
-                    while true {
-                        if let maxTurns = self.options.maxTurns, self._turnCounter >= maxTurns {
-                            // A steer ("wrap up now") is most likely to come just
-                            // as the turns run out, so it gets one call to answer.
-                            let mayAnswerSteer = self.hasSteering && !self._tookTurnCapGrace
-                            if !mayAnswerSteer {
-                                self.emit(.informational("Hit maxTurns (\(maxTurns)) — stopping."))
-                                self.finish(continuation, self.result(.errorMaxTurns))
-                                return
-                            }
-                            self._tookTurnCapGrace = true
-                        }
-
-                        // 1. Ask the model, after trimming what it no longer needs
-                        // and adding what the caller steered in meanwhile.
-                        try await self.shrinkContext { note in
-                            self.emit(note)
-                            continuation.yield(note)
-                        }
-                        if let steered = self.takeSteering() {
-                            let message = Message(role: .user, text: steered)
-                            self._session.append(message)
-                            self.recordAppended([message])
-                            self.record(.steered(messageID: message.id))
-                            let note = AgentEvent.informational("Steered: \(steered)")
-                            self.emit(note)
-                            continuation.yield(note)
-                        }
-                        let request = ModelRequest(
-                            model: self.model,
-                            messages: self._session.messages,
-                            tools: self.options.sendTools ? self.toolDefinitions : nil,
-                            maxOutputTokens: self.options.maxOutputTokens,
-                            temperature: self.options.temperature,
-                            mayFailOver: self.mayFailOver,
-                            sessionID: self._session.id
-                        )
-
-                        let (response, _) = try await self.callModel(request, purpose: .turn, stream: self.options.streamReplies) { update in
-                            self.emit(.stream(update))
-                            continuation.yield(.stream(update))
-                        }
-                        self._usage.accumulate(response.usage)
-                        self._contextTokens = response.usage.total
-                        try self.checkAnsweringProvider(response) { note in
-                            self.emit(note)
-                            continuation.yield(note)
-                        }
-
-                        // Enforce the spend cap, if any.
-                        if let maxBudget = self.options.maxBudgetUSD,
-                           let cost = self.totalCost, cost >= maxBudget
-                        {
-                            self.record(.message(response.message, appendedToContext: false))
-                            self.finish(continuation, self.result(.errorMaxBudgetUSD))
-                            return
-                        }
-
-                        // A declined reply is dropped, partial text included:
-                        // it is not an answer. Ask the fallback model, if any.
-                        if response.finishReason == .refusal {
-                            self.record(.message(response.message, appendedToContext: false))
-                            let notice = self.recordRefusal(response)
-                            self.record(.refusal(notice))
-                            self.emit(.refusal(notice))
-                            continuation.yield(.refusal(notice))
-                            if notice.answeredBy != nil { continue }
-                            self.finish(continuation, self.result(.refused))
-                            return
-                        }
-                        // Anthropic's server-side fallback already answered
-                        // in the model's place; say so, and keep the answer.
-                        if let declinedModel = response.declinedBy.first {
-                            let notice = RefusalNotice(declinedBy: declinedModel, answeredBy: response.model)
-                            self.rememberDeclinedPrompt(notice)
-                            self.record(.refusal(notice))
-                            self.emit(.refusal(notice))
-                            continuation.yield(.refusal(notice))
-                        }
-
-                        // 2. Persist the assistant turn and emit it.
-                        let update = AssistantUpdate(
-                            text: response.message.text,
-                            toolCalls: response.message.toolCalls,
-                            usage: response.usage,
-                            stopReason: response.finishReason,
-                            sessionUsage: self._usage,
-                            sessionCost: self.totalCost
-                        )
-                        self._session.append(response.message)
-                        self.recordAppended([response.message])
-                        self.emit(.assistant(update))
-                        continuation.yield(.assistant(update))
-
-                        // 3. No tool calls → the run is done, unless the caller
-                        // steered in a message the model hasn't seen yet.
-                        if response.message.toolCalls.isEmpty && self.hasSteering {
-                            // Counted as a turn, so steering after every answer
-                            // still reaches maxTurns.
-                            self._turnCounter += 1
-                            continue
-                        }
-                        guard !response.message.toolCalls.isEmpty else {
-                            let success = self.result(.success, text: response.message.text, stopReason: response.finishReason)
-                            self.finish(continuation, success)
-                            return
-                        }
-
-                        // 4. Execute the requested tools.
-                        self._turnCounter += 1
-                        let results = await self.runTools(response.message.toolCalls) { event in
-                            self.emit(event)
-                            continuation.yield(event)
-                        }
-                        // A cancelled run stops here rather than asking the model again.
-                        try Task.checkCancellation()
-                        for result in results {
-                            self.emit(.toolResult(result))
-                        }
-                        // The context gets a pointer for output it already has;
-                        // events and the loop check above see the real results.
-                        let contextResults = ContextShrinking.dedupingRepeatedResults(results, against: self._session.messages)
-                        let resultMessages = contextResults.map { $0.asMessage }
-                        self._session.messages.append(contentsOf: resultMessages)
-                        self.recordAppended(resultMessages)
-                        continuation.yield(.toolResults(results))
-
-                        if let repeatedTools = self._loopDetector.record(calls: response.message.toolCalls, results: results) {
-                            let message = "Stopped after \(self._turnCounter) tool turns: the same \(repeatedTools.joined(separator: ", ")) calls returned the same results \(LoopDetector.repeatLimit) times in the last \(LoopDetector.window) turns."
-                            self.emit(.informational(message))
-                            self.finish(continuation, self.result(.errorDuringExecution, errorMessage: message))
-                            return
-                        }
-                    }
-                } catch {
-                    self.emit(.informational("Loop error: \(error)"))
-                    let failure = self.result(.errorDuringExecution, errorMessage: error.localizedDescription)
-                    self.finish(continuation, failure)
-                }
+            let send: @Sendable (AgentEvent) -> Void = { [onEvent] event in
+                onEvent?(event)
+                continuation.yield(event)
+            }
+            let task = startRun { [self] in
+                let result = await self.drive(prompt: prompt, continuing: continuing, send: send)
+                self.finish(result, send: send)
+                continuation.finish()
             }
             continuation.onTermination = { _ in task.cancel() }
         }
     }
 
-    /// Starts a run: appends the prompt and resets the turn counter and the
-    /// loop check, so both apply to each prompt rather than the whole conversation.
-    private func appendUser(_ prompt: String) {
-        lock.lock(); defer { lock.unlock() }
-        let countBefore = _session.messages.count
-        // A run interrupted between the model's tool calls and their results
-        // left calls unanswered, and providers refuse such a conversation.
-        if let last = _session.messages.last, last.role == .assistant {
-            for call in last.toolCalls {
-                let result = ToolCallResult(callID: call.id, name: call.name, content: "interrupted by the user before it finished", isError: true)
-                _session.append(result.asMessage)
+    /// Starts `body` once the previous run has ended, cancelling that run
+    /// first. A cancelled run can still be unwinding (a shell command that
+    /// ignores cancellation), and two runs writing the session, the turn
+    /// count and the journal at once would interleave their messages.
+    private func startRun(_ body: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        lock.withLock {
+            let previous = _currentRun
+            previous?.cancel()
+            let task = Task {
+                await previous?.value
+                await body()
             }
+            _currentRun = task
+            return task
         }
-        _session.append(Message(role: .user, text: prompt))
-        recordAppended(_session.messages[countBefore...])
-        _runPromptIndex = _session.messages.count - 1
-        _turnCounter = 0
-        _loopDetector.reset()
-        _lastRefusal = nil
-        _declined = nil
-        _tookTurnCapGrace = false
+    }
+
+    /// The run itself: turns until the model answers without tool calls or
+    /// a limit stops it. Returns the run's result; `send` gets every event.
+    private func drive(prompt: String, continuing: Bool, send: (AgentEvent) -> Void) async -> AgentResult {
+        do {
+            startJournalIfNeeded()
+            // Emit the init event once per *conversation*, not per run.
+            if !continuing {
+                send(.initEvent(session))
+            }
+            let promptID = appendUser(prompt)
+            record(.runStarted(promptMessageID: promptID, model: model))
+
+            while true {
+                if let maxTurns = options.maxTurns, _turnCounter >= maxTurns {
+                    // A steer ("wrap up now") is most likely to come just
+                    // as the turns run out, so it gets one call to answer.
+                    let mayAnswerSteer = hasSteering && !_tookTurnCapGrace
+                    guard mayAnswerSteer else {
+                        send(.informational("Hit maxTurns (\(maxTurns)) — stopping."))
+                        return result(.errorMaxTurns)
+                    }
+                    _tookTurnCapGrace = true
+                }
+                // Checked before the call, not after: a call made past the
+                // cap would be paid for and then thrown away.
+                if isOverBudget {
+                    return result(.errorMaxBudgetUSD)
+                }
+
+                // 1. Ask the model, after trimming what it no longer needs
+                // and adding what the caller steered in meanwhile.
+                try await shrinkContext(report: send)
+                deliverSteering(send: send)
+                let response = try await askModel(send: send)
+                if Task.isCancelled {
+                    // Interrupted while the model answered: its tool calls
+                    // must not start.
+                    record(.message(response.message, appendedToContext: false))
+                    throw CancellationError()
+                }
+
+                // A declined reply is dropped, partial text included:
+                // it is not an answer. Ask the fallback model, if any.
+                if response.finishReason == .refusal {
+                    record(.message(response.message, appendedToContext: false))
+                    let notice = recordRefusal(response)
+                    record(.refusal(notice))
+                    send(.refusal(notice))
+                    if notice.answeredBy != nil { continue }
+                    return result(.refused)
+                }
+                // Anthropic's server-side fallback already answered
+                // in the model's place; say so, and keep the answer.
+                if let declinedModel = response.declinedBy.first {
+                    let notice = RefusalNotice(declinedBy: declinedModel, answeredBy: response.model)
+                    rememberDeclinedPrompt(notice)
+                    record(.refusal(notice))
+                    send(.refusal(notice))
+                }
+
+                let toolCalls = response.message.toolCalls
+                // A reply that crossed the cap is kept when it is the answer;
+                // its tool calls aren't run, since their results would need
+                // another paid call.
+                if !toolCalls.isEmpty && isOverBudget {
+                    record(.message(response.message, appendedToContext: false))
+                    return result(.errorMaxBudgetUSD)
+                }
+
+                // 2. Persist the assistant turn and emit it.
+                appendToContext([response.message])
+                send(.assistant(AssistantUpdate(
+                    text: response.message.text,
+                    toolCalls: toolCalls,
+                    usage: response.usage,
+                    stopReason: response.finishReason,
+                    sessionUsage: usage,
+                    sessionCost: totalCost
+                )))
+
+                // 3. No tool calls → the run is done, unless the caller
+                // steered in a message the model hasn't seen yet.
+                if toolCalls.isEmpty {
+                    guard hasSteering else {
+                        return result(.success, text: response.message.text, stopReason: response.finishReason)
+                    }
+                    // Counted as a turn, so steering after every answer
+                    // still reaches maxTurns.
+                    _turnCounter += 1
+                    continue
+                }
+
+                // 4. Execute the requested tools.
+                _turnCounter += 1
+                let results = await runTools(toolCalls, finishReason: response.finishReason, progress: send)
+                // The context gets a pointer for output it already has;
+                // events and the loop check see the real results.
+                let contextResults = ContextShrinking.dedupingRepeatedResults(results, against: session.messages)
+                appendToContext(contextResults.map(\.asMessage))
+                send(.toolResults(results))
+                // A cancelled run keeps what its finished tools did (so the
+                // model won't redo an edit), then stops rather than asking
+                // the model again.
+                try Task.checkCancellation()
+
+                let checkAfterTurns = options.loopCheckAfterTurns
+                if let repeatedTools = _loopDetector.record(calls: toolCalls, results: results, checkAfterTurns: checkAfterTurns) {
+                    let message = "Stopped after \(_turnCounter) tool turns: the same \(repeatedTools.joined(separator: ", ")) calls returned the same results \(LoopDetector.repeatLimit) times in the last \(LoopDetector.window) turns."
+                    send(.informational(message))
+                    return result(.errorDuringExecution, errorMessage: message)
+                }
+            }
+        } catch {
+            send(.informational("Loop error: \(error)"))
+            return result(.errorDuringExecution, errorMessage: error.localizedDescription)
+        }
+    }
+
+    /// Adds the steered messages, if any, to the context before the next call.
+    private func deliverSteering(send: (AgentEvent) -> Void) {
+        guard let steered = takeSteering() else { return }
+        let message = Message(role: .user, text: steered)
+        appendToContext([message])
+        record(.steered(messageID: message.id))
+        send(.informational("Steered: \(steered)"))
+    }
+
+    /// One turn's model call, with its usage counted and its provider checked.
+    private func askModel(send: (AgentEvent) -> Void) async throws -> ModelResponse {
+        let request = ModelRequest(
+            model: model,
+            messages: session.messages,
+            tools: options.sendTools ? toolDefinitions : nil,
+            maxOutputTokens: options.maxOutputTokens,
+            temperature: options.temperature,
+            mayFailOver: mayFailOver,
+            sessionID: sessionID,
+            reasoningEffort: options.reasoningEffort
+        )
+        let (response, _) = try await callModel(request, purpose: .turn, helper: false, stream: options.streamReplies) { update in
+            send(.stream(update))
+        }
+        recordUsage(response.usage, helper: false)
+        lock.withLock { _contextTokens = response.usage.total }
+        try checkAnsweringProvider(response, report: send)
+        return response
+    }
+
+    /// Whether the session's estimated cost has reached `maxBudgetUSD`.
+    private var isOverBudget: Bool {
+        guard let maxBudget = options.maxBudgetUSD, let cost = totalCost else { return false }
+        return cost >= maxBudget
+    }
+
+    /// Starts a run: appends the prompt and resets the turn counter and the
+    /// loop check, so both apply to each prompt rather than the whole
+    /// conversation. Returns the prompt message's id.
+    private func appendUser(_ prompt: String) -> String {
+        let promptMessage = Message(role: .user, text: prompt)
+        let added: [Message] = lock.withLock {
+            var added: [Message] = []
+            // A run that ended between the model's tool calls and their
+            // results (e.g. a crash, then a restore) left calls unanswered,
+            // and providers refuse such a conversation.
+            if let last = _session.messages.last, last.role == .assistant {
+                added = last.toolCalls.map { Self.interruptedResult($0).asMessage }
+            }
+            added.append(promptMessage)
+            _session.messages.append(contentsOf: added)
+            _runPromptID = promptMessage.id
+            _turnCounter = 0
+            _loopDetector.reset()
+            _lastRefusal = nil
+            _declined = nil
+            _retriedAfterRefusal = false
+            _tookTurnCapGrace = false
+            return added
+        }
+        recordAppended(added)
+        return promptMessage.id
+    }
+
+    static func interruptedResult(_ call: ToolCall) -> ToolCallResult {
+        ToolCallResult(callID: call.id, name: call.name, content: "interrupted by the user before it finished", isError: true)
+    }
+
+    /// Adds messages to the end of the context and records them.
+    private func appendToContext(_ messages: [Message]) {
+        lock.withLock { _session.messages.append(contentsOf: messages) }
+        recordAppended(messages)
+    }
+
+    /// Replaces the context with a rewritten one and records what changed.
+    private func rewriteContext(_ messages: [Message], reason: ContextRewrite.Reason, before: [Message], modelCallID: String? = nil) {
+        lock.withLock { _session.messages = messages }
+        recordRewrite(reason, before: before, after: messages, modelCallID: modelCallID)
     }
 
     // MARK: Refusals
 
     /// Notes a declined reply and picks the model to ask next: the
     /// configured `fallbackModel`, else the one the provider recommends.
-    /// There is one retry per run: a refusal from the fallback is final.
+    /// There is one retry per run: a refusal from the fallback is final,
+    /// even when it recommends yet another model (or the first one back).
     private func recordRefusal(_ response: ModelResponse) -> RefusalNotice {
         let declinedModel = response.model ?? model
         let category = response.refusal?.category
@@ -444,7 +507,7 @@ public final class AgentLoop: @unchecked Sendable {
         let anotherModelWontHelp = category == "reasoning_extraction"
         let candidate = options.fallbackModel ?? response.refusal?.recommendedModel
         let alreadyTried = candidate == model || candidate == declinedModel
-        let shouldRetry = !anotherModelWontHelp && !alreadyTried
+        let shouldRetry = !anotherModelWontHelp && !alreadyTried && !_retriedAfterRefusal
         let fallback = shouldRetry ? candidate : nil
 
         let notice = RefusalNotice(
@@ -454,15 +517,19 @@ public final class AgentLoop: @unchecked Sendable {
             answeredBy: fallback
         )
         rememberDeclinedPrompt(notice)
-        if let fallback { model = fallback }
+        if let fallback {
+            _retriedAfterRefusal = true
+            model = fallback
+        }
         return notice
     }
 
     private func rememberDeclinedPrompt(_ notice: RefusalNotice) {
-        lock.lock(); defer { lock.unlock() }
-        _lastRefusal = notice
-        if _declined == nil {
-            _declined = DeclinedRequest(promptIndex: _runPromptIndex, modelBefore: _model)
+        lock.withLock {
+            _lastRefusal = notice
+            if _declined == nil {
+                _declined = DeclinedRequest(promptID: _runPromptID, modelBefore: _model)
+            }
         }
     }
 
@@ -476,10 +543,11 @@ public final class AgentLoop: @unchecked Sendable {
     /// folded the prompt into a summary.
     public func removeDeclinedRequest() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard let declined = _declined, declined.promptIndex < _session.messages.count else { return false }
+        guard let declined = _declined else { return false }
+        guard let promptIndex = _session.messages.firstIndex(where: { $0.id == declined.promptID }) else { return false }
         let before = _session.messages
-        _session.messages.removeSubrange(declined.promptIndex...)
-        recordRewrite(.declinedPromptRemoved, before: before)
+        _session.messages.removeSubrange(promptIndex...)
+        recordRewrite(.declinedPromptRemoved, before: before, after: _session.messages)
         if _model != declined.modelBefore {
             record(.modelChanged(from: _model, to: declined.modelBefore))
         }
@@ -500,26 +568,22 @@ public final class AgentLoop: @unchecked Sendable {
         AgentResult(
             kind: kind,
             text: text,
-            usage: _usage,
+            usage: usage,
             numTurns: _turnCounter,
-            sessionID: _session.id,
+            sessionID: sessionID,
             stopReason: stopReason,
             costEstimate: totalCost,
             errorMessage: errorMessage,
-            refusal: _lastRefusal
+            refusal: lock.withLock { _lastRefusal }
         )
     }
 
-    private func finish(_ continuation: AsyncThrowingStream<AgentEvent, any Error>.Continuation, _ result: AgentResult) {
+    private func finish(_ result: AgentResult, send: (AgentEvent) -> Void) {
         if let dropped = takeSteering() {
-            let note = AgentEvent.informational("Not delivered: \(dropped)")
-            emit(note)
-            continuation.yield(note)
+            send(.informational("Not delivered: \(dropped)"))
         }
         record(.runFinished(result))
-        emit(.result(result))
-        continuation.yield(.result(result))
-        continuation.finish()
+        send(.result(result))
     }
 
     // MARK: Tools
@@ -540,23 +604,58 @@ public final class AgentLoop: @unchecked Sendable {
     /// turn: sub-agents only report back, so they run at the same time
     /// (after the turn's other calls).
     /// `progress` receives events produced while a tool runs (sub-agents).
-    private func runTools(_ toolCalls: [ToolCall], progress: (AgentEvent) -> Void) async -> [ToolCallResult] {
-        let runsTasksTogether = toolCalls.filter(isTaskCall).count > 1
+    ///
+    /// Every call gets a result. A call whose arguments are unusable gets an
+    /// error instead of running; once the run is cancelled, the calls not
+    /// yet started get an "interrupted" result.
+    private func runTools(_ toolCalls: [ToolCall], finishReason: StopReason?, progress: (AgentEvent) -> Void) async -> [ToolCallResult] {
         var resultsByIndex: [Int: ToolCallResult] = [:]
+        // A reply cut off at max_tokens stops inside its last call.
+        let cutOffCallID = finishReason == .maxTokens ? toolCalls.last?.id : nil
         for (index, call) in toolCalls.enumerated() {
+            resultsByIndex[index] = Self.rejectingUnusableArguments(call, isCutOff: call.id == cutOffCallID)
+        }
+        let runnable = toolCalls.enumerated().filter { resultsByIndex[$0.offset] == nil }
+        let runsTasksTogether = runnable.filter { isTaskCall($0.element) }.count > 1
+
+        for (index, call) in runnable {
             if runsTasksTogether && isTaskCall(call) { continue }
+            if Task.isCancelled {
+                resultsByIndex[index] = Self.interruptedResult(call)
+                continue
+            }
             let startedAt = Date()
             let result = await runTool(call, progress: progress)
             recordToolRun(call, result: result, startedAt: startedAt, durationMS: millisecondsSince(startedAt))
             resultsByIndex[index] = result
         }
         if runsTasksTogether {
-            let tasks = toolCalls.enumerated().filter { isTaskCall($0.element) }.map { (index: $0.offset, call: $0.element) }
-            for (index, result) in await runSubAgentsTogether(tasks, progress: progress) {
-                resultsByIndex[index] = result
+            let tasks = runnable.filter { isTaskCall($0.element) }.map { (index: $0.offset, call: $0.element) }
+            if Task.isCancelled {
+                for (index, call) in tasks { resultsByIndex[index] = Self.interruptedResult(call) }
+            } else {
+                for (index, result) in await runSubAgentsTogether(tasks, progress: progress) {
+                    resultsByIndex[index] = result
+                }
             }
         }
         return toolCalls.indices.compactMap { resultsByIndex[$0] }
+    }
+
+    /// An error result for a call that must not run because its arguments
+    /// can't be trusted, nil for a call that may run. Running a cut-off
+    /// call would act on half its arguments (half a file written, say).
+    static func rejectingUnusableArguments(_ call: ToolCall, isCutOff: Bool) -> ToolCallResult? {
+        if isCutOff {
+            let message = "not run: the reply reached the output token limit (max_tokens) while writing this call, so its arguments were cut off. Send the call again, in smaller pieces if it was long."
+            return ToolCallResult(callID: call.id, name: call.name, content: message, isError: true)
+        }
+        // A call without arguments may arrive as null or an empty string.
+        let hasNoArguments = call.arguments == .null || call.arguments.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true
+        let isObject = call.arguments.objectValue != nil
+        guard !isObject && !hasNoArguments else { return nil }
+        let message = "not run: the arguments were not valid JSON (a JSON object was expected). Send the call again with valid JSON arguments."
+        return ToolCallResult(callID: call.id, name: call.name, content: message, isError: true)
     }
 
     private func isTaskCall(_ call: ToolCall) -> Bool {
@@ -682,8 +781,8 @@ public final class AgentLoop: @unchecked Sendable {
     /// Run a `task` call in a fresh loop. Its tool output never enters this
     /// conversation; only the final answer does. Its events are forwarded to
     /// `progress` as they happen, tagged with the call id. It may only spend
-    /// its share of what is left of the budget (`budgetShare` children
-    /// running together split it evenly).
+    /// its share of what is left of the budget (a turn's `budgetShare`
+    /// `task` calls split it evenly).
     private func runSubAgent(_ call: ToolCall, budgetShare: Int, progress: (AgentEvent) -> Void) async -> SubAgentOutcome {
         func failure(_ message: String) -> SubAgentOutcome {
             SubAgentOutcome(result: ToolCallResult(callID: call.id, name: call.name, content: message, isError: true))
@@ -694,10 +793,17 @@ public final class AgentLoop: @unchecked Sendable {
         let prompt = Self.subAgentPrompt(job: job, context: fields["context"]?.stringValue)
 
         let child = AgentLoop(gateway: gateway, tools: tools, systemPrompt: systemPrompt, options: childOptions(budgetShare: budgetShare), cwd: cwd, journal: journal)
-        child.journalParent = JournalParent(session: _session.id, callID: call.id)
+        child.journalParent = JournalParent(session: sessionID, callID: call.id)
         let childModel = options.helperModel ?? model
         child.model = childModel
 
+        // What the child spent counts even when it didn't finish: it was
+        // paid for, and the budget must see it.
+        func failureAfterSpending(_ message: String) -> SubAgentOutcome {
+            var outcome = failure(message)
+            outcome.usage = child.usage
+            return outcome
+        }
         var childResult: AgentResult?
         do {
             for try await event in child.run(prompt: prompt) {
@@ -705,10 +811,10 @@ public final class AgentLoop: @unchecked Sendable {
                 progress(.subAgent(SubAgentUpdate(callID: call.id, model: childModel, event: event)))
             }
         } catch {
-            return failure("sub-agent failed: \(error)")
+            return failureAfterSpending("sub-agent failed: \(error)")
         }
-        if Task.isCancelled { return failure("sub-agent cancelled") }
-        guard let childResult else { return failure("sub-agent ended without a result") }
+        if Task.isCancelled { return failureAfterSpending("sub-agent cancelled") }
+        guard let childResult else { return failureAfterSpending("sub-agent ended without a result") }
 
         guard childResult.isSuccess else {
             let reason = childResult.errorMessage ?? childResult.kind.rawValue
@@ -725,7 +831,10 @@ public final class AgentLoop: @unchecked Sendable {
     /// through a stream, because `progress` may only be called from this task.
     private func runSubAgentsTogether(_ calls: [(index: Int, call: ToolCall)], progress: (AgentEvent) -> Void) async -> [(Int, ToolCallResult)] {
         let (events, sink) = AsyncStream.makeStream(of: AgentEvent.self)
-        let budgetShare = min(calls.count, Self.maxParallelSubAgents)
+        // Split over every call, not just one batch: the children's spend is
+        // counted only once all batches are done, so a later batch sees the
+        // same remaining budget as the first.
+        let budgetShare = calls.count
         async let finished = runInBatches(calls, budgetShare: budgetShare, sink: sink)
         for await event in events { progress(event) }
 
@@ -773,10 +882,13 @@ public final class AgentLoop: @unchecked Sendable {
 
     /// One model call, recorded in the journal whether it succeeds or not.
     /// Streams when `stream` is on, handing each partial update to `progress`.
-    /// Returns the call's id too, so records can refer to it.
+    /// Returns the call's id too, so records can refer to it. `helper` says
+    /// whether it runs on the helper model; the record keeps that, so live
+    /// totals, the call's cost and a replay all count it the same way.
     private func callModel(
         _ request: ModelRequest,
         purpose: ModelCallRecord.Purpose,
+        helper: Bool,
         stream: Bool,
         progress: (AgentStreamUpdate) -> Void = { _ in }
     ) async throws -> (response: ModelResponse, callID: String) {
@@ -811,7 +923,8 @@ public final class AgentLoop: @unchecked Sendable {
                 request: summary,
                 response: reply,
                 usage: usage,
-                costUSD: response == nil ? nil : cost(of: usage, purpose: purpose, model: request.model),
+                helper: helper,
+                costUSD: response == nil ? nil : cost(of: usage, helper: helper),
                 startedAt: startedAt,
                 firstChunkMS: firstChunkAt.map { Int(($0.timeIntervalSince(startedAt) * 1000).rounded()) },
                 durationMS: millisecondsSince(startedAt),
@@ -851,13 +964,17 @@ public final class AgentLoop: @unchecked Sendable {
 
     /// A sub-agent's options: no further sub-agents, no streaming (only its
     /// result is shown), the helper's pricing when it runs on the helper
-    /// model, and its share of what is left of the budget.
+    /// model (with the provider's effort), and its share of what is left of
+    /// the budget.
     private func childOptions(budgetShare: Int) -> LoopOptions {
         var child = options
         child.subAgents = false
         child.streamReplies = false
         if options.helperModel != nil {
             child.pricing = options.helperPricing ?? options.pricing
+            // The effort was chosen for the session's model; the helper may
+            // not take the same words.
+            child.reasoningEffort = nil
         }
         if let maxBudget = options.maxBudgetUSD {
             child.maxBudgetUSD = max(0, maxBudget - (totalCost ?? 0)) / Double(max(1, budgetShare))
@@ -868,9 +985,12 @@ public final class AgentLoop: @unchecked Sendable {
     /// Add a model call's (or a sub-agent's) usage to the session totals.
     /// `helper` usage was spent on the helper model, if one is set.
     private func recordUsage(_ usage: Usage, helper: Bool) {
-        _usage.accumulate(usage)
-        if helper, options.helperModel != nil {
-            _helperUsage.accumulate(usage)
+        let countsAsHelper = helper && options.helperModel != nil
+        lock.withLock {
+            _usage.accumulate(usage)
+            if countsAsHelper {
+                _helperUsage.accumulate(usage)
+            }
         }
     }
 
@@ -881,15 +1001,24 @@ public final class AgentLoop: @unchecked Sendable {
     private func shrinkContext(report: (AgentEvent) -> Void) async throws {
         let clearsToolResults = options.keepToolResults != nil || options.keepToolResultChars != nil
         if clearsToolResults {
-            let before = _session.messages
-            _session.messages = ContextShrinking.clearingOldToolResults(
+            let before = session.messages
+            let cleared = ContextShrinking.clearingOldToolResults(
                 before,
                 keep: options.keepToolResults,
                 maxChars: options.keepToolResultChars
             )
-            recordRewrite(.toolResultsCleared, before: before)
+            // A cleared message gets a new id, so equal ids mean nothing changed.
+            let clearedSomething = cleared.map(\.id) != before.map(\.id)
+            if clearedSomething {
+                rewriteContext(cleared, reason: .toolResultsCleared, before: before)
+                // The context size that would trigger a compaction was
+                // measured before this clearing; the next call reports the
+                // new one, and compaction can decide then.
+                return
+            }
         }
-        guard let compaction = options.compaction, _contextTokens >= compaction.atContextTokens else { return }
+        let contextTokens = lock.withLock { _contextTokens }
+        guard let compaction = options.compaction, contextTokens >= compaction.atContextTokens else { return }
         let compacted = try await compact(keepRecent: compaction.keepRecentMessages, report: report)
         if compacted > 0 {
             report(.informational("Compacted \(compacted) older messages into a summary."))
@@ -901,7 +1030,7 @@ public final class AgentLoop: @unchecked Sendable {
     /// Returns how many messages were folded into the summary (0 when there
     /// was nothing old enough to compact).
     private func compact(keepRecent: Int, report: (AgentEvent) -> Void) async throws -> Int {
-        let messages = _session.messages
+        let messages = session.messages
         guard let cut = ContextShrinking.compactionCut(messages, keepRecent: keepRecent) else { return 0 }
         let systemMessages = messages.prefix { $0.role == .system }
         let older = messages[systemMessages.count..<cut]
@@ -928,12 +1057,12 @@ public final class AgentLoop: @unchecked Sendable {
         let callID: String
         var usedHelper = helperModel != nil
         do {
-            (response, callID) = try await callModel(request, purpose: .compaction, stream: false)
+            (response, callID) = try await callModel(request, purpose: .compaction, helper: usedHelper, stream: false)
         } catch where helperModel != nil && !(error is CancellationError) && !Task.isCancelled {
             report(.informational("The helper model \(helperModel ?? "") couldn't summarize (\(error)); summarizing with the session's model instead."))
             request.model = model
             usedHelper = false
-            (response, callID) = try await callModel(request, purpose: .compaction, stream: false)
+            (response, callID) = try await callModel(request, purpose: .compaction, helper: usedHelper, stream: false)
         }
         record(.message(response.message, appendedToContext: false))
         recordUsage(response.usage, helper: usedHelper)
@@ -944,12 +1073,11 @@ public final class AgentLoop: @unchecked Sendable {
             notes: _notes,
             files: ContextShrinking.fileLists(in: Array(older))
         )
-        _session.messages = Array(systemMessages) + [Message(role: .user, text: summary)] + messages[cut...]
-        recordRewrite(.compaction, before: messages, modelCallID: callID)
-        // Message positions moved, and the declined prompt may be in the summary.
-        _declined = nil
+        let kept = ContextShrinking.redirectingOrphanedPointers(Array(messages[cut...]))
+        let compacted = Array(systemMessages) + [Message(role: .user, text: summary)] + kept
+        rewriteContext(compacted, reason: .compaction, before: messages, modelCallID: callID)
         // The next model call reports the new size; until then, don't compact again.
-        _contextTokens = 0
+        lock.withLock { _contextTokens = 0 }
         return older.count
     }
 
@@ -958,10 +1086,13 @@ public final class AgentLoop: @unchecked Sendable {
     /// Writes `session_started` and the messages the session began with
     /// (the system prompt), once, at the first run.
     private func startJournalIfNeeded() {
-        guard let journal, !_journalStarted else { return }
-        lock.lock()
-        _journalStarted = true
-        lock.unlock()
+        guard let journal else { return }
+        let isFirstStart = journalLock.withLock {
+            let isFirstStart = !_journalStarted
+            _journalStarted = true
+            return isFirstStart
+        }
+        guard isFirstStart else { return }
         let start = SessionStart(
             origin: journal.origin,
             cwd: cwd,
@@ -972,13 +1103,13 @@ public final class AgentLoop: @unchecked Sendable {
         )
         record(.sessionStarted(start))
         if !_isRestored {
-            recordAppended(_session.messages)
+            recordAppended(session.messages)
         }
     }
 
     private func record(_ record: JournalRecord) {
-        guard let journal, _journalStarted else { return }
-        journal.record(JournalEntry(session: _session.id, record: record))
+        guard let journal, journalLock.withLock({ _journalStarted }) else { return }
+        journal.record(JournalEntry(session: sessionID, record: record))
     }
 
     /// Records messages that joined the end of the context.
@@ -991,10 +1122,10 @@ public final class AgentLoop: @unchecked Sendable {
     /// Records a change to the context that isn't a plain append: the new
     /// messages first, then which ids left, which came in, and the order
     /// that results. Nothing is written when nothing changed.
-    private func recordRewrite(_ reason: ContextRewrite.Reason, before: [Message], modelCallID: String? = nil) {
+    private func recordRewrite(_ reason: ContextRewrite.Reason, before: [Message], after: [Message], modelCallID: String? = nil) {
         let beforeIDs = Set(before.map(\.id))
-        let afterIDs = Set(_session.messages.map(\.id))
-        let added = _session.messages.filter { !beforeIDs.contains($0.id) }
+        let afterIDs = Set(after.map(\.id))
+        let added = after.filter { !beforeIDs.contains($0.id) }
         let removed = before.map(\.id).filter { !afterIDs.contains($0) }
         guard !added.isEmpty || !removed.isEmpty else { return }
         for message in added {
@@ -1004,7 +1135,7 @@ public final class AgentLoop: @unchecked Sendable {
             reason: reason,
             removed: removed,
             added: added.map(\.id),
-            context: _session.messages.map(\.id),
+            context: after.map(\.id),
             modelCallID: modelCallID
         )
         record(.contextRewrite(rewrite))
@@ -1044,6 +1175,7 @@ public final class AgentLoop: @unchecked Sendable {
         }
         if let model = options.helperModel { fields["helper_model"] = .string(model) }
         if let model = options.fallbackModel { fields["fallback_model"] = .string(model) }
+        if let effort = options.reasoningEffort { fields["reasoning_effort"] = .string(effort) }
         if let pricing = options.pricing { fields["pricing"] = pricing.json }
         if let pricing = options.helperPricing { fields["helper_pricing"] = pricing.json }
         return .object(fields)
@@ -1051,9 +1183,9 @@ public final class AgentLoop: @unchecked Sendable {
 
     /// One call's estimated cost, priced the way `totalCost` prices it.
     /// A summary that fell back to the session's model is priced as that model.
-    private func cost(of usage: Usage, purpose: ModelCallRecord.Purpose, model: String?) -> Double? {
+    private func cost(of usage: Usage, helper: Bool) -> Double? {
         guard let pricing = options.pricing else { return nil }
-        let isHelperCall = purpose == .compaction && options.helperModel != nil && model == options.helperModel
+        let isHelperCall = helper && options.helperModel != nil
         let callPricing = isHelperCall ? (options.helperPricing ?? pricing) : pricing
         return callPricing.cost(of: usage)
     }
@@ -1098,10 +1230,6 @@ public final class AgentLoop: @unchecked Sendable {
         // Pricing is linear, so the main model's share is all minus the helper's.
         return pricing.cost(of: _usage) - pricing.cost(of: _helperUsage) + helperPricing.cost(of: _helperUsage)
     }
-
-    private func emit(_ event: AgentEvent) {
-        onEvent?(event)
-    }
 }
 
 /// A fallback provider answered a run that has a budget cap.
@@ -1139,7 +1267,10 @@ public struct Pricing: Sendable, Codable, Equatable {
     /// providers publish prices, e.g. `"3,15"`. Nil if it doesn't parse.
     public init?(perMillionTokens text: String) {
         let parts = text.split(separator: ",").map { Double($0.trimmingCharacters(in: .whitespaces)) }
-        guard parts.count == 2, let input = parts[0], let output = parts[1], input >= 0, output >= 0 else { return nil }
+        guard parts.count == 2, let input = parts[0], let output = parts[1] else { return nil }
+        // `Double` also parses "inf" and "nan", which no price is.
+        let isPrice = { (value: Double) in value.isFinite && value >= 0 }
+        guard isPrice(input) && isPrice(output) else { return nil }
         self.init(inputPer1K: input / 1000, outputPer1K: output / 1000)
     }
 
@@ -1188,6 +1319,7 @@ extension LoopOptions {
         if let budget = settings.maxBudgetUSD { options.maxBudgetUSD = budget }
         if let model = settings.fallbackModel { options.fallbackModel = model }
         if let stream = settings.stream { options.streamReplies = stream }
+        if let effort = settings.effort { options.reasoningEffort = effort }
         return options
     }
 }
@@ -1247,6 +1379,10 @@ public struct LoopOptions: Sendable {
     /// provider's recommendation, if it sends one, else stop. Anthropic's
     /// API can do this itself (`ProviderConfig.serverFallbacks`).
     public var fallbackModel: String?
+    /// How hard the session's model thinks on each turn, in place of the
+    /// provider's `reasoningEffort`. Nil = the provider's. Summaries keep
+    /// the provider's: they may run on a helper model that takes other words.
+    public var reasoningEffort: String?
 
     public init(
         maxTurns: Int? = nil,
@@ -1263,7 +1399,8 @@ public struct LoopOptions: Sendable {
         helperModel: String? = nil,
         helperPricing: Pricing? = nil,
         streamReplies: Bool = true,
-        fallbackModel: String? = nil
+        fallbackModel: String? = nil,
+        reasoningEffort: String? = nil
     ) {
         self.maxTurns = maxTurns
         self.loopCheckAfterTurns = loopCheckAfterTurns
@@ -1280,5 +1417,6 @@ public struct LoopOptions: Sendable {
         self.helperPricing = helperPricing
         self.streamReplies = streamReplies
         self.fallbackModel = fallbackModel
+        self.reasoningEffort = reasoningEffort
     }
 }

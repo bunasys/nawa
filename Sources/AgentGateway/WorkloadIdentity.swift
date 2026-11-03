@@ -110,6 +110,7 @@ public struct WorkloadIdentityConfig: Sendable, Codable, Hashable {
 public actor WorkloadIdentityTokenSource {
     static let advisoryRefreshMargin: TimeInterval = 120
     static let mandatoryRefreshMargin: TimeInterval = 30
+    static let exchangeTimeout: TimeInterval = 30
 
     struct AccessToken {
         var value: String
@@ -149,7 +150,9 @@ public actor WorkloadIdentityTokenSource {
             cached = fresh
             return fresh.value
         } catch {
-            let stillSafe = cached.map { currentTime < $0.expiresAt.addingTimeInterval(-Self.mandatoryRefreshMargin) } ?? false
+            // The exchange may have taken a while: judge the cached token by the time now.
+            let timeAfterExchange = now()
+            let stillSafe = cached.map { timeAfterExchange < $0.expiresAt.addingTimeInterval(-Self.mandatoryRefreshMargin) } ?? false
             if stillSafe, let cached { return cached.value }
             throw error
         }
@@ -166,6 +169,10 @@ public actor WorkloadIdentityTokenSource {
     private func exchange() async throws -> AccessToken {
         let assertion = try config.readIdentityToken()
         var request = URLRequest(url: tokenURL)
+        // Short, unlike a model call: a cached token may only be served
+        // until its mandatory margin, and a hung exchange would outlast it.
+        // Assigned, not passed to init: on Linux only the setter marks it as set.
+        request.timeoutInterval = Self.exchangeTimeout
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(config.exchangeBody(assertion: assertion))

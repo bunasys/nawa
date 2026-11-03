@@ -32,10 +32,12 @@ protocol TerminalIO: AnyObject {
 ///
 /// Raw mode keeps `OPOST`, so a stray `\n` from elsewhere still moves to
 /// the start of the next line. The saved settings are restored on normal
-/// exit, on `SIGTERM` / `SIGHUP` (an ssh disconnect) and through `atexit`;
-/// `SIGINT` can't arrive in raw mode, Ctrl-C is read as a key.
+/// exit, through `atexit`, on `SIGTERM` / `SIGHUP` (an ssh disconnect), and
+/// on a crash or a signal sent from outside (`SIGSEGV`, `SIGABRT`, a
+/// `kill -INT`, …). The keyboard sends no signals in raw mode: Ctrl-C is
+/// read as a key.
 @MainActor
-final class Terminal: TerminalIO {
+public final class Terminal: TerminalIO {
     /// What the terminal reports besides keys.
     enum Signal: Sendable {
         case resized
@@ -46,6 +48,7 @@ final class Terminal: TerminalIO {
     private let input: Int32 = STDIN_FILENO
     private let output: Int32 = STDOUT_FILENO
     private var signalSources: [any DispatchSourceSignal] = []
+    private var watchedSignals: [Int32] = []
 
     /// Whether stdin and stdout are a terminal worth drawing on.
     nonisolated static func isInteractive(environment: [String: String]) -> Bool {
@@ -73,13 +76,13 @@ final class Terminal: TerminalIO {
         guard tcgetattr(input, &settings) == 0 else { throw TerminalError.notATerminal }
         TerminalState.save(settings)
         atexit { TerminalState.restore() }
-        try enterRawMode()
-        rawWrite(Escape.bracketedPasteOn)
+        guard TerminalState.enter() else { throw TerminalError.notATerminal }
+        CrashRestore.install(settings)
 
         watch(SIGWINCH) { signals(.resized) }
         watch(SIGCONT) {
             // A shell restores its own settings when it stops a job: take raw mode back.
-            TerminalState.reenterRaw()
+            TerminalState.enter()
             signals(.resumed)
         }
         for signal in [SIGTERM, SIGHUP] {
@@ -90,15 +93,18 @@ final class Terminal: TerminalIO {
         }
     }
 
-    /// Restores the terminal as it was before `start`.
+    /// Restores the terminal as it was before `start`, signal handling included.
     func stop() {
         for source in signalSources { source.cancel() }
         signalSources = []
+        for number in watchedSignals + [SIGTSTP] { signal(number, SIG_DFL) }
+        watchedSignals = []
+        CrashRestore.uninstall()
         TerminalState.restore()
     }
 
     func write(_ text: String) {
-        rawWrite(text)
+        TerminalState.write(text, to: output)
     }
 
     func suspend() {
@@ -107,15 +113,7 @@ final class Terminal: TerminalIO {
         signal(SIGTSTP, SIG_DFL)
         kill(getpid(), SIGTSTP)
         signal(SIGTSTP, SIG_IGN)
-        TerminalState.reenterRaw()
-    }
-
-    private func enterRawMode() throws(TerminalError) {
-        guard TerminalState.reenterRaw() else { throw TerminalError.notATerminal }
-    }
-
-    private func rawWrite(_ text: String) {
-        TerminalState.write(text, to: output)
+        TerminalState.enter()
     }
 
     private func watch(_ number: Int32, _ handler: @escaping @Sendable () -> Void) {
@@ -124,6 +122,44 @@ final class Terminal: TerminalIO {
         source.setEventHandler(handler: handler)
         source.resume()
         signalSources.append(source)
+        watchedSignals.append(number)
+    }
+
+    // MARK: - Line mode
+
+    /// Calls `handler` on each Ctrl-C (`SIGINT`) instead of letting it end
+    /// the process, until the returned closure is called; then Ctrl-C
+    /// ends the process again. For line mode, where the terminal still
+    /// turns Ctrl-C into a signal.
+    nonisolated static func catchInterrupts(_ handler: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
+        signal(SIGINT, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+        source.setEventHandler(handler: handler)
+        source.resume()
+        let stopper = SignalSourceStopper(source)
+        return {
+            stopper.source.cancel()
+            signal(SIGINT, SIG_DFL)
+        }
+    }
+
+    /// Asks for a secret: writes `prompt` and reads one line with echo off
+    /// (the Enter is still echoed). Unlike `getpass(3)`, the line has no
+    /// length limit; macOS cuts it at 128 characters, shorter than some
+    /// API keys. When stdin isn't a terminal it just reads a line. Nil at
+    /// the end of input.
+    public nonisolated static func readHiddenLine(prompt: String) -> String? {
+        // Earlier `print`s may still sit in stdout's buffer; the prompt goes after them.
+        fflush(nil)
+        TerminalState.write(prompt, to: STDOUT_FILENO)
+        var settings = termios()
+        guard tcgetattr(STDIN_FILENO, &settings) == 0 else { return readLine() }
+        var hidden = settings
+        hidden.c_lflag &= ~tcflag_t(ECHO)
+        hidden.c_lflag |= tcflag_t(ECHONL)
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &hidden)
+        defer { tcsetattr(STDIN_FILENO, TCSAFLUSH, &settings) }
+        return readLine()
     }
 
     // MARK: - Reading keys
@@ -165,10 +201,13 @@ private enum TerminalState {
         locked { if saved == nil { saved = settings } }
     }
 
-    /// `cfmakeraw` minus `OPOST`: no echo, no line buffering, no signals
-    /// from Ctrl-C / Ctrl-Z, bytes delivered as they arrive.
+    /// Raw mode and bracketed paste on: the exact inverse of `restore()`,
+    /// so a resume after Ctrl-Z gets back everything a suspend undid.
+    ///
+    /// Raw mode is `cfmakeraw` minus `OPOST`: no echo, no line buffering,
+    /// no signals from Ctrl-C / Ctrl-Z, bytes delivered as they arrive.
     @discardableResult
-    static func reenterRaw() -> Bool {
+    static func enter() -> Bool {
         locked {
             guard var raw = saved else { return false }
             raw.c_iflag &= ~tcflag_t(BRKINT | ICRNL | INPCK | ISTRIP | IXON)
@@ -179,6 +218,7 @@ private enum TerminalState {
                 cc[Int(VTIME)] = 0
             }
             guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 else { return false }
+            write(Escape.bracketedPasteOn, to: STDOUT_FILENO)
             isRaw = true
             return true
         }
@@ -207,6 +247,48 @@ private enum TerminalState {
     }
 }
 
+/// Puts the terminal back when the process dies of a signal that skips
+/// `atexit`: a crash (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGTRAP` from a Swift
+/// runtime trap, `SIGABRT`) or one sent from outside (`SIGINT`, `SIGQUIT`).
+///
+/// The handler may only make async-signal-safe calls: no locks, no
+/// allocation. So the settings and the escape bytes are prepared at
+/// install time, and the handler uses `tcsetattr`, `write` and `sigaction`.
+/// It then reinstalls what was there before (the default action, or the
+/// Swift runtime's backtracer) and raises the signal again.
+private enum CrashRestore {
+    static let signals: [Int32] = [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGINT, SIGQUIT]
+    private static let reset: StaticString = "\u{1B}[?2004l\u{1B}[?25h"
+    /// Indexed by signal number; read by the handler, so fixed memory.
+    nonisolated(unsafe) private static let previous = UnsafeMutablePointer<sigaction>.allocate(capacity: 64)
+    nonisolated(unsafe) private static let settings = UnsafeMutablePointer<termios>.allocate(capacity: 1)
+    nonisolated(unsafe) private static var installed = false
+
+    static func install(_ saved: termios) {
+        guard !installed else { return }
+        installed = true
+        settings.pointee = saved
+        for number in signals {
+            sigaction(number, nil, previous + Int(number))
+            signal(number) { number in CrashRestore.handle(number) }
+        }
+    }
+
+    static func uninstall() {
+        guard installed else { return }
+        installed = false
+        for number in signals { sigaction(number, previous + Int(number), nil) }
+    }
+
+    private static func handle(_ number: Int32) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, settings)
+        _ = systemWrite(STDOUT_FILENO, reset.utf8Start, reset.utf8CodeUnitCount)
+        sigaction(number, previous + Int(number), nil)
+        // Delivered once this handler returns; a fault simply happens again.
+        raise(number)
+    }
+}
+
 /// `write(2)`, under a name the methods called `write` don't shadow.
 private func systemWrite(_ fd: Int32, _ bytes: UnsafeRawPointer?, _ count: Int) -> Int {
     write(fd, bytes, count)
@@ -219,6 +301,10 @@ private final class KeyReader: @unchecked Sendable {
     private let continuation: AsyncStream<[Key]>.Continuation
     /// Written to by `stop()` to wake the reader out of `poll`.
     private var wake: [Int32] = [-1, -1]
+    /// Guards `closed`: once the pipe is closed its numbers may belong to
+    /// another file, so `stop()` must not write to them.
+    private let lock = NSLock()
+    private var closed = false
 
     init(fd: Int32, continuation: AsyncStream<[Key]>.Continuation) {
         self.fd = fd
@@ -232,6 +318,9 @@ private final class KeyReader: @unchecked Sendable {
     }
 
     func stop() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
         var byte: UInt8 = 0
         _ = systemWrite(wake[1], &byte, 1)
     }
@@ -240,9 +329,13 @@ private final class KeyReader: @unchecked Sendable {
         var decoder = KeyDecoder()
         var buffer = [UInt8](repeating: 0, count: 4096)
         defer {
+            // `finish` calls `stop()` through `onTermination`: the pipe must still be open.
+            continuation.finish()
+            lock.lock()
+            closed = true
             close(wake[0])
             close(wake[1])
-            continuation.finish()
+            lock.unlock()
         }
         while true {
             var fds = [pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
@@ -265,4 +358,12 @@ private final class KeyReader: @unchecked Sendable {
             if !keys.isEmpty { continuation.yield(keys) }
         }
     }
+}
+
+/// Carries a signal source into a `@Sendable` closure. Linux's Dispatch
+/// doesn't mark `DispatchSourceSignal` Sendable, though `cancel()` is safe
+/// to call from any thread.
+private final class SignalSourceStopper: @unchecked Sendable {
+    let source: any DispatchSourceSignal
+    init(_ source: any DispatchSourceSignal) { self.source = source }
 }

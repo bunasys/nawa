@@ -43,15 +43,11 @@ public struct SystemPrompt: Sendable {
             ? SkillCatalog.discover(from: directory, environment: environment, includeProjectSkills: projectSkills)
             : SkillCatalog(skills: [])
         let userSoul = readSoul(at: nawaConfigDirectory(environment: environment).appendingPathComponent("SOUL.md"))
-        let projectSoul = projectDirectories(from: directory).lazy
-            .map { $0.appendingPathComponent("SOUL.md") }
-            .compactMap { file in readSoul(at: file).map { (file, $0) } }
-            .first
 
         var sections: [String] = []
         sections.append(userSoul ?? defaultPersona)
-        if let (file, soul) = projectSoul {
-            sections.append("# Project persona (from \(displayPath(file, relativeTo: directory)))\n\n\(soul)")
+        if let projectSoul = projectSoulSection(for: directory) {
+            sections.append(projectSoul)
         }
         if let instructions {
             sections.append("# Project instructions\n\n\(instructions.text)")
@@ -72,8 +68,18 @@ public struct SystemPrompt: Sendable {
         )
     }
 
+    /// The nearest project SOUL.md, up to the git root, as a section.
+    private static func projectSoulSection(for directory: URL) -> String? {
+        for folder in projectDirectories(from: directory) {
+            let file = folder.appendingPathComponent("SOUL.md")
+            guard let soul = readSoul(at: file) else { continue }
+            return "# Project persona (from \(displayPath(file, relativeTo: directory)))\n\n\(soul)"
+        }
+        return nil
+    }
+
     private static func readSoul(at file: URL) -> String? {
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+        guard let text = readTextFile(file, maxBytes: ProjectInstructions.maxFileBytes) else { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }

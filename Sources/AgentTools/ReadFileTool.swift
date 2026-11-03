@@ -16,6 +16,9 @@ public struct ReadFileTool: Tool {
     /// A size cap next to the line cap (~10K tokens): 2,000 long lines can
     /// be 80K characters, and every later request resends them.
     static let maxChars = 40_000
+    /// Longer lines are cut, so one minified line can't take the whole size
+    /// cap; a note after the lines says how to read the rest of one.
+    static let maxLineLength = 500
 
     public init(workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) {
         self.workingDirectory = workingDirectory
@@ -71,20 +74,24 @@ public struct ReadFileTool: Tool {
         }
         if text.isEmpty { return "(empty file)" }
 
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        if text.hasSuffix("\n") { lines.removeLast() }
+        var lines = splitLines(text)
+        if lines.last?.isEmpty == true { lines.removeLast() }
         guard offset <= lines.count else {
             throw ToolError.argumentError("offset \(offset) is past the end of \(path) (\(lines.count) lines)")
         }
 
-        let lastAsked = min(lines.count, offset + limit - 1)
+        // Written so a huge limit can't overflow.
+        let linesFromOffset = lines.count - offset + 1
+        let lastAsked = offset + min(limit, linesFromOffset) - 1
         var output: [String] = []
         var outputChars = 0
         var last = offset - 1
+        var cutLines: [Int] = []
         for number in offset...lastAsked {
             var line = lines[number - 1]
-            if line.count > CapturedOutput.maxLineLength {
-                line = line.prefix(CapturedOutput.maxLineLength) + " […]"
+            if line.count > Self.maxLineLength {
+                line = line.prefix(Self.maxLineLength) + " […]"
+                cutLines.append(number)
             }
             let numbered = "\(number)\t\(line)"
             // Stop at whole lines once the size cap is reached; the first line always fits.
@@ -99,6 +106,18 @@ public struct ReadFileTool: Tool {
             let reason = stoppedBySize ? " (stopped at \(Self.maxChars / 1000)K characters)" : ""
             output.append("[showing lines \(offset)-\(last) of \(lines.count)\(reason); pass offset \(last + 1) to read on, or search for what you need]")
         }
+        let shownCutLines = cutLines.filter { $0 <= last }
+        if !shownCutLines.isEmpty {
+            output.append(Self.cutLinesNote(shownCutLines, path: path))
+        }
         return output.joined(separator: "\n")
+    }
+
+    private static func cutLinesNote(_ numbers: [Int], path: String) -> String {
+        let listed = numbers.prefix(10).map(String.init).joined(separator: ", ")
+        let more = numbers.count > 10 ? " and \(numbers.count - 10) more" : ""
+        let from = maxLineLength + 1
+        return "[lines longer than \(maxLineLength) characters were cut (\(listed)\(more)); "
+            + "read the rest of one with shell, e.g. sed -n '\(numbers[0])p' \(path) | cut -c \(from)-\(from + 4999)]"
     }
 }

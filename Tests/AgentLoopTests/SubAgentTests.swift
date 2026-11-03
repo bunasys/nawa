@@ -14,10 +14,14 @@ final class ParallelModel: LanguageModel, Sendable {
     let inFlight = Mutex(0)
     let mostInFlight = Mutex(0)
     let childInputTokens: Int
+    /// Children answer with a tool call instead of text, so they go on
+    /// calling until their budget stops them.
+    let childrenCallTools: Bool
 
-    init(parentReplies: [ModelResponse], childInputTokens: Int = 10) {
+    init(parentReplies: [ModelResponse], childInputTokens: Int = 10, childrenCallTools: Bool = false) {
         self.parentReplies = Mutex(parentReplies)
         self.childInputTokens = childInputTokens
+        self.childrenCallTools = childrenCallTools
     }
 
     func complete(_ request: ModelRequest) async throws -> ModelResponse {
@@ -30,6 +34,10 @@ final class ParallelModel: LanguageModel, Sendable {
         // Long enough that children started together overlap.
         try await Task.sleep(for: .milliseconds(100))
         inFlight.withLock { $0 -= 1 }
+        if childrenCallTools {
+            let call = ToolCall(id: UUID().uuidString, name: "look", arguments: .object([:]))
+            return ModelResponse(message: Message(role: .assistant, content: [.toolCall(call)]), finishReason: .toolUse, usage: Usage(inputTokens: childInputTokens))
+        }
         let job = firstText.components(separatedBy: "Your job:\n").last ?? ""
         return ModelResponse(message: Message(role: .assistant, text: "answer to \(job)"), usage: Usage(inputTokens: childInputTokens))
     }
@@ -103,10 +111,12 @@ struct SubAgentTests {
                 ModelResponse(message: Message(role: .assistant, content: [.toolCall(task("a", "one")), .toolCall(task("b", "two"))]), finishReason: .toolUse, usage: Usage(inputTokens: 200)),
                 ModelResponse(message: Message(role: .assistant, text: "done")),
             ],
-            childInputTokens: 500
+            childInputTokens: 500,
+            childrenCallTools: true
         )
         // $1 budget, $0.20 spent by the parent: $0.80 left, $0.40 per child.
-        // Each child's call costs $0.50: within $0.80, over its $0.40 share.
+        // Each child's call costs $0.50: within $0.80, over its $0.40 share,
+        // so neither runs its tool call.
         let options = LoopOptions(maxBudgetUSD: 1, pricing: Pricing(inputPer1K: 1), subAgents: true)
         let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: options)
 
@@ -118,6 +128,51 @@ struct SubAgentTests {
         }
         #expect(results.count == 2)
         #expect(results.allSatisfy { $0.isError && $0.content.contains(AgentResultKind.errorMaxBudgetUSD.rawValue) })
+    }
+
+    /// More calls than run at once: the later batch must not get the same
+    /// share of the remaining budget as the first, which would overspend.
+    @Test(.timeLimit(.minutes(1)))
+    func batchesSplitTheBudgetOverEveryCall() async throws {
+        let calls = (1...5).map { ContentBlock.toolCall(task("t\($0)", "job \($0)")) }
+        let model = ParallelModel(
+            parentReplies: [
+                ModelResponse(message: Message(role: .assistant, content: calls), finishReason: .toolUse, usage: Usage(inputTokens: 200)),
+                ModelResponse(message: Message(role: .assistant, text: "done")),
+            ],
+            childInputTokens: 30,
+            childrenCallTools: true
+        )
+        // $0.80 left after the parent's call, $0.16 per child. A child's
+        // calls cost $0.03 each: it makes six ($0.18), the sixth crossing
+        // its share. A $0.20 share would have allowed seven per child.
+        let options = LoopOptions(maxBudgetUSD: 1, pricing: Pricing(inputPer1K: 1), subAgents: true)
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry(), options: options)
+
+        let result = try await finalResult(loop.run(prompt: "go"))
+
+        #expect(loop.usage.inputTokens == 200 + 5 * 180)
+        #expect(result.kind == .errorMaxBudgetUSD)
+    }
+
+    /// A sub-agent cut short by an interrupt still spent what it spent.
+    @Test(.timeLimit(.minutes(1)))
+    func aCancelledSubAgentsSpendIsCounted() async throws {
+        let gate = GatedTool()
+        let model = ScriptedModel(responses: [
+            toolCallResponse(task("t1", "look"), usage: Usage(inputTokens: 10)),
+            toolCallResponse(ToolCall(id: "k1", name: "gated"), usage: Usage(inputTokens: 100)),
+            ModelResponse(message: Message(role: .assistant, text: "ok"), usage: Usage(inputTokens: 1)),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([gate]), options: LoopOptions(subAgents: true, streamReplies: false))
+
+        let first = Task { for try await _ in loop.run(prompt: "go") {} }
+        await gate.started.wait()
+        first.cancel()
+        _ = try await finalResult(loop.run(prompt: "next", continuing: true))
+        gate.release.open()
+
+        #expect(loop.usage.inputTokens == 111)
     }
 }
 
@@ -161,6 +216,22 @@ struct LoopSettingsTests {
         #expect(options.maxBudgetUSD == 2)
         #expect(options.streamReplies == false)  // not set, so not changed
         #expect(base.applying(LoopSettings()).maxTurns == 50)
+    }
+
+    /// The effort goes with every turn of the session's model.
+    @Test
+    func theEffortSettingReachesEveryTurn() async throws {
+        let model = ScriptedModel(responses: [
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c1", name: "echo", arguments: .object([:])))]), finishReason: .toolUse),
+            ModelResponse(message: Message(role: .assistant, text: "done"), finishReason: .endTurn),
+        ])
+        let options = LoopOptions().applying(LoopSettings(effort: "high"))
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+
+        for try await _ in loop.run(prompt: "go") {}
+
+        #expect(model.requests.map(\.reasoningEffort) == ["high", "high"])
+        #expect(LoopOptions().applying(LoopSettings()).reasoningEffort == nil)
     }
 
     @Test

@@ -15,21 +15,31 @@ public struct SessionStore: Sendable {
         self.directory = directory
     }
 
-    /// `$NAWA_SESSIONS_DIR`, else `$XDG_STATE_HOME/nawa/sessions`, else
-    /// `~/.local/state/nawa/sessions`. Nil when `NAWA_SESSIONS=off`.
+    /// `$NAWA_SESSIONS_DIR`, else `defaultDirectory`. Nil when
+    /// `NAWA_SESSIONS=off`.
+    ///
+    /// Kept for library users. Nawa's CLI reads those two variables as
+    /// settings (`sessions`, `sessions_dir`) and calls `defaultDirectory`.
     public static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) -> SessionStore? {
         let recordingIsOff = ["off", "0", "false", "no"].contains(env["NAWA_SESSIONS"]?.lowercased() ?? "")
         if recordingIsOff { return nil }
         if let directory = env["NAWA_SESSIONS_DIR"], !directory.isEmpty {
             return SessionStore(directory: URL(fileURLWithPath: directory))
         }
+        return SessionStore(directory: defaultDirectory(environment: env))
+    }
+
+    /// `$XDG_STATE_HOME/nawa/sessions`, else `~/.local/state/nawa/sessions`.
+    /// Reads only `XDG_STATE_HOME` and `HOME`.
+    public static func defaultDirectory(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
         let stateHome: URL
-        if let xdg = env["XDG_STATE_HOME"], !xdg.isEmpty {
+        if let xdg = environment["XDG_STATE_HOME"], !xdg.isEmpty {
             stateHome = URL(fileURLWithPath: xdg)
         } else {
-            stateHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/state")
+            let home = environment["HOME"] ?? NSHomeDirectory()
+            stateHome = URL(fileURLWithPath: home).appendingPathComponent(".local/state")
         }
-        return SessionStore(directory: stateHome.appendingPathComponent("nawa/sessions"))
+        return stateHome.appendingPathComponent("nawa/sessions")
     }
 
     // MARK: Names
@@ -51,7 +61,7 @@ public struct SessionStore: Sendable {
     }
 
     /// The session id in a journal's file name, if it is one of ours.
-    static func sessionID(inFileName name: String) -> String? {
+    public static func sessionID(inFileName name: String) -> String? {
         let timestampLength = "2026-10-28T08-00-03Z-".count
         guard name.hasSuffix(".jsonl"), name.count > timestampLength + ".jsonl".count else { return nil }
         let id = String(name.dropFirst(timestampLength).dropLast(".jsonl".count))
@@ -75,45 +85,62 @@ public struct SessionStore: Sendable {
         return journalURLs().first { Self.sessionID(inFileName: $0.lastPathComponent) == sessionID }
     }
 
-    /// The newest session started in `cwd`, by `mode` if given, for
-    /// `repl --resume` without an id.
+    /// The session in `cwd` written to most recently, by `mode` if given,
+    /// for `repl --resume` without an id. Last written, not last started:
+    /// a session resumed today is newer than one started this morning.
     public func newestSession(inDirectory cwd: String, mode: String? = nil) -> URL? {
-        journalURLs().first { url in
+        var lastWritten: [URL: Date] = [:]
+        for url in journalURLs() {
+            lastWritten[url] = Self.modificationDate(of: url) ?? .distantPast
+        }
+        let lastWrittenFirst = lastWritten.keys.sorted { lastWritten[$0]! > lastWritten[$1]! }
+        return lastWrittenFirst.first { url in
             guard case .sessionStarted(let start)? = JournalReader.readFirst(url)?.entry.record else { return false }
             let modeMatches = mode == nil || start.origin.mode == mode
             return start.cwd == cwd && modeMatches
         }
     }
 
-    /// Deletes the journals last written before `date`; returns them.
-    public func prune(lastWrittenBefore date: Date) throws -> [URL] {
-        var removed: [URL] = []
-        for url in journalURLs() {
-            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard let modified = attributes[.modificationDate] as? Date, modified < date else { continue }
-            try FileManager.default.removeItem(at: url)
-            removed.append(url)
-        }
-        return removed
+    /// What `pruneJournals` did.
+    public struct PruneResult: Sendable, Hashable {
+        public var removed: [URL] = []
+        /// Old enough, but open in a running nawa.
+        public var inUse: [URL] = []
+        /// Old enough, but removing them failed.
+        public var failed: [URL] = []
     }
-}
 
-extension JournalReader {
-    /// The first record only, read without loading the whole file: enough
-    /// to tell where and when a session started.
-    public static func readFirst(_ url: URL) -> JournalLine? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        var buffer = Data()
-        while true {
-            guard let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
-            buffer.append(chunk)
-            if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                buffer = buffer[..<newline]
-                break
+    /// Deletes the journals last written before `date`, except those a
+    /// running nawa has open. A file that vanishes or can't be removed
+    /// meanwhile is skipped, so one problem doesn't hide what was done.
+    public func pruneJournals(lastWrittenBefore date: Date) -> PruneResult {
+        var result = PruneResult()
+        for url in journalURLs() {
+            guard let modified = Self.modificationDate(of: url), modified < date else { continue }
+            if JournalFile.isInUse(url) {
+                result.inUse.append(url)
+                continue
+            }
+            do {
+                try FileManager.default.removeItem(at: url)
+                result.removed.append(url)
+            } catch {
+                result.failed.append(url)
             }
         }
-        return try? JournalFormat.decode(Data(buffer))
+        return result
+    }
+
+    /// Deletes the journals last written before `date`; returns them.
+    /// `pruneJournals` also says which were skipped.
+    public func prune(lastWrittenBefore date: Date) throws -> [URL] {
+        pruneJournals(lastWrittenBefore: date).removed
+    }
+
+    /// Nil when the file is gone or can't be read.
+    static func modificationDate(of url: URL) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return attributes?[.modificationDate] as? Date
     }
 }
 

@@ -83,7 +83,9 @@ public enum ACPStopReason: String, Sendable {
         case .success: self = .endTurn
         case .errorMaxTurns: self = .maxTurnRequests
         case .errorMaxBudgetUSD: self = .maxTurnRequests
-        case .errorDuringExecution: self = .refusal
+        // Never sent: a failed turn is answered with a JSON-RPC error (see
+        // `ACPSession.runTurn`), because `refusal` would read as "the model declined".
+        case .errorDuringExecution: self = .endTurn
         case .refused: self = .refusal
         }
     }
@@ -97,6 +99,8 @@ public enum ACPContentBlock: Sendable, Hashable {
     case image(mimeType: String, data: String, uri: String?)
     case audio(mimeType: String, data: String)
     case resource(uri: String, mimeType: String?, text: String)
+    /// A file the client points at without sending its content.
+    case resourceLink(uri: String, name: String)
 
     /// Decode from wire JSON, tolerating unknown variants (forward compat).
     public init?(json: JSON) {
@@ -112,10 +116,15 @@ public enum ACPContentBlock: Sendable, Hashable {
             guard let data = object["data"]?.stringValue else { return nil }
             self = .audio(mimeType: object["mimeType"]?.stringValue ?? "audio/wav", data: data)
         case "resource":
-            guard let r = object["resource"]?.objectValue,
-                let uri = r["uri"]?.stringValue
+            // A binary (`blob`) resource has no text to give the model.
+            guard let resource = object["resource"]?.objectValue,
+                let uri = resource["uri"]?.stringValue,
+                let text = resource["text"]?.stringValue
             else { return nil }
-            self = .resource(uri: uri, mimeType: r["mimeType"]?.stringValue, text: r["text"]?.stringValue ?? "")
+            self = .resource(uri: uri, mimeType: resource["mimeType"]?.stringValue, text: text)
+        case "resource_link":
+            guard let uri = object["uri"]?.stringValue else { return nil }
+            self = .resourceLink(uri: uri, name: object["name"]?.stringValue ?? uri)
         default:
             return nil
         }
@@ -136,26 +145,25 @@ public enum ACPContentBlock: Sendable, Hashable {
             if let mime { r["mimeType"] = .string(mime) }
             r["text"] = .string(text)
             return .object(["type": .string("resource"), "resource": .object(r)])
+        case .resourceLink(let uri, let name):
+            return .object(["type": .string("resource_link"), "uri": .string(uri), "name": .string(name)])
         }
     }
-}
 
-// MARK: - Collection of valid ACP method names
-
-/// ACP method names the agent can receive.
-public enum ACPMethod: String, Sendable {
-    case initialize
-    case newSession = "session/new"
-    case loadSession = "session/load"
-    case prompt = "session/prompt"
-    case cancel = "session/cancel"
-    case setMode = "session/set_mode"
-}
-
-/// ACP method names / notifications the agent emits to the client.
-public enum ACPClientMethod: String, Sendable {
-    case update = "session/update"
-    case requestPermission = "session/request_permission"
+    /// How the block reads in the prompt the model gets; nil for kinds the
+    /// agent doesn't advertise (images, audio).
+    public var promptText: String? {
+        switch self {
+        case .text(let text):
+            return text
+        case .resource(let uri, _, let text):
+            return "<file uri=\"\(uri)\">\n\(text)\n</file>"
+        case .resourceLink(let uri, _):
+            return "@\(uri)"
+        case .image, .audio:
+            return nil
+        }
+    }
 }
 
 /// The kinds of `session/update` payloads (wire `sessionUpdate` discriminator).
@@ -218,15 +226,16 @@ public enum ACPSessionUpdate {
         return .object(update)
     }
 
-    /// Update usage/context accounting for the session.
-    public static func usageUpdate(used: Int, size: Int, costUSDCenticents: Double? = nil) -> JSON {
+    /// Update usage/context accounting for the session: `used` tokens of a
+    /// context of `size`, and what the session has cost so far.
+    public static func usageUpdate(used: Int, size: Int, costUSD: Double? = nil) -> JSON {
         var update: [String: JSON] = [
             "sessionUpdate": .string(ACPSessionUpdateKind.usageUpdate.rawValue),
             "used": .int(used),
             "size": .int(size),
         ]
-        if let costUSDCenticents {
-            update["cost"] = .object(["amount": .double(costUSDCenticents), "currency": .string("USD")])
+        if let costUSD {
+            update["cost"] = .object(["amount": .double(costUSD), "currency": .string("USD")])
         }
         return .object(update)
     }

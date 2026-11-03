@@ -29,6 +29,8 @@ public struct AnthropicClient: LanguageModel, Sendable {
     public let requestTimeout: TimeInterval
     /// Sent as `output_config.effort`; see `ProviderConfig.reasoningEffort`.
     public let reasoningEffort: String?
+    /// Sent with every request; see `ProviderConfig.headers`.
+    public let headers: [String: String]
     public let session: URLSession
 
     static let apiVersion = "2023-06-01"
@@ -51,9 +53,11 @@ public struct AnthropicClient: LanguageModel, Sendable {
         serverFallbacks: Bool = false,
         requestTimeout: TimeInterval = Self.defaultRequestTimeout,
         reasoningEffort: String? = nil,
+        headers: [String: String] = [:],
         session: URLSession = .shared
     ) {
         self.reasoningEffort = reasoningEffort
+        self.headers = headers
         self.providerName = providerName
         self.baseURL = Self.versionedBaseURL(baseURL)
         self.apiKey = apiKey
@@ -160,7 +164,7 @@ public struct AnthropicClient: LanguageModel, Sendable {
     /// caches the whole prefix up to each breakpoint, so a turn pays full
     /// price only for what changed since the previous one; cache reads cost
     /// about a tenth of fresh input. (The API allows four breakpoints.)
-    static func requestBody(_ request: ModelRequest, serverFallbacks: Bool = false, effort: String? = nil) throws -> JSON {
+    static func requestBody(_ request: ModelRequest, serverFallbacks: Bool = false, effort providerEffort: String? = nil) throws -> JSON {
         var body: [String: JSON] = [
             "model": .string(try request.requiredModel()),
             "max_tokens": .int(request.maxOutputTokens ?? defaultMaxTokens),
@@ -189,7 +193,8 @@ public struct AnthropicClient: LanguageModel, Sendable {
         if serverFallbacks {
             body["fallbacks"] = .string("default")
         }
-        if let effort {
+        // The request's effort (the `effort` setting) wins over the provider's.
+        if let effort = request.reasoningEffort ?? providerEffort {
             body["output_config"] = .object(["effort": .string(effort)])
         }
         // Current Claude models reject sampling parameters, so only send one
@@ -400,13 +405,15 @@ public struct AnthropicClient: LanguageModel, Sendable {
         return (data, WireFacts(request: urlRequest, response: response))
     }
 
-    /// A request with the version and auth headers.
+    /// A request with the version and auth headers. The provider's own
+    /// headers go first, so the ones set here win over a configured copy.
     private func makeRequest(method: String, url: URL, body: JSON?, serverFallbacks: Bool = false) async throws -> URLRequest {
         var urlRequest = URLRequest(url: url)
         // Assigned, not passed to init: on Linux only the setter marks the
         // timeout as set, and otherwise URLSession uses the session's 60 s.
         urlRequest.timeoutInterval = requestTimeout
         urlRequest.httpMethod = method
+        for (name, value) in headers { urlRequest.setValue(value, forHTTPHeaderField: name) }
         urlRequest.setValue(Self.apiVersion, forHTTPHeaderField: "anthropic-version")
         if serverFallbacks {
             urlRequest.setValue(Self.serverFallbackBeta, forHTTPHeaderField: "anthropic-beta")
@@ -495,8 +502,10 @@ struct AnthropicStreamAssembler {
             }
         case "content_block_stop":
             if let json = toolInput[index] {
-                let input = json.isEmpty ? JSON.object([:]) : (try? JSONDecoder().decode(JSON.self, from: Data(json.utf8))) ?? .object([:])
-                blocks[index]?["input"] = input
+                // Input that isn't JSON (most often cut off by `max_tokens`)
+                // stays a string, so the tool isn't run without its arguments.
+                let parsed = try? JSONDecoder().decode(JSON.self, from: Data(json.utf8))
+                blocks[index]?["input"] = json.isEmpty ? .object([:]) : parsed ?? .string(json)
             }
         case "message_delta":
             let delta = event["delta"]?.objectValue

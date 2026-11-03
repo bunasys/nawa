@@ -67,10 +67,18 @@ public struct ResultSummary: Sendable, Hashable {
 
     public init(_ result: ToolCallResult) {
         var lines = result.content.split(separator: "\n", omittingEmptySubsequences: false)
-        var exitCode: Int?
-        if let first = lines.first, let match = first.wholeMatch(of: /exit code: (-?\d+)/) {
-            exitCode = Int(match.1)
-            lines.removeFirst()
+        // The shell tool's first line says how the command ended
+        // (`ShellTool`): kept short here, the output follows it.
+        var ending: String?
+        if let first = lines.first {
+            if let match = first.wholeMatch(of: /exit code: (-?\d+)/) {
+                ending = "exit \(match.1)"
+            } else if let match = first.wholeMatch(of: /killed by signal (\d+)/) {
+                ending = "killed by signal \(match.1)"
+            } else if let match = first.prefixMatch(of: /timed out after (\d+) seconds/) {
+                ending = "timed out after \(match.1)s"
+            }
+            if ending != nil { lines.removeFirst() }
         }
 
         var omitted = 0
@@ -89,7 +97,7 @@ public struct ResultSummary: Sendable, Hashable {
         if lines.last?.isEmpty == true { lines.removeLast() }
         if lines == ["(no output)"] { lines = [] }
 
-        if result.isError && exitCode == nil {
+        if result.isError && ending == nil {
             let message = lines.first { !$0.allSatisfy(\.isWhitespace) } ?? "failed"
             self.init(text: String(message), isError: true, fullOutputPath: path)
             return
@@ -97,7 +105,7 @@ public struct ResultSummary: Sendable, Hashable {
 
         let count = lines.count + omitted
         var parts: [String] = []
-        if let exitCode { parts.append("exit \(exitCode)") }
+        if let ending { parts.append(ending) }
         parts.append(count == 0 ? "no output" : count == 1 ? "1 line" : "\(count) lines")
         if let path { parts.append("full output: \(path)") }
         self.init(text: parts.joined(separator: " · "), isError: result.isError, fullOutputPath: path)

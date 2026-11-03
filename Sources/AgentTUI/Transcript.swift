@@ -160,9 +160,8 @@ public struct Transcript: Sendable {
     /// `now` times the reasoning for the `thought for 4s` note.
     public mutating func reduce(_ event: AgentEvent, now: ContinuousClock.Instant = .now) -> [Block] {
         switch event {
-        case .initEvent, .toolResult:
-            // The header is printed at startup; `.toolResults` carries the
-            // same results as a batch.
+        case .initEvent:
+            // The header is printed at startup.
             return []
 
         case .stream(let update):
@@ -188,7 +187,10 @@ public struct Transcript: Sendable {
             stats.cost = update.sessionCost
             stats.contextTokens = update.usage.total
             live.running = update.toolCalls.map { LiveState.RunningTool(id: $0.id, label: ToolLabel($0)) }
-            live.phase = update.toolCalls.isEmpty ? .idle : .runningTools
+            // A turn without tool calls doesn't end the run, `.result` does:
+            // until then a steer can start another turn, and Esc must still
+            // interrupt.
+            live.phase = update.toolCalls.isEmpty ? .waiting : .runningTools
             var blocks: [Block] = []
             if let seconds = live.inFlight.thoughtSeconds(at: now) {
                 blocks.append(.note("thought for \(Layout.elapsed(seconds))"))

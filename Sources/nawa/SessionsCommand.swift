@@ -25,17 +25,21 @@ enum SessionsCommand {
             print(list(sessions, inDirectory: directory), terminator: "")
         case "show":
             let url = try journal(of: rest.first, in: sessions)
-            print(show(JournalReader.read(url), path: url.path), terminator: "")
+            let contents = JournalReader.read(url)
+            AgentCLI.reportUnreadableLines(contents, path: url.path)
+            print(show(contents, path: url.path), terminator: "")
         case "path":
             print(try journal(of: rest.first, in: sessions).path)
         case "prune":
             guard rest.first == "--older-than", rest.count > 1, let age = parseAge(rest[1]) else {
                 throw SessionsError.badAge(rest.dropFirst().first)
             }
-            let removed = try sessions.prune(lastWrittenBefore: Date().addingTimeInterval(-age))
-            print(removed.count == 1 ? "Removed 1 session." : "Removed \(removed.count) sessions.")
-        default:
+            let result = sessions.pruneJournals(lastWrittenBefore: Date().addingTimeInterval(-age))
+            print(pruneReport(result), terminator: "")
+        case nil, "help", "--help", "-h":
             print(usage)
+        case let unknown?:
+            throw UsageError("unknown sessions command \(unknown)\n" + usage)
         }
     }
 
@@ -45,9 +49,22 @@ enum SessionsCommand {
         return url
     }
 
-    /// `30d`, `12h`, `2w` in seconds; nil if it doesn't parse.
+    /// What prune removed, and what it left and why.
+    static func pruneReport(_ result: SessionStore.PruneResult) -> String {
+        var lines = [result.removed.count == 1 ? "Removed 1 session." : "Removed \(result.removed.count) sessions."]
+        for url in result.inUse {
+            lines.append("Kept \(url.lastPathComponent): open in a running nawa.")
+        }
+        for url in result.failed {
+            lines.append("Could not remove \(url.path).")
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// `30d`, `12h`, `2w` in seconds; nil if it doesn't parse, or is zero
+    /// (which would delete every journal, the running session's included).
     static func parseAge(_ text: String) -> TimeInterval? {
-        guard let match = text.wholeMatch(of: /(\d+)([hdw])/), let count = Double(match.1) else { return nil }
+        guard let match = text.wholeMatch(of: /(\d+)([hdw])/), let count = Double(match.1), count > 0 else { return nil }
         let hour = 3600.0
         switch match.2 {
         case "h": return count * hour

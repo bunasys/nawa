@@ -67,20 +67,21 @@ public struct HarnessSessionFactory: ACPSessionFactory {
     }
 
     /// The session keeps the directory it was started in, whatever `cwd`
-    /// the client sends with `session/load`.
+    /// the client sends with `session/load`. Throws when another nawa has
+    /// the session open or its journal is damaged.
     public func restoreLoop(sessionID: String, cwd: String, mcpServers: [MCPServerConfig]) async throws -> AgentLoop? {
         guard let url = sessions?.journalURL(forSession: sessionID),
-              let state = JournalReader.read(url).replay(),
-              state.sessionID == sessionID
+              let reopened = try AgentCLI.reopenSession(at: url, mode: mode),
+              reopened.state.sessionID == sessionID
         else { return nil }
-        let (gateway, tools, systemPrompt, options) = try await parts(cwd: state.cwd, mcpServers: mcpServers)
+        let (gateway, tools, systemPrompt, options) = try await parts(cwd: reopened.state.cwd, mcpServers: mcpServers)
         return AgentLoop(
-            restoring: state,
+            restoring: reopened.state,
             gateway: gateway,
             tools: tools,
             systemPrompt: systemPrompt,
             options: options,
-            journal: AgentCLI.journal(at: url, mode: mode)
+            journal: reopened.journal
         )
     }
 
@@ -95,17 +96,25 @@ public struct HarnessSessionFactory: ACPSessionFactory {
 
         // Connect any MCP servers the client requested for this session.
         var mcpTools: [any Tool] = []
-        for config in mcpServers {
+        for var config in mcpServers {
+            // Relative paths the server uses mean the session's directory,
+            // not wherever nawa was started.
+            config.workingDirectory = config.workingDirectory ?? cwd
             let client = MCPClient(config: config)
             do {
                 try await client.start()
             } catch {
-                // A failing MCP server shouldn't sink the session; report and skip.
+                // A failing MCP server shouldn't sink the session: say so on
+                // stderr (in `acp` mode stdout is the protocol), take down
+                // whatever it started, and go on without it.
+                FileHandle.standardError.write(Data("nawa: MCP server \(config.name) failed: \(AgentCLI.message(for: error))\n".utf8))
+                await client.stop()
                 continue
             }
             // Expose the MCP server's tools under prefixed names to avoid clashes.
+            let prefix = PrefixedTool.prefix(forServer: config.name)
             for tool in await client.tools {
-                mcpTools.append(PrefixedTool(prefix: "\(config.name)__", wrapped: client, remote: tool))
+                mcpTools.append(PrefixedTool(prefix: prefix, wrapped: client, remote: tool))
             }
         }
         if mcpTools.count > Self.maxDirectMCPTools {
@@ -129,9 +138,26 @@ public struct PrefixedTool: Tool {
     public let wrapped: MCPClient
     public let remote: MCPToolDefinition
 
+    /// Providers reject a tool whose name isn't `[A-Za-z0-9_-]{1,64}`, and
+    /// the server's name comes from the client, so it is cleaned and kept
+    /// short enough to leave room for the tool's own name.
+    public static func prefix(forServer serverName: String) -> String {
+        String(allowedInToolNames(serverName).prefix(20)) + "__"
+    }
+
+    static let maxNameLength = 64
+
+    static func allowedInToolNames(_ text: String) -> String {
+        let cleaned = text.unicodeScalars.map { scalar -> Character in
+            let isAllowed = scalar.isASCII && (CharacterSet.alphanumerics.contains(scalar) || scalar == "_" || scalar == "-")
+            return isAllowed ? Character(scalar) : "_"
+        }
+        return String(cleaned)
+    }
+
     public var definition: ToolDefinition {
         ToolDefinition(
-            name: prefix + remote.name,
+            name: String((prefix + Self.allowedInToolNames(remote.name)).prefix(Self.maxNameLength)),
             description: remote.description ?? "(MCP tool \(remote.name))",
             parameters: remote.inputSchema ?? .object(["type": .string("object")])
         )
@@ -147,19 +173,45 @@ public struct PrefixedTool: Tool {
 @main
 struct AgentCLI {
     static func main() async {
+        // Writing to a pipe whose reader is gone (an MCP server that exited)
+        // must fail that one write, not kill nawa and every session in it.
+        signal(SIGPIPE, SIG_IGN)
         do {
             try await run()
+        } catch let usage as UsageError {
+            FileHandle.standardError.write(Data("nawa: \(usage.message)\n".utf8))
+            exit(2)
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-            FileHandle.standardError.write(Data("nawa: \(message)\n".utf8))
+            FileHandle.standardError.write(Data("nawa: \(message(for: error))\n".utf8))
             exit(1)
         }
     }
+
+    static func message(for error: any Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? "\(error)"
+    }
+
+    static let usage = """
+        Usage: nawa [serve|acp|repl|config|sessions|prompt|provider list]
+          serve  — start the ACP server (streamable HTTP + WebSocket) on :7878
+          acp    — speak ACP over stdio (for editors and Waku that launch the agent)
+          repl [--plain] [--resume [id]] — chat with the agent in the terminal (--plain: line mode;
+                 --resume: go on with a recorded session, by default this directory's newest; /help inside lists commands)
+          sessions list|show|path|prune — the recorded sessions (nawa config set sessions off turns recording off)
+          prompt [dir] — print the system prompt a session in this directory would get
+          config [settings|set|unset] — configure providers (OpenAI-compatible or Anthropic) and settings for the current directory
+          provider list [--json] — list the active provider's models
+        """
 
     static func run() async throws {
         let args = Array(CommandLine.arguments.dropFirst())
         let command = args.first ?? "serve"
 
+        // Settings are resolved again for every session and `/clear`, so
+        // what's wrong with the environment is said here, once.
+        for problem in Settings.environmentProblems(ProcessInfo.processInfo.environment) {
+            FileHandle.standardError.write(Data("nawa: \(problem)\n".utf8))
+        }
         // Process-wide settings (session recording) come from the directory
         // nawa starts in; each session's own from its directory.
         let startSettings = Settings.resolved(for: WorkingDirectory.defaultURL)
@@ -168,9 +220,10 @@ struct AgentCLI {
         }
         // Every session is recorded unless the `sessions` setting is off (proposal 0005).
         let sessions = sessionStore(startSettings)
+        let gateways = GatewayCache()
         func sessionFactory(mode: String) -> HarnessSessionFactory {
             HarnessSessionFactory(
-                gatewayForDirectory: { directory in try resolveGateway(directory: directory) },
+                gatewayForDirectory: { directory in try gateways.gateway(for: directory) },
                 settingsForDirectory: { directory in Settings.resolved(for: directory) },
                 sessions: sessions,
                 mode: mode
@@ -223,16 +276,10 @@ struct AgentCLI {
             let extraTools = prompt.tools.map(\.definition.name).joined(separator: ", ")
             let summary = "\(SystemPrompt.composed(prompt.text).count) chars, \(prompt.skills.skills.count) skills" + (extraTools.isEmpty ? "" : ", adds \(extraTools)")
             FileHandle.standardError.write(Data("\n[\(summary)]\n".utf8))
+        case "help", "--help", "-h":
+            print(usage)
         default:
-            print("Usage: nawa [serve|acp|repl|config|sessions|prompt|provider list]")
-            print("  serve  — start the ACP server (streamable HTTP + WebSocket) on :7878")
-            print("  acp    — speak ACP over stdio (for editors and Waku that launch the agent)")
-            print("  repl [--plain] [--resume [id]] — chat with the agent in the terminal (--plain: line mode;")
-            print("         --resume: go on with a recorded session, by default this directory's newest; /help inside lists commands)")
-            print("  sessions list|show|path|prune — the recorded sessions (nawa config set sessions off turns recording off)")
-            print("  prompt [dir] — print the system prompt a session in this directory would get")
-            print("  config [settings|set|unset] — configure providers (OpenAI-compatible or Anthropic) and settings for the current directory")
-            print("  provider list [--json] — list the active provider's models")
+            throw UsageError("unknown command \(command)\n" + usage)
         }
     }
 
@@ -246,24 +293,59 @@ struct AgentCLI {
         }
     }
 
+    /// A recorded session to go on with: its journal, opened and locked
+    /// first so no other nawa writes to it meanwhile, and the state it
+    /// leaves. Nil when the journal never started a session.
+    ///
+    /// Lines that don't decode are reported on stderr. A context that
+    /// names messages the journal lacks is refused: the model would get a
+    /// conversation with holes in it.
+    static func reopenSession(at url: URL, mode: String) throws -> (state: SessionState, journal: JournalFile)? {
+        let sessionID = SessionStore.sessionID(inFileName: url.lastPathComponent) ?? url.lastPathComponent
+        let journalFile: JournalFile
+        do {
+            journalFile = try JournalFile(continuing: url, origin: JournalOrigin(mode: mode, nawaVersion: ACPServerInfo.nawa.version)) { problem in
+                FileHandle.standardError.write(Data("nawa: \(problem)\n".utf8))
+            }
+        } catch JournalFileError.inUse {
+            throw CLIError.sessionInUse(sessionID)
+        }
+        let contents = JournalReader.read(url)
+        reportUnreadableLines(contents, path: url.path)
+        guard let state = contents.replay() else { return nil }
+        let missing = contents.missingContextMessageIDs(ofSession: state.sessionID)
+        if !missing.isEmpty {
+            throw CLIError.damagedJournal(sessionID, missingMessages: missing.count)
+        }
+        return (state, journalFile)
+    }
+
+    /// Says on stderr (never stdout: in `acp` mode that is the protocol)
+    /// how many lines of a journal were skipped.
+    static func reportUnreadableLines(_ contents: JournalContents, path: String) {
+        guard contents.skippedLines > 0 else { return }
+        let lines = contents.skippedLines == 1 ? "1 journal line" : "\(contents.skippedLines) journal lines"
+        FileHandle.standardError.write(Data("nawa: \(lines) could not be read in \(path)\n".utf8))
+    }
+
     /// How long a `serve` session may sit without a prompt before it is
-    /// unloaded: `NAWA_SESSION_IDLE_MINUTES`, 30 by default.
+    /// unloaded: the `session_idle_minutes` setting, 30 by default.
     static func idleSessionTimeout(minutes: Double?) -> Duration {
-        .seconds((minutes ?? 30) * 60)
+        let defaultMinutes = 30.0
+        // A value saved in the file by hand skips the setting's parsing,
+        // and `Duration` traps on NaN or a huge number.
+        guard let minutes, minutes.isFinite, minutes > 0 else { return .seconds(defaultMinutes * 60) }
+        return .seconds(min(minutes, Settings.maxIdleMinutes) * 60)
     }
 
     /// Where sessions are recorded: nil when the `sessions` setting is off,
-    /// else `sessions_dir`, else the default (`SessionStore.fromEnvironment`
-    /// without the variables the settings already read).
+    /// else `sessions_dir`, else `SessionStore.defaultDirectory`.
     static func sessionStore(_ settings: DirectorySettings, environment: [String: String] = ProcessInfo.processInfo.environment) -> SessionStore? {
         if settings.sessions == false { return nil }
         if let directory = settings.sessionsDirectory {
             return SessionStore(directory: URL(fileURLWithPath: directory))
         }
-        var defaultsOnly = environment
-        defaultsOnly["NAWA_SESSIONS"] = nil
-        defaultsOnly["NAWA_SESSIONS_DIR"] = nil
-        return SessionStore.fromEnvironment(defaultsOnly)
+        return SessionStore(directory: SessionStore.defaultDirectory(environment: environment))
     }
 
     /// The system prompt for a session in `directory`, with its skills settings.
@@ -277,16 +359,17 @@ struct AgentCLI {
 
     /// The session `repl --resume [id]` goes on with: the one named (from
     /// any mode), or the newest repl session in this directory. Nil without
-    /// `--resume`.
+    /// `--resume`. Throws when another nawa has the session open.
     static func resumedSession(
         arguments: [String],
         sessions: SessionStore?,
         directory: URL = WorkingDirectory.defaultURL
-    ) throws -> (state: SessionState, url: URL)? {
+    ) throws -> (state: SessionState, journal: JournalFile)? {
         guard let flag = arguments.firstIndex(of: "--resume") else { return nil }
         guard let sessions else { throw CLIError.resumeWithoutSessions }
         let next = arguments.index(after: flag)
-        let requestedID = next < arguments.endIndex && !arguments[next].hasPrefix("--") ? arguments[next] : nil
+        let hasValue = next < arguments.endIndex && !arguments[next].hasPrefix("--")
+        let requestedID = hasValue ? arguments[next] : nil
 
         let found: URL?
         if let requestedID {
@@ -294,10 +377,10 @@ struct AgentCLI {
         } else {
             found = sessions.newestSession(inDirectory: directory.path, mode: "repl")
         }
-        guard let url = found, let state = JournalReader.read(url).replay() else {
+        guard let url = found, let resumed = try reopenSession(at: url, mode: "repl") else {
             throw CLIError.noSessionToResume(requestedID)
         }
-        return (state, url)
+        return resumed
     }
 
     static func builtInTools(workingDirectory: URL) -> [any Tool] {
@@ -326,54 +409,66 @@ struct AgentCLI {
         return defaults.applying(settings)
     }
 
-    /// Build the gateway for this run. Precedence:
-    /// 1. `NAWA_GATEWAY_URL` / `NAWA_GATEWAY_API_KEY` / `NAWA_MODEL` env vars (explicit override);
-    ///    `NAWA_GATEWAY_API=anthropic` switches it from the OpenAI wire API to Anthropic's.
-    /// 2. The per-directory configuration saved by `nawa config` for the current directory.
-    /// 3. `NAWA_GATEWAY_CONFIG` or a `Gateways.json` in the current directory.
-    /// 4. OpenAI with `OPENAI_API_KEY`.
+    /// Build the gateway for a session in `directory` (see `gatewayConfig`).
     static func resolveGateway(
-        directory cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        directory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> Gateway {
-        let env = ProcessInfo.processInfo.environment
-
-        if let baseURL = env["NAWA_GATEWAY_URL"] {
-            return try envGateway(baseURL: baseURL, env: env)
-        }
-
-        let store = try AgentConfigStore.load()
-        if let config = store.gatewayConfig(for: cwd), !config.providers.isEmpty {
-            return config.withEnvironmentDefaults(env).makeGateway()
-        }
-
-        let fileConfig = try GatewayConfig.loadFromEnvironmentOrFile()
-        if !fileConfig.providers.isEmpty {
-            return fileConfig.withEnvironmentDefaults(env).makeGateway()
-        }
-
-        return try envGateway(baseURL: "https://api.openai.com/v1", env: env)
+        try gatewayConfig(directory: directory, environment: environment).makeGateway()
     }
 
-    static func envGateway(baseURL: String, env: [String: String]) throws -> Gateway {
+    /// The providers a session in `directory` uses. Precedence:
+    /// 1. `NAWA_GATEWAY_URL` / `NAWA_GATEWAY_API_KEY` / `NAWA_MODEL` env vars (explicit override);
+    ///    `NAWA_GATEWAY_API=anthropic` switches it from the OpenAI wire API to Anthropic's.
+    /// 2. The per-directory configuration saved by `nawa config` for `directory`.
+    /// 3. `NAWA_GATEWAY_CONFIG` or a `Gateways.json` in `directory`.
+    /// 4. The API's own endpoint (`NAWA_GATEWAY_API`, OpenAI by default) with
+    ///    `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`.
+    static func gatewayConfig(
+        directory: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> GatewayConfig {
+        if let baseURL = environment["NAWA_GATEWAY_URL"] {
+            return try environmentGatewayConfig(baseURL: baseURL, environment: environment)
+        }
+
+        let store = try AgentConfigStore.load(from: AgentConfigStore.defaultLocation(environment: environment))
+        if let config = store.gatewayConfig(for: directory), !config.providers.isEmpty {
+            return config.withEnvironmentDefaults(environment)
+        }
+
+        let fileConfig = try GatewayConfig.loadFromEnvironmentOrFile(directory: directory, environment: environment)
+        if !fileConfig.providers.isEmpty {
+            return fileConfig.withEnvironmentDefaults(environment)
+        }
+
+        return try environmentGatewayConfig(baseURL: nil, environment: environment)
+    }
+
+    /// One provider from the environment. Without a `baseURL` it is the
+    /// API's own endpoint: an Anthropic key must never go to OpenAI's.
+    static func environmentGatewayConfig(baseURL: String?, environment: [String: String]) throws -> GatewayConfig {
         var api = ProviderAPI.openAI
-        if let requested = env["NAWA_GATEWAY_API"] {
+        if let requested = environment["NAWA_GATEWAY_API"] {
             guard let parsed = ProviderAPI(rawValue: requested.lowercased()) else {
                 throw CLIError.unknownAPI(requested)
             }
             api = parsed
         }
-        guard let url = URL(string: baseURL), url.scheme != nil, url.host != nil else {
-            throw CLIError.invalidGatewayURL(baseURL)
+        let isAnthropic = api == .anthropic
+        let address = baseURL ?? (isAnthropic ? "https://api.anthropic.com" : "https://api.openai.com/v1")
+        guard let url = URL(string: address), url.scheme != nil, url.host != nil else {
+            throw CLIError.invalidGatewayURL(address)
         }
-        let fallbackKeyVariable = api == .anthropic ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"
+        let fallbackKeyVariable = isAnthropic ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"
         let provider = ProviderConfig(
             name: "default",
             api: api,
             baseURL: url,
-            apiKey: env["NAWA_GATEWAY_API_KEY"] ?? env[fallbackKeyVariable],
-            model: env["NAWA_MODEL"]
-        ).withEnvironmentDefaults(env)
-        return Gateway(providers: [provider], activeProviderName: "default")
+            apiKey: environment["NAWA_GATEWAY_API_KEY"] ?? environment[fallbackKeyVariable],
+            model: environment["NAWA_MODEL"]
+        ).withEnvironmentDefaults(environment)
+        return GatewayConfig(activeProvider: "default", providers: [provider])
     }
 
     /// The chat in the terminal. Settings come from `directory`'s saved
@@ -384,7 +479,7 @@ struct AgentCLI {
         mode: ChatApp.Mode = .auto,
         directory: URL = WorkingDirectory.defaultURL,
         sessions: SessionStore? = nil,
-        resume: (state: SessionState, url: URL)? = nil
+        resume: (state: SessionState, journal: JournalFile)? = nil
     ) async throws {
         // Everything runs in `directory`: a resumed session's, which can
         // differ from where `nawa repl` was started.
@@ -428,7 +523,7 @@ struct AgentCLI {
                 tools: start.tools,
                 systemPrompt: start.prompt.text,
                 options: start.options,
-                journal: journal(at: resume.url, mode: "repl")
+                journal: resume.journal
             )
         } else {
             firstLoop = makeLoop()
@@ -450,7 +545,12 @@ struct AgentCLI {
             removeDeclinedRequest: { loop.withLock { $0 }.removeDeclinedRequest() },
             liveContextLimit: { loop.withLock { $0 }.options.compaction?.atContextTokens },
             configure: { arguments in
-                let lines = Settings.command(arguments, directory: directory, inSession: true)
+                let lines: [String]
+                do {
+                    lines = try Settings.command(arguments, directory: directory, inSession: true)
+                } catch {
+                    return [message(for: error)]
+                }
                 // Apply what takes effect now to the running conversation.
                 let options = defaultLoopOptions(settings: Settings.resolved(for: directory).loop)
                 loop.withLock { $0 }.options = options
@@ -470,11 +570,51 @@ struct AgentCLI {
     }
 }
 
-enum CLIError: Error, LocalizedError {
+/// One gateway per directory for as long as the process runs, so ACP
+/// sessions share failover cooldowns: a new session doesn't wait out a hung
+/// primary provider that an earlier one already gave up on. Rebuilt when
+/// the directory's configuration changes.
+final class GatewayCache: Sendable {
+    private struct Entry {
+        var config: GatewayConfig
+        var gateway: Gateway
+    }
+
+    private let entries = Mutex<[String: Entry]>([:])
+    private let environment: [String: String]
+
+    init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.environment = environment
+    }
+
+    func gateway(for directory: URL) throws -> Gateway {
+        let config = try AgentCLI.gatewayConfig(directory: directory, environment: environment)
+        let key = AgentConfigStore.key(for: directory)
+        return entries.withLock { entries in
+            if let cached = entries[key], cached.config == config { return cached.gateway }
+            let gateway = config.makeGateway()
+            entries[key] = Entry(config: config, gateway: gateway)
+            return gateway
+        }
+    }
+}
+
+/// Words on the command line nawa can't use: said on stderr, exit status 2.
+struct UsageError: Error, LocalizedError {
+    var message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
+}
+
+/// `CustomStringConvertible` too: ACP replies put an error into words with
+/// `"\(error)"`, which would otherwise print the case name.
+enum CLIError: Error, Equatable, LocalizedError, CustomStringConvertible {
     case unknownAPI(String)
     case invalidGatewayURL(String)
     case resumeWithoutSessions
     case noSessionToResume(String?)
+    case sessionInUse(String)
+    case damagedJournal(String, missingMessages: Int)
 
     var errorDescription: String? {
         switch self {
@@ -489,6 +629,12 @@ enum CLIError: Error, LocalizedError {
             return "no recorded session \(id) (nawa sessions list --all shows them)"
         case .noSessionToResume(nil):
             return "no recorded session in this directory (nawa sessions list shows them)"
+        case .sessionInUse(let id):
+            return "session \(id) is open in another nawa"
+        case .damagedJournal(let id, let missing):
+            return "session \(id) can't be restored: its journal lacks \(missing) message(s) of its context"
         }
     }
+
+    var description: String { errorDescription ?? "nawa error" }
 }

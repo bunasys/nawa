@@ -289,6 +289,7 @@ struct SystemPromptTests {
         let scratch = try Scratch()
         let root = try scratch.makeDirectory("root")
         let nested = try scratch.makeDirectory("root/nested")
+        _ = try scratch.makeDirectory("root/.git")
         try scratch.write("root/CLAUDE.md", "ROOT CLAUDE")
         try scratch.write("root/nested/AGENTS.md", "NESTED AGENTS")
         try scratch.write("root/nested/CLAUDE.md", "NESTED CLAUDE")

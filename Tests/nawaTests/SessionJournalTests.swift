@@ -117,6 +117,8 @@ struct SessionJournalTests {
         var first = await ACPHarness(sessions: sessions, model: RecordingModel())
         let sessionID = try await first.newSession(cwd: cwd)
         #expect(await first.prompt(sessionID, "hi") == "end_turn")
+        // The first connection lets go of the journal, as an exiting process would.
+        await first.connection.unloadIdleSessions(idleFor: .zero)
 
         // A new connection knows nothing of the session but its journal.
         let model = RecordingModel()
@@ -136,6 +138,46 @@ struct SessionJournalTests {
         #expect(sentMessages.first?.text.contains("You are Nawa") == true)
         let sent = sentMessages.filter { $0.role != .system }.map(\.text)
         #expect(sent == ["hi", "ok", "again"])
+    }
+
+    /// Two writers would overwrite each other's lines in the journal.
+    @Test
+    func aSessionOpenElsewhereIsNotLoaded() async throws {
+        let sessions = SessionStore(directory: try scratchDirectory())
+        let cwd = try scratchDirectory()
+        var first = await ACPHarness(sessions: sessions, model: RecordingModel())
+        let sessionID = try await first.newSession(cwd: cwd)
+        #expect(await first.prompt(sessionID, "hi") == "end_turn")
+
+        var second = await ACPHarness(sessions: sessions, model: RecordingModel())
+        let reply = await second.call("session/load", ["sessionId": .string(sessionID), "cwd": .string(cwd.path), "mcpServers": .array([])]).reply
+        #expect(reply?.errorMessage?.contains("session \(sessionID) is open in another nawa") == true)
+        #expect(throws: CLIError.sessionInUse(sessionID)) {
+            try AgentCLI.resumedSession(arguments: ["--resume", sessionID], sessions: sessions)
+        }
+    }
+
+    /// A context naming a message whose line was lost would reach the
+    /// model with a hole in it.
+    @Test
+    func aJournalMissingContextMessagesIsNotResumed() throws {
+        let sessions = SessionStore(directory: try scratchDirectory())
+        let sessionID = UUID().uuidString
+        let url = sessions.newJournalURL(sessionID: sessionID)
+        let journal = JournalFile(url: url, origin: JournalOrigin(mode: "repl"))
+        let records: [JournalRecord] = [
+            .sessionStarted(SessionStart(origin: journal.origin, cwd: "/work", model: nil, options: .object([:]))),
+            .message(Message(id: "kept", role: .user, text: "hi"), appendedToContext: true),
+            .contextRewrite(ContextRewrite(reason: .compaction, removed: [], added: ["lost"], context: ["lost", "kept"])),
+        ]
+        for record in records {
+            journal.record(JournalEntry(session: sessionID, record: record))
+        }
+        journal.close()
+
+        #expect(throws: CLIError.damagedJournal(sessionID, missingMessages: 1)) {
+            try AgentCLI.resumedSession(arguments: ["--resume", sessionID], sessions: sessions)
+        }
     }
 
     @Test
@@ -203,7 +245,7 @@ struct SessionJournalTests {
     @Test
     func theIdleTimeoutIsReadInMinutes() {
         let fromEnvironment = { (value: String) in
-            AgentCLI.idleSessionTimeout(minutes: Settings.fromEnvironment(["NAWA_SESSION_IDLE_MINUTES": value], reportProblems: false).sessionIdleMinutes)
+            AgentCLI.idleSessionTimeout(minutes: Settings.fromEnvironment(["NAWA_SESSION_IDLE_MINUTES": value]).sessionIdleMinutes)
         }
         #expect(AgentCLI.idleSessionTimeout(minutes: nil) == .seconds(30 * 60))
         #expect(fromEnvironment("5") == .seconds(5 * 60))
@@ -253,10 +295,12 @@ struct SessionJournalTests {
         var acp = await ACPHarness(sessions: sessions, model: RecordingModel())
         let sessionID = try await acp.newSession(cwd: cwd)
         #expect(await acp.prompt(sessionID, "hi") == "end_turn")
+        await acp.connection.unloadIdleSessions(idleFor: .zero)
 
         let named = try #require(try AgentCLI.resumedSession(arguments: ["--resume", sessionID], sessions: sessions))
         #expect(named.state.sessionID == sessionID)
         #expect(named.state.messages.filter { $0.role != .system }.map(\.text) == ["hi", "ok"])
+        named.journal.close()
 
         // Without an id, only repl sessions are picked up.
         #expect(throws: CLIError.self) {

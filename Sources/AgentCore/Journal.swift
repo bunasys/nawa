@@ -207,6 +207,16 @@ public struct ModelCallRecord: Sendable, Hashable {
     /// Nil when the call failed (see `error`).
     public var response: Response?
     public var usage: Usage
+    /// Whether the call ran on the helper model (`helper_model`), whose
+    /// usage is priced apart. Nil in journals written before it was
+    /// recorded; readers then take a summary as a helper call.
+    public var helper: Bool?
+
+    /// Whether to count the call's usage as the helper model's.
+    public var countsAsHelper: Bool {
+        helper ?? (purpose == .compaction)
+    }
+
     /// Estimated, when pricing is configured.
     public var costUSD: Double?
     public var startedAt: Date
@@ -224,6 +234,7 @@ public struct ModelCallRecord: Sendable, Hashable {
         request: Request,
         response: Response?,
         usage: Usage,
+        helper: Bool? = nil,
         costUSD: Double?,
         startedAt: Date,
         firstChunkMS: Int?,
@@ -237,6 +248,7 @@ public struct ModelCallRecord: Sendable, Hashable {
         self.request = request
         self.response = response
         self.usage = usage
+        self.helper = helper
         self.costUSD = costUSD
         self.startedAt = startedAt
         self.firstChunkMS = firstChunkMS

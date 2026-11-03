@@ -25,19 +25,77 @@ public struct ACPServerConfiguration: Sendable {
     /// id; it is rebuilt from its journal when needed. Needs
     /// `capabilities.loadSession`. Nil keeps every session in memory.
     public var idleSessionTimeout: Duration?
+    /// Web origins (`https://app.example`) whose pages may use the server.
+    /// Empty by default: native ACP clients send no `Origin`, browsers
+    /// always do on a WebSocket, and a page that can reach the server can
+    /// start MCP servers, that is, run commands.
+    public var allowedOrigins: Set<String>
 
     public init(
         hostname: String = "127.0.0.1",
         port: Int = 7878,
         info: ACPServerInfo = .nawa,
         capabilities: ACPCapabilities = .init(),
-        idleSessionTimeout: Duration? = nil
+        idleSessionTimeout: Duration? = nil,
+        allowedOrigins: Set<String> = []
     ) {
         self.hostname = hostname
         self.port = port
         self.info = info
         self.capabilities = capabilities
         self.idleSessionTimeout = idleSessionTimeout
+        self.allowedOrigins = allowedOrigins
+    }
+
+    /// Whether a request with this `Host` (`authority`) and `Origin` may
+    /// reach the agent. The `Host` check stops DNS rebinding (a page whose
+    /// own domain resolves to 127.0.0.1); the `Origin` check stops any web
+    /// page opening a WebSocket to localhost, which browsers allow.
+    public func admits(authority: String?, origin: String?) -> Bool {
+        if let origin, !allowedOrigins.contains(origin) { return false }
+        guard let authority else { return false }
+        let host = Self.hostName(ofAuthority: authority.lowercased())
+        let loopbackNames: Set<String> = ["127.0.0.1", "localhost", "[::1]"]
+        let isIPv6Address = hostname.contains(":")
+        let boundName = isIPv6Address ? "[\(hostname.lowercased())]" : hostname.lowercased()
+        return loopbackNames.contains(host) || host == boundName
+    }
+
+    /// `localhost:7878` → `localhost`, `[::1]:7878` → `[::1]`.
+    private static func hostName(ofAuthority authority: String) -> String {
+        if authority.hasPrefix("["), let end = authority.firstIndex(of: "]") {
+            return String(authority[...end])
+        }
+        return String(authority.split(separator: ":", maxSplits: 1).first ?? "")
+    }
+}
+
+/// Answers 403 to a request `ACPServerConfiguration.admits` turns away.
+/// On both routers. On the WebSocket router it refuses the handshake, which
+/// Hummingbird always answers with its own 400.
+struct ACPAdmissionMiddleware<Context: RequestContext>: RouterMiddleware {
+    let configuration: ACPServerConfiguration
+
+    func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
+        let admitted = configuration.admits(authority: request.head.authority, origin: request.headers[.origin])
+        guard admitted else { return Response(status: .forbidden) }
+        return try await next(request, context)
+    }
+}
+
+/// The WebSocket router's request context. It names the connection during
+/// the handshake, so the upgrade response can carry the id and the
+/// upgraded socket can create the connection under it: each socket gets
+/// its own, however many handshakes run at once.
+struct ACPWebSocketRequestContext: RequestContext, WebSocketRequestContext {
+    var coreContext: CoreRequestContextStorage
+    let webSocket: WebSocketHandlerReference<Self>
+    let connectionID: String
+
+    init(source: Source) {
+        coreContext = .init(source: source)
+        webSocket = .init()
+        connectionID = ACPRegistry.newConnectionID()
     }
 }
 
@@ -46,14 +104,17 @@ public struct ACPServerConfiguration: Sendable {
 ///
 /// Routing (per the streamable-http-websocket transport RFD):
 /// - `POST /acp`: JSON-RPC. `initialize` returns 200 with a JSON body and the
-///   `Acp-Connection-Id` header; all other requests return 202 Accepted
-///   immediately and are processed async, with responses delivered later on the
-///   matching GET stream (correlated by JSON-RPC id).
+///   `Acp-Connection-Id` header; every other message returns 202 Accepted
+///   immediately and is processed async, with responses delivered later on
+///   the matching GET stream (correlated by JSON-RPC id).
 /// - `GET /acp` (no Upgrade): SSE. `Acp-Connection-Id` alone → stream for
 ///   connection-scoped messages; `Acp-Connection-Id` + `Acp-Session-Id` →
-///   session-scoped stream.
+///   session-scoped stream. One reader per stream (409 for a second).
 /// - `GET /acp` with `Upgrade: websocket`: full-duplex WebSocket.
 /// - `DELETE /acp`: terminate the connection (202).
+///
+/// Every route refuses (403) requests from web pages and foreign hosts
+/// (see `ACPServerConfiguration.admits`).
 public struct ACPServer: Sendable {
     public let configuration: ACPServerConfiguration
     public let factory: any ACPSessionFactory
@@ -67,54 +128,54 @@ public struct ACPServer: Sendable {
 
     /// Build the Hummingbird application.
     public func buildApplication() -> some ApplicationProtocol {
-        let router = Router(context: BasicRequestContext.self)
-        let wsRouter = Router(context: BasicWebSocketRequestContext.self)
+        buildApplication(onServerRunning: { _ in })
+    }
 
-        // POST /acp
+    /// `onServerRunning` gets the listening channel, so tests can learn the port.
+    func buildApplication(onServerRunning: @escaping @Sendable (any Channel) async -> Void) -> some ApplicationProtocol {
+        let router = Router(context: BasicRequestContext.self)
+        router.add(middleware: ACPAdmissionMiddleware(configuration: configuration))
         router.post("acp") { request, context -> Response in
             await self.handlePOST(request: request, context: context)
         }
-
-        // GET /acp (SSE)
         router.get("acp") { request, context -> Response in
             await self.handleGET(request: request, context: context)
         }
-
-        // DELETE /acp
         router.delete("acp") { request, context -> Response in
             await self.handleDELETE(request: request, context: context)
         }
 
-        // WebSocket upgrade on /acp. The connection is created at upgrade time
-        // so its id can be returned in the upgrade response headers.
-        let socketBox = ACPSocketBox()
-        wsRouter.ws("acp") { request, _ in
+        let wsRouter = Router(context: ACPWebSocketRequestContext.self)
+        wsRouter.add(middleware: ACPAdmissionMiddleware(configuration: configuration))
+        wsRouter.ws("acp") { request, context in
             guard request.headers[.upgrade]?.lowercased() == "websocket" else { return .dontUpgrade }
-            let connection = await self.registry.createConnection(
-                factory: self.factory,
-                info: self.configuration.info,
-                capabilities: self.configuration.capabilities,
-                idleSessionTimeout: self.configuration.idleSessionTimeout,
-                routing: .singleStream
-            )
-            socketBox.connection = connection
             var headers = HTTPFields()
-            headers[.acpConnectionID] = connection.connectionID
+            headers[.acpConnectionID] = context.connectionID
             return .upgrade(headers)
         } onUpgrade: { inbound, outbound, context in
-            guard let connection = socketBox.connection else { return }
-            await self.handleWebSocket(inbound: inbound, outbound: outbound, connection: connection)
+            await self.handleWebSocket(inbound: inbound, outbound: outbound, connectionID: context.requestContext.connectionID)
         }
 
-        let app = Application(
+        return Application(
             router: router,
             server: .http1WebSocketUpgrade(webSocketRouter: wsRouter),
             configuration: .init(
                 address: .hostname(configuration.hostname, port: configuration.port),
                 serverName: "swift-agent-acp"
-            )
+            ),
+            onServerRunning: onServerRunning
         )
-        return app
+    }
+
+    private func makeConnection(id: String? = nil, routing: ACPOutboundRouting) async -> ACPConnection {
+        await registry.createConnection(
+            id: id,
+            factory: factory,
+            info: configuration.info,
+            capabilities: configuration.capabilities,
+            idleSessionTimeout: configuration.idleSessionTimeout,
+            routing: routing
+        )
     }
 
     // MARK: - POST
@@ -138,12 +199,7 @@ public struct ACPServer: Sendable {
 
         // `initialize` is special: return 200 with JSON body + Acp-Connection-Id header.
         if case .request(let req) = message, req.method == "initialize" {
-            let connection = await registry.createConnection(
-                factory: factory,
-                info: configuration.info,
-                capabilities: configuration.capabilities,
-                idleSessionTimeout: configuration.idleSessionTimeout
-            )
+            let connection = await makeConnection(routing: .perSession)
             let result = await connection.initializeResult()
             let responseMessage = JSONRPCMessage.makeSuccess(id: req.id, result: result)
             let data = Data(responseMessage.json.description.utf8)
@@ -157,45 +213,51 @@ public struct ACPServer: Sendable {
             )
         }
 
-        // All other requests: 202 Accepted, process async.
-        if case .request(let req) = message {
-            let connectionID = request.headers[.acpConnectionID]
-            if let connection = await registry.connection(for: connectionID) {
-                let reqCopy = req
-                Task { await connection.handle(.request(reqCopy)) }
-            }
+        // Everything else, notifications (`session/cancel`) included:
+        // 202 Accepted, processed async.
+        guard let connection = await registry.connection(for: request.headers[.acpConnectionID]) else {
+            return Response(status: .notFound)
         }
+        Task { await connection.handle(message) }
         return Response(status: .accepted)
     }
 
     // MARK: - GET (SSE)
 
     private func handleGET(request: Request, context: BasicRequestContext) async -> Response {
-        let connectionID = request.headers[.acpConnectionID]
-        let sessionID = request.headers[.acpSessionID]
-        guard let connection = await registry.connection(for: connectionID) else {
-            return Response(status: .badRequest)
+        guard let connection = await registry.connection(for: request.headers[.acpConnectionID]) else {
+            return Response(status: .notFound)
         }
+        let route: ACPRoute = request.headers[.acpSessionID].map { .session($0) } ?? .connection
 
         let stream: AsyncStream<JSONRPCMessage>
-        if let sessionID {
-            stream = await connection.sessionOutbound(for: sessionID)
-        } else {
-            stream = await connection.outbound
+        switch await connection.attachStream(route) {
+        case .stream(let attached):
+            stream = attached
+        case .alreadyAttached:
+            return Response(status: .conflict)
+        case .unknownSession:
+            return Response(status: .notFound)
         }
 
         return Response(
             status: .ok,
             headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
             body: .init(contentLength: nil) { writer in
-                let allocator = ByteBufferAllocator()
-                for await message in stream {
-                    let frame = "data: \(message.json.description)\n\n"
-                    var buffer = allocator.buffer(capacity: frame.utf8.count)
-                    buffer.writeString(frame)
-                    try await writer.write(buffer)
+                do {
+                    let allocator = ByteBufferAllocator()
+                    for await message in stream {
+                        let frame = "data: \(message.json.description)\n\n"
+                        var buffer = allocator.buffer(capacity: frame.utf8.count)
+                        buffer.writeString(frame)
+                        try await writer.write(buffer)
+                    }
+                    try await writer.finish(nil)
+                } catch {
+                    await connection.detachStream(route)
+                    throw error
                 }
-                try await writer.finish(nil)
+                await connection.detachStream(route)
             }
         )
     }
@@ -203,8 +265,10 @@ public struct ACPServer: Sendable {
     // MARK: - DELETE
 
     private func handleDELETE(request: Request, context: BasicRequestContext) async -> Response {
-        let connectionID = request.headers[.acpConnectionID]
-        await registry.removeConnection(connectionID)
+        guard let connection = await registry.removeConnection(request.headers[.acpConnectionID]) else {
+            return Response(status: .notFound)
+        }
+        await connection.close()
         return Response(status: .accepted)
     }
 
@@ -213,10 +277,10 @@ public struct ACPServer: Sendable {
     private func handleWebSocket(
         inbound: WebSocketInboundStream,
         outbound: WebSocketOutboundWriter,
-        connection: ACPConnection
+        connectionID: String
     ) async {
+        let connection = await makeConnection(id: connectionID, routing: .singleStream)
         let outboundTask = Task {
-            // Stream connection-scoped messages to the socket.
             for await message in await connection.outbound {
                 try? await outbound.write(.text(message.json.description))
             }
@@ -231,15 +295,9 @@ public struct ACPServer: Sendable {
         }
         outboundTask.cancel()
         await outboundTask.value
-        await registry.removeConnection(connection.connectionID)
+        await registry.removeConnection(connectionID)
+        await connection.close()
     }
-}
-
-/// Holds the connection created during a WebSocket upgrade so the handshake
-/// decision and the upgraded-socket closures can share it.
-final class ACPSocketBox: @unchecked Sendable {
-    var connection: ACPConnection?
-    init() {}
 }
 
 /// Registry of active connections, keyed by `Acp-Connection-Id`.
@@ -248,14 +306,19 @@ public actor ACPRegistry {
 
     public init() {}
 
+    static func newConnectionID() -> String {
+        "conn_\(UUID().uuidString.prefix(12))"
+    }
+
     public func createConnection(
+        id: String? = nil,
         factory: any ACPSessionFactory,
         info: ACPServerInfo,
         capabilities: ACPCapabilities,
         idleSessionTimeout: Duration? = nil,
         routing: ACPOutboundRouting = .perSession
     ) async -> ACPConnection {
-        let id = "conn_\(UUID().uuidString.prefix(12))"
+        let id = id ?? Self.newConnectionID()
         let connection = ACPConnection(
             connectionID: id, factory: factory, info: info, capabilities: capabilities, routing: routing
         )
@@ -271,8 +334,10 @@ public actor ACPRegistry {
         return connections[id]
     }
 
-    public func removeConnection(_ id: String?) {
-        guard let id else { return }
-        connections.removeValue(forKey: id)
+    /// Forgets the connection and returns it, for its caller to close.
+    @discardableResult
+    public func removeConnection(_ id: String?) -> ACPConnection? {
+        guard let id else { return nil }
+        return connections.removeValue(forKey: id)
     }
 }

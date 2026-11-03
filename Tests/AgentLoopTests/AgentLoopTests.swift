@@ -445,6 +445,8 @@ struct AgentLoopTests {
         #expect(Pricing(perMillionTokens: "3, 15") == Pricing(inputPer1K: 0.003, outputPer1K: 0.015))
         #expect(Pricing(perMillionTokens: "3") == nil)
         #expect(Pricing(perMillionTokens: "a,b") == nil)
+        #expect(Pricing(perMillionTokens: "inf,15") == nil)
+        #expect(Pricing(perMillionTokens: "3,nan") == nil)
     }
 
     @Test
@@ -612,7 +614,6 @@ func kind(_ event: AgentEvent) -> String {
     switch event {
     case .initEvent: "init"
     case .assistant: "assistant"
-    case .toolResult: "toolResult"
     case .toolResults: "toolResults"
     case .stream: "stream"
     case .informational: "informational"
