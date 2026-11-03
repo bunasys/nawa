@@ -50,12 +50,12 @@ public struct ACPStdioTransport: Sendable {
                 await connection.handle(text: line)
             }
         } catch {
-            await connection.finishOutbound()
+            await connection.close()
             await writer.value
             throw error
         }
         // stdin closed: write the replies already queued, then stop.
-        await connection.finishOutbound()
+        await connection.close()
         await writer.value
     }
 

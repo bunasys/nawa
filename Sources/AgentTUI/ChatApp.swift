@@ -50,7 +50,12 @@ public enum ChatApp {
         let interactive = isatty(STDIN_FILENO) != 0
         // A pipe gets rows that are never wrapped.
         let columns = isatty(STDOUT_FILENO) != 0 ? Terminal.currentSize()?.columns ?? 80 : Int(Int32.max)
-        let chat = PlainChat(session: session, layout: Layout(columns: columns), echoPrompts: !interactive) { text in
+        let chat = PlainChat(
+            session: session,
+            layout: Layout(columns: columns),
+            echoPrompts: !interactive,
+            catchInterrupts: Terminal.catchInterrupts
+        ) { text in
             FileHandle.standardOutput.write(Data(text.utf8))
         }
         await chat.run { readLine() }
@@ -265,17 +270,31 @@ final class InlineChat {
     /// Esc / Ctrl-C during a run: cancelling the task that drains the
     /// stream ends it, which cancels the loop. Events still on their way
     /// are dropped by run id.
+    ///
+    /// The user wants to stop, so queued prompts don't start: they go back
+    /// into the editor, above whatever was being typed, to edit or resend.
     private func interrupt() {
         current?.task.cancel()
         commit(transcript.interrupt())
-        finishRun()
+        endRun()
+        guard !queued.isEmpty else { return }
+        let draft = editor.isEmpty ? [] : [editor.text]
+        let restored = (queued + draft).joined(separator: "\n")
+        queued = []
+        editor.clear()
+        _ = editor.apply(.paste(restored))
     }
 
+    /// A run that ended on its own: the next queued prompt starts.
     private func finishRun() {
+        endRun()
+        startNext()
+    }
+
+    private func endRun() {
         current = nil
         ticker?.cancel()
         ticker = nil
-        startNext()
     }
 
     private func startNext() {
@@ -312,42 +331,62 @@ final class InlineChat {
 
     private func render() {
         let size = terminal.size
-        var live: [StyledLine] = []
+        var status: [StyledLine] = []
         if let current {
             let elapsed = Int((clock.now - current.started).components.seconds)
-            live = layout.status(transcript.live, frame: spinnerFrame, elapsedSeconds: elapsed, maxTurns: transcript.maxTurns)
+            status = layout.status(transcript.live, frame: spinnerFrame, elapsedSeconds: elapsed, maxTurns: transcript.maxTurns)
         }
+        var below: [StyledLine] = []
         for prompt in queued {
-            live.append(layout.row(prompt, style: .dim, prefix: StyledSpan(" ⏎ queued  ", .dim)))
+            below.append(layout.row(prompt, style: .dim, prefix: StyledSpan(" ⏎ queued  ", .dim)))
         }
         if let unansweredRefusal {
             let question = DeclinedRequest.question(unansweredRefusal)
-            live += layout.paragraph(question, style: .color(.yellow), prefix: StyledSpan(" ? ", .color(.yellow)))
+            below += layout.paragraph(question, style: .color(.yellow), prefix: StyledSpan(" ? ", .color(.yellow)))
         }
-        live = Array(live.suffix(max(size.rows / 2, 1)))
 
-        // Borders and the footer take three rows; keep one spare so the
-        // whole live region fits on screen and relative moves stay exact.
-        let boxRows = min(max(size.rows - live.count - 4, 1), 12)
+        // Rows are handed out from the bottom up, so the region never
+        // outgrows the screen (it would flood scrollback on every frame):
+        // the box's borders and one row of text first, then the footer,
+        // then the status and the rest, then more rows for the box. One row
+        // stays spare so relative moves stay exact.
+        let usable = max(size.rows - 1, 1)
+        let smallestBox = 3
+        let showFooter = usable > smallestBox
+        let footerRows = showFooter ? 1 : 0
+        let statusRoom = min(max(usable - smallestBox - footerRows, 0), max(size.rows / 2, 1))
+        var live = Self.fit(status: status, below: below, rows: statusRoom)
+        let boxRows = min(max(usable - footerRows - live.count - 2, 1), 12)
         let box = layout.promptBox(editor.text, cursor: editor.cursor, maxRows: boxRows)
         let cursor = InlineScreen.Cursor(row: live.count + box.cursor.row, column: box.cursor.column)
         live += box.lines
-        live.append(footer())
+        if showFooter { live.append(footer()) }
 
         terminal.write(screen.frame(columns: size.columns, committed: committed, live: live, cursor: cursor))
         committed = []
         lastFrame = clock.now
     }
 
+    /// The status and the rows below it cut to `rows`, newest last. The
+    /// status's first line (spinner, `esc to interrupt`) always stays.
+    static func fit(status: [StyledLine], below: [StyledLine], rows: Int) -> [StyledLine] {
+        let all = status + below
+        guard all.count > rows else { return all }
+        guard rows > 0 else { return [] }
+        guard let statusLine = status.first else { return Array(all.suffix(rows)) }
+        return [statusLine] + all.dropFirst().suffix(rows - 1)
+    }
+
     private func footer() -> StyledLine {
+        let nothingSpent = transcript.stats.usage.total == 0
         let hint: String? = if quitArmed {
             "press ctrl-c again to quit"
-        } else if transcript.stats.usage.total == 0 {
+        } else if nothingSpent {
             "/help for commands · alt-enter for a newline"
         } else {
             nil
         }
-        if transcript.stats.usage.total == 0 {
+        if nothingSpent {
             return layout.row(hint ?? "", style: .dim, prefix: StyledSpan(" "))
         }
         return layout.footer(transcript.stats, contextLimit: session.contextLimit, extra: hint)

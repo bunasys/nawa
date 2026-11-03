@@ -12,9 +12,9 @@ public enum AgentEvent: Sendable {
     case initEvent(Session)
     /// One complete model response for a turn, including tool calls if any.
     case assistant(AssistantUpdate)
-    /// One tool result, delivered back to the model as a tool-role message.
-    case toolResult(ToolCallResult)
-    /// The tool results for a turn, delivered back to the model as tool-role messages.
+    /// The tool results for a turn, delivered back to the model as tool-role
+    /// messages. They are the real results, even where the model gets a
+    /// pointer to an identical earlier result instead.
     case toolResults([ToolCallResult])
     /// A partial stream of text/tool-input while a turn is being generated.
     case stream(AgentStreamUpdate)

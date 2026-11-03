@@ -4,8 +4,10 @@ import Foundation
 ///
 /// Swift's standard library ships no `JSON` value, so the agent domain defines
 /// its own. It is used for tool arguments, tool input schemas, MCP/ACP params,
-/// and anywhere the wire format is JSON. It is fully `Codable` in both
-/// directions: numbers decode as `int` when integral, and encode losslessly.
+/// and anywhere the wire format is JSON. It is `Codable` in both directions,
+/// but numbers are not kept exactly as written: any number that fits an `Int`
+/// decodes as `int` (so `1.0` comes back as `1`), and every other number as
+/// `double` (so integers beyond `Int`'s range lose precision).
 public indirect enum JSON: Sendable, Hashable, Codable {
     case null
     case bool(Bool)
@@ -87,7 +89,9 @@ public indirect enum JSON: Sendable, Hashable, Codable {
         case .null: return "null"
         case .bool(let v): return v ? "true" : "false"
         case .int(let v): return String(v)
-        case .double(let v): return String(v)
+        // JSON has no NaN or infinity; writing Swift's `nan` / `inf` would
+        // make the whole line unparseable for the reader.
+        case .double(let v): return v.isFinite ? String(v) : "null"
         case .string(let v): return "\"" + Self.escaped(v) + "\""
         case .array(let values): return "[" + values.map(\.description).joined(separator: ",") + "]"
         case .object(let dict):

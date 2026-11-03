@@ -43,6 +43,10 @@ public struct LoopSettings: Codable, Sendable, Equatable {
     public var fallbackModel: String?
     /// Stream replies as they arrive.
     public var stream: Bool?
+    /// How hard the model thinks (`low`, `high`, …), sent as given and in
+    /// place of the provider's own `reasoningEffort`. Which words a model
+    /// accepts depends on its provider.
+    public var effort: String?
 
     public init(
         compactAt: Int? = nil,
@@ -51,7 +55,8 @@ public struct LoopSettings: Codable, Sendable, Equatable {
         helperPrice: TokenPrice? = nil,
         maxBudgetUSD: Double? = nil,
         fallbackModel: String? = nil,
-        stream: Bool? = nil
+        stream: Bool? = nil,
+        effort: String? = nil
     ) {
         self.compactAt = compactAt
         self.helperModel = helperModel
@@ -60,6 +65,7 @@ public struct LoopSettings: Codable, Sendable, Equatable {
         self.maxBudgetUSD = maxBudgetUSD
         self.fallbackModel = fallbackModel
         self.stream = stream
+        self.effort = effort
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -70,6 +76,7 @@ public struct LoopSettings: Codable, Sendable, Equatable {
         case maxBudgetUSD = "max_budget_usd"
         case fallbackModel = "fallback_model"
         case stream
+        case effort
     }
 
     /// These settings with every field `other` sets replacing this one's.
@@ -81,7 +88,8 @@ public struct LoopSettings: Codable, Sendable, Equatable {
             helperPrice: other.helperPrice ?? helperPrice,
             maxBudgetUSD: other.maxBudgetUSD ?? maxBudgetUSD,
             fallbackModel: other.fallbackModel ?? fallbackModel,
-            stream: other.stream ?? stream
+            stream: other.stream ?? stream,
+            effort: other.effort ?? effort
         )
     }
 }

@@ -262,6 +262,51 @@ final class FakeTerminal: TerminalIO {
         #expect(terminal.screen.screen.hasSuffix("› go\n⚠ interrupted\n"))
     }
 
+    @Test func escPutsQueuedPromptsBackInTheEditorInsteadOfRunningThem() async {
+        final class Sent: @unchecked Sendable { var prompts: [String] = [] }
+        let sent = Sent()
+        let chat = ChatSession(header: SessionHeader(directory: "~/p")) { prompt in
+            sent.prompts.append(prompt)
+            return AsyncThrowingStream { continuation in
+                guard prompt != "go" else {
+                    continuation.onTermination = { _ in _ = continuation }  // runs until interrupted
+                    return
+                }
+                continuation.yield(turn("re \(prompt)"))
+                continuation.yield(.result(result()))
+                continuation.finish()
+            }
+        }
+        let keys: [[Key]] = [
+            [.text("go"), .enter, .text("one"), .enter, .text("two"), .enter, .text("draft")],
+            [.escape],
+            [.enter],
+        ]
+        let terminal = await run(chat, keys: keys)
+        #expect(sent.prompts == ["go", "one\ntwo\ndraft"])
+        #expect(terminal.screen.screen.hasSuffix("› go\n⚠ interrupted\n\n› one\n  two\n  draft\n● re one\n  two\n  draft\n"))
+    }
+
+    @Test func aShortTerminalKeepsTheLiveRegionOnScreenAndTheStatusLine() async {
+        let chat = ChatSession(header: SessionHeader(directory: "~/p")) { _ in
+            AsyncThrowingStream { continuation in
+                continuation.onTermination = { _ in _ = continuation }  // runs until interrupted
+            }
+        }
+        let terminal = FakeTerminal(columns: 80, rows: 6)
+        let inline = InlineChat(session: chat, terminal: terminal, color: false)
+        let (keys, continuation) = AsyncStream<[Key]>.makeStream()
+        let task = Task { await inline.run(keys: keys) }
+        continuation.yield([.text("go"), .enter, .text("a"), .enter, .text("b"), .enter, .text("c"), .enter])
+        while !terminal.output.contains("esc to interrupt") { await Task.yield() }
+        let rows = terminal.screen.screen.split(separator: "\n", omittingEmptySubsequences: false)
+        let statusRow = rows.lastIndex { $0.contains("esc to interrupt") } ?? 0
+        #expect(rows.count - statusRow <= 5)  // one row spare on a 6-row screen
+        continuation.yield([.escape])
+        continuation.finish()
+        await task.value
+    }
+
     @Test func ctrlCTwiceOnAnEmptyPromptQuits() async {
         let chat = session { _ in [] }
         let terminal = await run(chat, keys: [[.text("draft"), .control("c"), .control("c"), .control("c")]], endInput: false)

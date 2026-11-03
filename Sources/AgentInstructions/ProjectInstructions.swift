@@ -18,46 +18,52 @@ import Foundation
 public struct ProjectInstructions: Sendable, Hashable {
     /// The nearest AGENTS.md (highest precedence), if found.
     public var nearest: URL
-    /// All AGENTS.md files from the filesystem root down to `nearest`, ordered
+    /// The AGENTS.md files from the project root down to `nearest`, ordered
     /// from root-most to nearest (so concatenation reads top-down).
     public var files: [URL]
     /// The raw concatenated markdown (root first, nearest last).
     public var text: String
 
-    /// The instructions loaded for a directory, or nil if no AGENTS.md exists.
+    /// The instructions from `files`. Never nil: the optional is kept so
+    /// existing callers still compile; `load` returns nil when there are
+    /// no files.
     public init?(nearest: URL, files: [URL], text: String) {
         self.nearest = nearest
         self.files = files
         self.text = text
     }
 
+    /// A file bigger than this is not instructions anyone wrote by hand,
+    /// and it would be resent with every request; it is skipped. The same
+    /// cap as a SKILL.md.
+    static let maxFileBytes = SkillCatalog.maxSkillFileBytes
+
     /// Load the instructions chain for the given start directory.
     ///
-    /// Searches `start` and every parent directory for `AGENTS.md` (or, where
-    /// there is none, `CLAUDE.md`). Results are
-    /// ordered root-most first, nearest last, so that a nested AGENTS.md takes
-    /// precedence over its parents' instructions (the standard's "nearest wins").
+    /// Searches `start` and its parents up to the git root (outside a git
+    /// repository, `start` alone) for `AGENTS.md` (or, where there is
+    /// none, `CLAUDE.md`). Results are ordered root-most first, nearest
+    /// last, so that a nested AGENTS.md takes precedence over its parents'
+    /// instructions (the standard's "nearest wins").
+    ///
+    /// A file that isn't a regular file, is too big, or isn't UTF-8 text
+    /// is skipped; the rest of the chain still loads. It never throws: the
+    /// signature is kept for existing callers.
     public static func load(from start: URL) throws -> ProjectInstructions? {
-        var directory = URL(fileURLWithPath: start.path).standardizedFileURL
         var files: [URL] = []
-        while true {
+        var texts: [String] = []
+        // projectDirectories is nearest first; the chain reads root first.
+        for directory in projectDirectories(from: URL(fileURLWithPath: start.path)).reversed() {
             let agentsMD = directory.appendingPathComponent("AGENTS.md")
             let claudeMD = directory.appendingPathComponent("CLAUDE.md")
-            if FileManager.default.fileExists(atPath: agentsMD.path) {
-                files.append(agentsMD)
-            } else if FileManager.default.fileExists(atPath: claudeMD.path) {
-                files.append(claudeMD)
-            }
-            guard directory.path != "/" else { break }
-            let parent = directory.deletingLastPathComponent()
-            guard parent.path != directory.path else { break }
-            directory = parent
+            // A directory with an AGENTS.md uses it, even when it can't be read.
+            let file = FileManager.default.fileExists(atPath: agentsMD.path) ? agentsMD : claudeMD
+            guard let text = readTextFile(file, maxBytes: maxFileBytes) else { continue }
+            files.append(file)
+            texts.append(text)
         }
-        // We collected nearest-first while walking up; reverse for root-first.
-        let ordered = Array(files.reversed())
-        guard let nearest = ordered.last else { return nil }
-        let text = try ordered.map { try String(contentsOf: $0, encoding: .utf8) }.joined(separator: "\n\n")
-        return ProjectInstructions(nearest: nearest, files: ordered, text: text)
+        guard let nearest = files.last else { return nil }
+        return ProjectInstructions(nearest: nearest, files: files, text: texts.joined(separator: "\n\n"))
     }
 
     /// Convenience: load instructions for the current working directory.
@@ -68,7 +74,10 @@ public struct ProjectInstructions: Sendable, Hashable {
     /// Whether a given file is governed by these instructions (it lives at or
     /// below the directory that owns the nearest AGENTS.md).
     public func governs(_ url: URL) -> Bool {
-        let owner = nearest.deletingLastPathComponent().path
-        return url.path.hasPrefix(owner) || url.path.hasSuffix("/" + (nearest.lastPathComponent))
+        // Compared by path component: a prefix of the path string would let
+        // `/a/b` govern `/a/bc`.
+        let owner = nearest.deletingLastPathComponent().standardizedFileURL.pathComponents
+        let path = url.standardizedFileURL.pathComponents
+        return path.starts(with: owner)
     }
 }

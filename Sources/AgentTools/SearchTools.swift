@@ -71,16 +71,20 @@ public struct SearchTool: Tool {
 
         // Sorted, so the same search gives the same output (and stays cacheable).
         var rgArguments = [
-            "rg", "--line-number", "--with-filename", "--no-heading", "--color=never", "--sort=path",
+            "--line-number", "--with-filename", "--no-heading", "--color=never", "--sort=path",
             "--max-columns=\(CapturedOutput.maxLineLength)", "--max-columns-preview",
+            "--max-filesize=\(FileWalk.maxSearchedFileSize)",
         ]
         if let glob { rgArguments += ["--glob", glob] }
-        rgArguments += ["--regexp", pattern, path]
+        // "--" so a path starting with "-" can't be read as a flag (`--pre=…` runs a program).
+        rgArguments += ["--regexp", pattern, "--", path]
 
-        let lines = try runRipgrep(rgArguments, in: workingDirectory)
+        let found = try await runRipgrep(rgArguments, in: workingDirectory)
+        let lines = try found?.lines
             ?? FileWalk(workingDirectory: workingDirectory).search(pattern: pattern, under: path, glob: glob)
-        if lines.isEmpty { return "No matches." }
-        return Self.capped(lines, maxMatches: maxMatches, offset: offset)
+        let problem = found?.problem.map { "\n" + $0 } ?? ""
+        if lines.isEmpty { return "No matches." + problem }
+        return Self.capped(lines, maxMatches: maxMatches, offset: offset) + problem
     }
 
     /// The matches from `offset` on, up to `maxMatches` and `maxOutputChars`.
@@ -112,14 +116,23 @@ public struct SearchTool: Tool {
         var notice = "[showing matches \(first)-\(last) of \(lines.count)\(reason)"
         if last < lines.count {
             notice += "; pass offset=\(last) for the next ones, or narrow the pattern, path or glob"
-            let files = filesWithMatches(lines.dropFirst(last))
-            let listed = files.prefix(maxListedFiles).map { "\($0.path) (\($0.count))" }
-            let unlisted = files.count - listed.count
-            if !listed.isEmpty {
-                notice += ". More matches in: " + listed.joined(separator: ", ") + (unlisted > 0 ? ", and \(unlisted) more files" : "")
-            }
+            notice += whereTheRestAre(lines.dropFirst(last))
         }
         return shown.joined(separator: "\n") + "\n" + notice + "]"
+    }
+
+    /// ". More matches in: a (3), b (1), and 4 more files", naming at most
+    /// `maxListedFiles` files.
+    private static func whereTheRestAre(_ lines: ArraySlice<String>) -> String {
+        let files = filesWithMatches(lines)
+        if files.isEmpty { return "" }
+        let listed = files.prefix(maxListedFiles).map { "\($0.path) (\($0.count))" }
+        var note = ". More matches in: " + listed.joined(separator: ", ")
+        let unlisted = files.count - listed.count
+        if unlisted > 0 {
+            note += ", and \(unlisted) more files"
+        }
+        return note
     }
 
     /// Files and their match counts, most matches first (ties by path).
@@ -178,18 +191,21 @@ public struct ListFilesTool: Tool {
         let path = fields["path"]?.stringValue ?? "."
         let glob = fields["glob"]?.stringValue
 
-        var rgArguments = ["rg", "--files", "--sort=path"]
+        var rgArguments = ["--files", "--sort=path"]
         if let glob { rgArguments += ["--glob", glob] }
-        rgArguments.append(path)
+        // "--" so a path starting with "-" can't be read as a flag.
+        rgArguments += ["--", path]
 
-        let files = try runRipgrep(rgArguments, in: workingDirectory)
+        let found = try await runRipgrep(rgArguments, in: workingDirectory)
+        let files = try found?.lines
             ?? FileWalk(workingDirectory: workingDirectory).files(under: path, glob: glob).map(\.display)
-        if files.isEmpty { return "No files." }
+        let problem = found?.problem.map { "\n" + $0 } ?? ""
+        if files.isEmpty { return "No files." + problem }
         let wantsEveryFile = glob != nil || files.count <= Self.overviewThreshold
         if wantsEveryFile {
-            return limited(files, to: Self.maxFiles, noun: "files", hint: "narrow the path or glob")
+            return limited(files, to: Self.maxFiles, noun: "files", hint: "narrow the path or glob") + problem
         }
-        return Self.overview(of: files, under: path)
+        return Self.overview(of: files, under: path) + problem
     }
 
     /// Past this many files, a listing without a glob is an overview.
@@ -228,21 +244,40 @@ public struct ListFilesTool: Tool {
     }
 }
 
-/// Runs ripgrep and returns its output lines, or nil when ripgrep is not
-/// installed. Exit status 1 means "nothing found", which is an answer, not
-/// an error.
-private func runRipgrep(_ arguments: [String], in directory: URL) throws -> [String]? {
-    let run = try CapturedOutput.run(arguments, in: directory)
-    defer { try? FileManager.default.removeItem(at: run.logFile) }
-    switch run.status {
+/// ripgrep, looked up once on `PATH`; nil when it isn't installed.
+let ripgrep = findExecutable(named: "rg", searchPath: ProcessInfo.processInfo.environment["PATH"])
+
+/// What ripgrep printed, and a one-line note when it hit errors on the way.
+struct RipgrepOutput {
+    var lines: [String]
+    var problem: String?
+}
+
+/// Runs ripgrep (the arguments go after `rg`), or returns nil when ripgrep
+/// is not installed.
+///
+/// Exit status 1 means "nothing found", which is an answer, not an error.
+/// Status 2 means some error, often one unreadable directory among many
+/// readable ones; what was found is still returned, with a note, and only
+/// a run that found nothing throws.
+func runRipgrep(_ arguments: [String], in directory: URL) async throws -> RipgrepOutput? {
+    guard let ripgrep else { return nil }
+    let run = try await CapturedOutput.run(ripgrep, arguments, in: directory, separateErrors: true)
+    defer { run.removeFiles() }
+    let lines = splitLines(run.output).filter { !$0.isEmpty }.map(String.init)
+    let errors = run.errors.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    switch run.exitCode {
     case 0:
-        return run.output.split(separator: "\n").map(String.init)
+        return RipgrepOutput(lines: lines)
     case 1:
-        return []
-    case 127:
-        return nil
+        return RipgrepOutput(lines: [])
+    case 2 where !lines.isEmpty:
+        let firstError = errors.split(separator: "\n").first.map(String.init) ?? "unknown error"
+        return RipgrepOutput(lines: lines, problem: "[rg reported errors; results may be incomplete. First: \(firstError.prefix(300))]")
     default:
-        throw ToolError.runtimeError("rg failed (exit code \(run.status)): \(run.output.prefix(1_000))")
+        let status = run.exitCode.map { "exit code \($0)" } ?? "stopped by a signal"
+        throw ToolError.runtimeError("rg failed (\(status)): \(errors.prefix(1_000))")
     }
 }
 

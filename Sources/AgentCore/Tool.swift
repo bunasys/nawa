@@ -59,9 +59,11 @@ extension Tool {
 
 /// A set of tools callable by the model, keyed by name.
 public struct ToolRegistry: Sendable {
-    private var tools: [String: any Tool]
+    private var tools: [String: any Tool] = [:]
+
+    /// Tools sharing a name keep the last one, as `register` and `merge` do.
     public init(_ tools: [any Tool] = []) {
-        self.tools = Dictionary(uniqueKeysWithValues: tools.map { ($0.definition.name, $0) })
+        register(contentsOf: tools)
     }
 
     public subscript(name: String) -> (any Tool)? { tools[name] }

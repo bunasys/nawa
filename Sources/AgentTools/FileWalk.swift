@@ -48,7 +48,7 @@ struct FileWalk {
         }
         var matches: [String] = []
         for file in try files(under: path, glob: glob) {
-            guard let data = try? Data(contentsOf: file.url), !data.contains(0) else { continue }
+            guard let data = Self.searchableText(at: file.url) else { continue }
             var lineNumber = 0
             String(decoding: data, as: UTF8.self).enumerateLines { line, _ in
                 lineNumber += 1
@@ -61,6 +61,31 @@ struct FileWalk {
             }
         }
         return matches
+    }
+
+    /// Files bigger than this aren't searched (`search` passes the same
+    /// limit to ripgrep as `--max-filesize`): past it they are data dumps
+    /// or build output, and reading one would hold it all in memory.
+    static let maxSearchedFileSize = 10 * 1024 * 1024
+    /// Where binary detection looks for a NUL byte, as git does.
+    static let binaryCheckSize = 8 * 1024
+
+    /// The file's contents, or nil when it is too big or binary. The first
+    /// bytes are checked before the rest is read, so a large binary costs
+    /// one small read.
+    private static func searchableText(at url: URL) -> Data? {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        guard size <= maxSearchedFileSize else { return nil }
+        guard let file = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? file.close() }
+        guard let start = try? file.read(upToCount: binaryCheckSize) ?? Data() else { return nil }
+        if start.contains(0) { return nil }
+        guard let rest = try? file.readToEnd() ?? Data() else { return nil }
+        // A later NUL marks the file binary too. ripgrep would still print
+        // the matches before it, a difference only files mixing text and
+        // binary data show.
+        if rest.contains(0) { return nil }
+        return start + rest
     }
 
     private func walk(_ directory: URL, display: String, rules inherited: IgnoreRules, filter: IgnorePattern?, into found: inout [File]) {

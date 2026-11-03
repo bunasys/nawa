@@ -24,7 +24,8 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
     public var model: String?
     /// Optional models to auto-select among; if empty, discovered at runtime.
     public var modelWhitelist: [String]?
-    /// Optional per-provider HTTP headers.
+    /// Extra HTTP headers sent with every request to this provider. The
+    /// ones the client sets itself (auth, versions, content type) win.
     public var headers: [String: String]?
     /// Anthropic only: the `wrkspc_…` workspace requests act in. Required for
     /// API keys not scoped to a single workspace; falls back to
@@ -100,6 +101,12 @@ public struct ProviderConfig: Sendable, Codable, Equatable {
     ) -> String? {
         guard reference.hasPrefix("env:") else { return reference }
         return environment[String(reference.dropFirst(4))]
+    }
+
+    /// The variable named by an `env:NAME` API key when it is not set.
+    var unsetAPIKeyVariable: String? {
+        guard let apiKey, apiKey.hasPrefix("env:"), resolvedAPIKey == nil else { return nil }
+        return String(apiKey.dropFirst(4))
     }
 
     /// This provider with unset Anthropic settings filled from the standard

@@ -37,46 +37,63 @@ public enum Key: Sendable, Hashable {
 /// Unknown escape sequences are dropped, never inserted as text.
 public struct KeyDecoder: Sendable {
     private var pending: [UInt8] = []
-    /// Bytes of a bracketed paste still waiting for its end marker.
+    /// Bytes of a bracketed paste still waiting for its end marker; nil
+    /// outside a paste.
     private var paste: [UInt8]?
+    /// `flush()` calls in a row, inside a paste, with no bytes in between.
+    private var silentPasteFlushes = 0
 
     private static let pasteEnd: [UInt8] = Array("\u{1B}[201~".utf8)
+    /// A paste whose end marker hasn't come after this many flushes (about
+    /// two seconds at 50 ms each) is taken as it is. Without a limit a lost
+    /// end marker would swallow every later key, Enter and Ctrl-C included.
+    static let pasteGiveUpFlushes = 40
 
     public init() {}
 
-    /// Whether bytes are held back waiting for the rest of a sequence.
-    public var hasPending: Bool { !pending.isEmpty }
+    /// Whether bytes are held back waiting for the rest of a sequence or
+    /// the end of a paste.
+    public var hasPending: Bool { !pending.isEmpty || paste != nil }
 
     public mutating func decode(_ bytes: some Sequence<UInt8>) -> [Key] {
         pending.append(contentsOf: bytes)
+        silentPasteFlushes = 0
         var keys: [Key] = []
-        var index = 0
-        while index < pending.count {
-            if paste != nil {
-                guard let consumed = consumePaste(from: index, into: &keys) else {
-                    // Still inside the paste: keep all but a possible partial end marker.
-                    let keep = Self.partialSuffix(of: pending[index...], matching: Self.pasteEnd)
-                    paste!.append(contentsOf: pending[index..<(pending.count - keep)])
-                    index = pending.count - keep
-                    break
-                }
-                index = consumed
-                continue
+        // One read can hold keys, a whole paste and more keys: go on while
+        // the mode keeps switching.
+        while !pending.isEmpty {
+            let wasInPaste = paste != nil
+            if wasInPaste {
+                decodePaste(into: &keys)
+            } else {
+                decodeKeys(into: &keys)
             }
+            let switchedMode = (paste != nil) != wasInPaste
+            if !switchedMode { break }
+        }
+        return keys
+    }
+
+    /// Gives up waiting: a held-back lone Esc becomes `.escape`, and an
+    /// incomplete UTF-8 or escape sequence is dropped. Inside a paste the
+    /// held bytes are kept (the end marker may be split across reads)
+    /// until the paste has been silent for `pasteGiveUpFlushes` calls.
+    public mutating func flush() -> [Key] {
+        if paste != nil { return flushPaste() }
+        defer { pending.removeAll() }
+        return pending.first == 0x1B ? [.escape] : []
+    }
+
+    /// Decodes keys from the start of `pending` until the bytes run out,
+    /// a sequence is incomplete, or a bracketed paste starts.
+    private mutating func decodeKeys(into keys: inout [Key]) {
+        var index = 0
+        while index < pending.count, paste == nil {
             guard let (key, next) = decodeOne(at: index) else { break }  // incomplete
             if let key { Self.append(key, to: &keys) }
             index = next
         }
         pending.removeFirst(index)
-        return keys
-    }
-
-    /// Gives up waiting: a held-back lone Esc becomes `.escape`, and an
-    /// incomplete UTF-8 or escape sequence is dropped.
-    public mutating func flush() -> [Key] {
-        defer { pending.removeAll() }
-        if paste != nil { return [] }  // a paste without its end marker keeps waiting
-        return pending.first == 0x1B ? [.escape] : []
     }
 
     // MARK: - Decoding
@@ -88,7 +105,7 @@ public struct KeyDecoder: Sendable {
         switch byte {
         case 0x1B:
             return decodeEscape(at: index)
-        case 0x0D: return (.enter, index + 1)
+        case 0x0D: return decodeCarriageReturn(at: index)
         case 0x0A: return (.newline, index + 1)
         case 0x09: return (.tab, index + 1)
         case 0x7F, 0x08: return (.backspace, index + 1)
@@ -97,6 +114,17 @@ public struct KeyDecoder: Sendable {
         case 0x20..<0x80: return (.text(String(Unicode.Scalar(byte))), index + 1)
         default: return decodeUTF8(at: index)
         }
+    }
+
+    /// A typed Enter arrives in a read of its own, or ends one. A CR with
+    /// more bytes behind it in the same read is a line break pasted on a
+    /// terminal without bracketed paste: a newline, so the paste isn't
+    /// sent one line at a time.
+    private func decodeCarriageReturn(at index: Int) -> (Key?, Int) {
+        let next = index + 1
+        guard next < pending.count else { return (.enter, next) }
+        let isCRLF = pending[next] == 0x0A
+        return (.newline, isCRLF ? next + 1 : next)
     }
 
     private func decodeUTF8(at index: Int) -> (Key?, Int)? {
@@ -228,23 +256,46 @@ public struct KeyDecoder: Sendable {
 
     // MARK: - Bracketed paste
 
-    /// Looks for the paste end marker from `index`. On success emits the
-    /// paste and returns the index after the marker.
-    private mutating func consumePaste(from index: Int, into keys: inout [Key]) -> Int? {
-        let marker = Self.pasteEnd
-        guard pending.count - index >= marker.count else { return nil }
-        var position = index
-        while position + marker.count <= pending.count {
-            if pending[position..<(position + marker.count)].elementsEqual(marker) {
-                let bytes = paste! + pending[index..<position]
-                paste = nil
-                let text = String(decoding: bytes, as: UTF8.self)
-                    .replacing("\r\n", with: "\n")
-                    .replacing("\r", with: "\n")
-                if !text.isEmpty { keys.append(.paste(text)) }
-                return position + marker.count
-            }
-            position += 1
+    /// Moves `pending` into the paste and emits the paste once its end
+    /// marker is there. A possible partial end marker stays in `pending`.
+    private mutating func decodePaste(into keys: inout [Key]) {
+        guard var collected = paste else { return }
+        guard let markerStart = Self.firstIndex(of: Self.pasteEnd, in: pending) else {
+            let keep = Self.partialSuffix(of: pending[...], matching: Self.pasteEnd)
+            collected += pending.dropLast(keep)
+            pending.removeFirst(pending.count - keep)
+            paste = collected
+            return
+        }
+        collected += pending[..<markerStart]
+        pending.removeFirst(markerStart + Self.pasteEnd.count)
+        paste = nil
+        if let text = Self.pasteText(collected) { keys.append(.paste(text)) }
+    }
+
+    private mutating func flushPaste() -> [Key] {
+        silentPasteFlushes += 1
+        guard silentPasteFlushes >= Self.pasteGiveUpFlushes, let collected = paste else { return [] }
+        let bytes = collected + pending
+        pending.removeAll()
+        paste = nil
+        silentPasteFlushes = 0
+        guard let text = Self.pasteText(bytes) else { return [] }
+        return [.paste(text)]
+    }
+
+    /// Pasted bytes as text with line breaks as `\n`; nil when empty.
+    private static func pasteText(_ bytes: [UInt8]) -> String? {
+        let text = String(decoding: bytes, as: UTF8.self)
+            .replacing("\r\n", with: "\n")
+            .replacing("\r", with: "\n")
+        return text.isEmpty ? nil : text
+    }
+
+    private static func firstIndex(of marker: [UInt8], in bytes: [UInt8]) -> Int? {
+        guard bytes.count >= marker.count else { return nil }
+        for start in 0...(bytes.count - marker.count) {
+            if bytes[start..<(start + marker.count)].elementsEqual(marker) { return start }
         }
         return nil
     }

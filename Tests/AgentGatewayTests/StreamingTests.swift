@@ -22,6 +22,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     private static let bodies = Mutex<[String: [String]]>([:])
     private static let timeouts = Mutex<[String: [TimeInterval]]>([:])
     private static let sessionIDs = Mutex<[String: [String?]]>([:])
+    private static let headers = Mutex<[String: [[String: String]]]>([:])
 
     /// A session whose requests to `host` get `replies`.
     static func session(host: String, replies: [Reply]) -> URLSession {
@@ -34,6 +35,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     static func bodies(host: String) -> [String] { bodies.withLock { $0[host] ?? [] } }
     static func timeouts(host: String) -> [TimeInterval] { timeouts.withLock { $0[host] ?? [] } }
     static func sessionIDs(host: String) -> [String?] { sessionIDs.withLock { $0[host] ?? [] } }
+    static func headers(host: String) -> [[String: String]] { headers.withLock { $0[host] ?? [] } }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -43,6 +45,7 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         Self.bodies.withLock { $0[host, default: []].append(Self.body(of: request)) }
         Self.timeouts.withLock { $0[host, default: []].append(request.timeoutInterval) }
         Self.sessionIDs.withLock { $0[host, default: []].append(request.value(forHTTPHeaderField: "x-session-id")) }
+        Self.headers.withLock { $0[host, default: []].append(request.allHTTPHeaderFields ?? [:]) }
         let reply = Self.replies.withLock { replies -> Reply? in
             guard var queue = replies[host], !queue.isEmpty else { return nil }
             let next = queue.removeFirst()
@@ -201,7 +204,7 @@ struct OpenAIStreamingTests {
         else { Issue.record("unexpected deltas \(deltas)"); return }
         #expect(call.id == "c1" && call.name == "shell")
 
-        let response = assembler.response()
+        let response = try assembler.response()
         #expect(response.message.text == "Running it.")
         #expect(response.message.toolCalls == [ToolCall(id: "c1", name: "shell", arguments: .object(["command": .string("ls")]))])
         #expect(response.finishReason == .toolUse)
@@ -666,6 +669,17 @@ struct ReasoningEffortTests {
 
         #expect(set["output_config"] == .object(["effort": .string("medium")]))
         #expect(unset["output_config"] == nil)
+    }
+
+    /// The `effort` setting reaches the request and wins over the provider's.
+    @Test
+    func theRequestsEffortWinsOverTheProviders() throws {
+        var request = ModelRequest(model: "claude-opus-5-5", messages: [Message(role: .user, text: "hi")])
+        request.reasoningEffort = "high"
+
+        let body = try AnthropicClient.requestBody(request, effort: "low").objectValue!
+
+        #expect(body["output_config"] == .object(["effort": .string("high")]))
     }
 
     /// Saved with the provider, so `nawa config` files can set it too.

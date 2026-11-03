@@ -90,18 +90,26 @@ public struct Layout: Sendable {
     /// One row: `text` cleaned, joined onto one line and cut to fit with `…`.
     public func row(_ text: String, style: Style = .plain, prefix: StyledSpan? = nil) -> StyledLine {
         let prefixWidth = prefix.map { TextWidth.of($0.text) } ?? 0
-        let flat = Layout.sanitize(text).split(whereSeparator: \.isNewline).joined(separator: " ")
-        let cut = TextWidth.truncate(flat, width: max(width - prefixWidth, 1))
+        let cut = TextWidth.truncate(Layout.oneLine(text), width: max(width - prefixWidth, 1))
         return StyledLine((prefix.map { [$0] } ?? []) + [StyledSpan(cut, style)])
     }
 }
 
 extension Layout {
+    /// Agent-supplied `text` sanitized and joined onto one line, for rows
+    /// that must stay one row tall (a newline would throw off the live
+    /// region's row count).
+    static func oneLine(_ text: String) -> String {
+        sanitize(text).split(whereSeparator: \.isNewline).joined(separator: " ")
+    }
+
     /// Removes what could act on the terminal instead of being shown: C0
     /// controls (except newline and tab), DEL and C1 controls, which start
     /// escape sequences (colours, cursor moves, window titles, OSC 52
     /// clipboard writes). A lone CR becomes a newline and tabs become
-    /// spaces up to the next multiple of four columns.
+    /// spaces up to the next multiple of four columns. Bidi embeddings,
+    /// overrides and isolates become `�`: they could make a shell command
+    /// in a tool label read differently from what runs.
     ///
     /// Everything the agent supplies (model text, tool output, file
     /// contents, MCP results) goes through here: only the renderer emits
@@ -126,6 +134,9 @@ extension Layout {
                 column += spaces
             case 0x00...0x1F, 0x7F...0x9F:
                 continue
+            case 0x202A...0x202E, 0x2066...0x2069:
+                result.unicodeScalars.append("\u{FFFD}")
+                column += 1
             default:
                 result.unicodeScalars.append(scalar)
                 column += 1  // close enough for tab stops; wide characters are rare before a tab
@@ -150,9 +161,11 @@ public enum TextWidth {
     public static func of(_ character: Character) -> Int {
         let scalars = character.unicodeScalars
         guard let first = scalars.first else { return 0 }
-        if first.value < 0x7F { return first.value >= 0x20 ? 1 : 0 }
         // Emoji: shown wide by default, or asked to be with VS16 (U+FE0F).
-        if first.properties.isEmojiPresentation || scalars.contains("\u{FE0F}") { return 2 }
+        // VS16 first: keycaps (`1️⃣`, `#️⃣`) start with an ASCII character.
+        if scalars.contains("\u{FE0F}") { return 2 }
+        if first.value < 0x7F { return first.value >= 0x20 ? 1 : 0 }
+        if first.properties.isEmojiPresentation { return 2 }
         switch first.properties.generalCategory {
         case .nonspacingMark, .enclosingMark, .format, .control, .lineSeparator, .paragraphSeparator:
             return 0

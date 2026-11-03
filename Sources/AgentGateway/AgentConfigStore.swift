@@ -111,7 +111,9 @@ public struct AgentConfigStore: Codable, Sendable, Equatable {
     }
 
     /// Write the store to `url`, creating parent directories as needed. The
-    /// file may contain API keys, so it is written owner-read/write only.
+    /// file may contain API keys, so it is owner-read/write only from the
+    /// moment it exists: written to a 0600 file beside it, then renamed
+    /// over it (a write-then-chmod leaves it readable for a moment).
     public func save(to url: URL = defaultLocation()) throws {
         let parent = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(
@@ -121,8 +123,57 @@ public struct AgentConfigStore: Codable, Sendable, Equatable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(self)
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+
+        let temporary = parent.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else { throw AgentConfigStoreError.writeFailed(path: temporary.path, reason: Self.lastError()) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        do {
+            try handle.write(contentsOf: data)
+            try handle.close()
+        } catch {
+            unlink(temporary.path)
+            throw error
+        }
+        guard rename(temporary.path, url.path) == 0 else {
+            let reason = Self.lastError()
+            unlink(temporary.path)
+            throw AgentConfigStoreError.writeFailed(path: url.path, reason: reason)
+        }
+    }
+
+    /// Load the store at `url`, apply `change`, and save it, holding an
+    /// exclusive lock on a sibling `.lock` file throughout. Two writers
+    /// (a repl's `/config` and `nawa config` in another terminal) would
+    /// otherwise each save what they loaded and lose the other's change.
+    /// Nothing is saved when `change` throws.
+    @discardableResult
+    public static func modify<Result>(
+        at url: URL = defaultLocation(),
+        _ change: (inout AgentConfigStore) throws -> Result
+    ) throws -> Result {
+        let parent = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: parent, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let lockPath = url.path + ".lock"
+        let lock = open(lockPath, O_RDWR | O_CREAT, 0o600)
+        guard lock >= 0 else { throw AgentConfigStoreError.writeFailed(path: lockPath, reason: lastError()) }
+        defer { close(lock) }
+        while flock(lock, LOCK_EX) != 0 {
+            guard errno == EINTR else { throw AgentConfigStoreError.writeFailed(path: lockPath, reason: lastError()) }
+        }
+        defer { flock(lock, LOCK_UN) }
+
+        var store = try load(from: url)
+        let result = try change(&store)
+        try store.save(to: url)
+        return result
+    }
+
+    private static func lastError() -> String {
+        String(cString: strerror(errno))
     }
 
     // MARK: Per-directory access
@@ -268,6 +319,7 @@ public enum AgentConfigStoreError: Error, LocalizedError, Sendable {
     case malformed(path: String, underlying: any Error)
     case providerNotFound(name: String, directory: String)
     case unsupportedVersion(path: String, version: Int)
+    case writeFailed(path: String, reason: String)
 
     public var errorDescription: String? {
         switch self {
@@ -277,6 +329,8 @@ public enum AgentConfigStoreError: Error, LocalizedError, Sendable {
             return "no provider named \"\(name)\" is configured for \(directory)"
         case .unsupportedVersion(let path, let version):
             return "config file at \(path) is version \(version); this nawa reads up to \(AgentConfigStore.currentVersion). Upgrade nawa."
+        case .writeFailed(let path, let reason):
+            return "could not write \(path): \(reason)"
         }
     }
 }

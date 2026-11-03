@@ -1,9 +1,7 @@
 import AgentCore
-import AgentGateway
 import AgentJSONRPC
 import AgentLoop
 import AgentMCP
-import AgentTools
 import Foundation
 
 /// Builds the agent loop for a new ACP session.
@@ -45,6 +43,15 @@ public enum ACPOutboundRouting: Sendable {
     case singleStream
 }
 
+/// What an SSE GET gets when it asks for a stream.
+enum ACPStreamAttachment {
+    case stream(AsyncStream<JSONRPCMessage>)
+    /// Another GET already reads this stream, and a stream has one reader.
+    case alreadyAttached
+    /// The session the GET names doesn't exist on this connection.
+    case unknownSession
+}
+
 /// One ACP connection (one `Acp-Connection-Id`).
 ///
 /// Owns the connection-scoped outbound stream and the per-session streams, and
@@ -57,14 +64,23 @@ public actor ACPConnection {
     private let capabilities: ACPCapabilities
     private let routing: ACPOutboundRouting
 
-    private let connectionStream = ACPEventStream()
+    private var connectionStream = ACPEventStream()
     private var sessionStreams: [String: ACPEventStream] = [:]
+    /// The streams an SSE GET is reading now.
+    private var attachedStreams: Set<ACPRoute> = []
     /// Sessions in memory. An idle one may be dropped from here and rebuilt
     /// from its journal on its next request (see `unloadIdleSessions`).
     private var sessions: [String: ACPSession] = [:]
     /// How every session of this connection was set up, loaded or not.
     private var setups: [String: SessionSetup] = [:]
+    /// When each session was last sent a prompt, noted before any await so
+    /// the idle sweeper can see a prompt that is still on its way.
+    private var lastPromptAt: [String: ContinuousClock.Instant] = [:]
+    /// Restores in progress. Requests for the same unloaded session share
+    /// one: a second restore would find the journal locked by the first.
+    private var restoring: [String: Task<ACPSession?, any Error>] = [:]
     private var idleSweeper: Task<Void, Never>?
+    private var isClosed = false
 
     private struct SessionSetup {
         var cwd: String
@@ -89,22 +105,53 @@ public actor ACPConnection {
         idleSweeper?.cancel()
     }
 
-    /// The connection-scoped outbound stream (for SSE GET handlers).
+    /// The connection-scoped outbound stream, for transports with one pipe
+    /// (stdio, WebSocket). SSE GETs use `attachStream`.
     public var outbound: AsyncStream<JSONRPCMessage> { connectionStream.stream }
 
-    /// Ends the connection-scoped stream once what is already queued on it
-    /// has been read; later messages are dropped. For a transport whose
-    /// client has gone (stdin closed) but whose last replies must still go out.
-    public func finishOutbound() {
+    /// Ends the connection: stops the idle sweeper, cancels running prompts,
+    /// lets the sessions go (their MCP servers stop with them) and ends the
+    /// outbound streams once what is already queued on them has been read.
+    /// Later messages are dropped.
+    public func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        idleSweeper?.cancel()
+        let closing = Array(sessions.values)
+        sessions = [:]
+        for session in closing { await session.cancel() }
         connectionStream.finish()
+        for stream in sessionStreams.values { stream.finish() }
     }
 
-    /// The session-scoped outbound stream for `sessionID`, creating it if needed.
-    public func sessionOutbound(for sessionID: String) -> AsyncStream<JSONRPCMessage> {
-        if sessionStreams[sessionID] == nil {
+    /// The stream an SSE GET reads: the connection's, or a session's. Each
+    /// has one reader at a time; `detachStream` lets the next one in.
+    func attachStream(_ route: ACPRoute) -> ACPStreamAttachment {
+        guard !attachedStreams.contains(route) else { return .alreadyAttached }
+        let stream: ACPEventStream
+        switch route {
+        case .connection:
+            stream = connectionStream
+        case .session(let sessionID):
+            guard let sessionStream = sessionStreams[sessionID] else { return .unknownSession }
+            stream = sessionStream
+        }
+        attachedStreams.insert(route)
+        return .stream(stream.stream)
+    }
+
+    /// The SSE GET reading `route` has ended.
+    func detachStream(_ route: ACPRoute) {
+        attachedStreams.remove(route)
+        guard !isClosed else { return }
+        // A stream ends when its reader goes away, so a reconnecting GET
+        // needs a fresh one.
+        switch route {
+        case .connection:
+            connectionStream = ACPEventStream()
+        case .session(let sessionID):
             sessionStreams[sessionID] = ACPEventStream()
         }
-        return sessionStreams[sessionID]!.stream
     }
 
     /// Handle one raw inbound frame (a stdio line or a WebSocket text
@@ -121,8 +168,10 @@ public actor ACPConnection {
         await handle(message)
     }
 
-    /// Handle an inbound JSON-RPC message.
+    /// Handle an inbound JSON-RPC message. Responses are ignored: the agent
+    /// sends the client no requests.
     public func handle(_ message: JSONRPCMessage) async {
+        guard !isClosed else { return }
         switch message {
         case .request(let request):
             await handleRequest(request)
@@ -160,10 +209,6 @@ public actor ACPConnection {
             await prompt(request: request)
         case "session/set_model":
             await setModel(request: request)
-        case "session/request_permission":
-            // A client→agent *response* to our permission request arrives here
-            // as a result; but a request with this method is unexpected. Ignore.
-            break
         default:
             connectionStream.publish(
                 .makeError(id: request.id, code: .methodNotFound, message: "unknown method \(request.method)")
@@ -189,7 +234,7 @@ public actor ACPConnection {
         let params = request.params ?? .object([:])
         let cwd = params.objectValue?["cwd"]?.stringValue ?? FileManager.default.currentDirectoryPath
         let sessionID = "sess_\(UUID().uuidString.prefix(12))"
-        let mcpServers = decodeMCPServers(params.objectValue?["mcpServers"])
+        let mcpServers = Self.decodeMCPServers(params.objectValue?["mcpServers"])
 
         do {
             let loop = try await factory.makeLoop(sessionID: sessionID, cwd: cwd, mcpServers: mcpServers)
@@ -217,7 +262,7 @@ public actor ACPConnection {
         }
         let setup = SessionSetup(
             cwd: params["cwd"]?.stringValue ?? FileManager.default.currentDirectoryPath,
-            mcpServers: decodeMCPServers(params["mcpServers"])
+            mcpServers: Self.decodeMCPServers(params["mcpServers"])
         )
         let session: ACPSession
         do {
@@ -230,13 +275,20 @@ public actor ACPConnection {
             connectionStream.publish(.makeError(id: request.id, code: .internalError, message: "session/load failed: \(error)"))
             return
         }
+        // The replay would interleave with the running turn's updates.
+        guard await !session.isRunning else {
+            connectionStream.publish(.makeError(id: request.id, code: .invalidRequest, message: "session \(sessionID) is running a prompt; load it once the turn ends"))
+            return
+        }
         await session.sendHistory()
         connectionStream.publish(.makeSuccess(id: request.id, result: .object([:])))
     }
 
     private func prompt(request: JSONRPCRequest) async {
         let params = request.params?.objectValue ?? [:]
-        guard let session = await liveSession(params["sessionId"]?.stringValue, answering: request) else { return }
+        let sessionID = params["sessionId"]?.stringValue
+        if let sessionID { lastPromptAt[sessionID] = .now }
+        guard let session = await liveSession(sessionID, answering: request) else { return }
         let content = (params["prompt"]?.arrayValue ?? []).compactMap { ACPContentBlock(json: $0) }
         await session.prompt(requestID: request.id, content: content)
     }
@@ -272,8 +324,9 @@ public actor ACPConnection {
         let sink = ConnectionSink(connection: self)
         sessions[sessionID] = ACPSession(sessionID: sessionID, cwd: setup.cwd, loop: loop, sink: sink)
         setups[sessionID] = setup
-        // Ensure the session stream exists.
-        _ = sessionOutbound(for: sessionID)
+        if sessionStreams[sessionID] == nil {
+            sessionStreams[sessionID] = ACPEventStream()
+        }
     }
 
     /// The session, rebuilt from its journal when it was unloaded. A session
@@ -281,14 +334,18 @@ public actor ACPConnection {
     /// (`session/load` says where it runs). Nil when there is none to find.
     private func liveSession(_ sessionID: String, setupIfUnknown: SessionSetup? = nil) async throws -> ACPSession? {
         if let session = sessions[sessionID] { return session }
+        if let restore = restoring[sessionID] { return try await restore.value }
         guard let setup = setups[sessionID] ?? setupIfUnknown else { return nil }
-        guard let loop = try await factory.restoreLoop(sessionID: sessionID, cwd: setup.cwd, mcpServers: setup.mcpServers) else {
-            return nil
+        let restore = Task { () async throws -> ACPSession? in
+            guard let loop = try await factory.restoreLoop(sessionID: sessionID, cwd: setup.cwd, mcpServers: setup.mcpServers) else {
+                return nil
+            }
+            addSession(sessionID, loop: loop, setup: setup)
+            return sessions[sessionID]
         }
-        // Another request may have restored it while this one waited.
-        if let session = sessions[sessionID] { return session }
-        addSession(sessionID, loop: loop, setup: setup)
-        return sessions[sessionID]
+        restoring[sessionID] = restore
+        defer { restoring[sessionID] = nil }
+        return try await restore.value
     }
 
     /// Drops the sessions with no prompt running for `idle`: their loops,
@@ -297,6 +354,11 @@ public actor ACPConnection {
     public func unloadIdleSessions(idleFor idle: Duration) async {
         guard capabilities.loadSession else { return }
         for (sessionID, session) in sessions where await session.isIdle(for: idle) {
+            // A prompt may have reached this connection while `isIdle` was
+            // awaited, and not reached the session yet.
+            let stillInMemory = sessions[sessionID] === session
+            let promptedRecently = lastPromptAt[sessionID].map { ContinuousClock.now - $0 < idle } ?? false
+            guard stillInMemory, !promptedRecently else { continue }
             sessions[sessionID] = nil
         }
     }
@@ -321,35 +383,49 @@ public actor ACPConnection {
 
     // MARK: - Helpers
 
-    /// Decode the `mcpServers` array from a `session/new` params object.
-    private func decodeMCPServers(_ value: JSON?) -> [MCPServerConfig] {
-        guard let array = value?.arrayValue else { return [] }
-        return array.compactMap { entry -> MCPServerConfig? in
-            guard let obj = entry.objectValue, let command = obj["command"]?.stringValue else { return nil }
-            let name = obj["name"]?.stringValue ?? command
-            let args = obj["args"]?.arrayValue?.compactMap { $0.stringValue } ?? []
-            let envDict = obj["env"]?.arrayValue?.compactMap { $0.objectValue }.flatMap { d -> [(String, String)] in
-                d.compactMap { (k, v) in v.stringValue.map { (k, $0) } }
-            } ?? []
-            return MCPServerConfig(name: name, command: command, args: args, env: Dictionary(envDict, uniquingKeysWith: { _, b in b }))
+    /// Decode the `mcpServers` array of `session/new` / `session/load`.
+    /// Only stdio servers (with a `command`) can be run; the others are
+    /// reported on stderr, never stdout, which carries the protocol in
+    /// stdio mode.
+    static func decodeMCPServers(_ value: JSON?) -> [MCPServerConfig] {
+        guard let entries = value?.arrayValue else { return [] }
+        return entries.compactMap { entry -> MCPServerConfig? in
+            guard let server = entry.objectValue else { return nil }
+            let name = server["name"]?.stringValue
+            guard let command = server["command"]?.stringValue else {
+                let kind = server["type"]?.stringValue ?? "unknown"
+                FileHandle.standardError.write(Data("nawa: skipping MCP server \(name ?? "?"): \(kind) servers are not supported, only stdio\n".utf8))
+                return nil
+            }
+            let args = server["args"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            // ACP sends the environment as `[{"name": …, "value": …}]`.
+            var env: [String: String] = [:]
+            for variable in server["env"]?.arrayValue ?? [] {
+                let fields = variable.objectValue
+                guard let variableName = fields?["name"]?.stringValue,
+                      let variableValue = fields?["value"]?.stringValue
+                else { continue }
+                env[variableName] = variableValue
+            }
+            return MCPServerConfig(name: name ?? command, command: command, args: args, env: env)
         }
     }
 }
 
 /// A sink backed by an `ACPConnection`, routing messages to the right stream.
 ///
-/// Lives in the connection's actor isolation: `send` hops onto the connection
-/// to publish. This keeps the session's view of the transport tiny (just
-/// "where do I send this?") and the connection's view of routing centralized.
+/// Holds the connection weakly: the connection owns its sessions, so a
+/// strong reference back would keep both alive forever. Messages sent after
+/// the connection is gone are dropped.
 public struct ConnectionSink: ACPMessageSink {
-    private let connection: ACPConnection
+    private weak let connection: ACPConnection?
 
     public init(connection: ACPConnection) {
         self.connection = connection
     }
 
     public func send(_ message: JSONRPCMessage, route: ACPRoute) async {
-        await connection.publish(message, route: route)
+        await connection?.publish(message, route: route)
     }
 }
 

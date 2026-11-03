@@ -66,7 +66,7 @@ extension Layout {
     /// `⏺ shell  swift test`, cut to one row.
     public func callRow(_ label: ToolLabel, indent: Int, marker: StyledSpan = StyledSpan("⏺ ", .color(.green))) -> StyledLine {
         let pad = StyledSpan(String(repeating: " ", count: indent))
-        let name = StyledSpan(Layout.sanitize(label.name), .bold)
+        let name = StyledSpan(Layout.oneLine(label.name), .bold)
         let used = indent + TextWidth.of(marker.text) + TextWidth.of(name.text)
         guard !label.detail.isEmpty, used + 3 <= width else {
             return StyledLine([pad, marker, StyledSpan(TextWidth.truncate(name.text, width: max(width - indent - 2, 1)), .bold)])

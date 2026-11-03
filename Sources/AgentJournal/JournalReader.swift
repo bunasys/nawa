@@ -23,6 +23,23 @@ public enum JournalReader {
         }
         return JournalContents(lines: lines, skippedLines: skipped)
     }
+
+    /// The first record only, read without loading the whole file: enough
+    /// to tell where and when a session started.
+    public static func readFirst(_ url: URL) -> JournalLine? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var buffer = Data()
+        while true {
+            guard let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
+            buffer.append(chunk)
+            if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                buffer = buffer[..<newline]
+                break
+            }
+        }
+        return try? JournalFormat.decode(Data(buffer))
+    }
 }
 
 /// A journal's records, with lookups for analysing them.
@@ -81,6 +98,21 @@ public struct JournalContents: Sendable {
             }
         }
         return context
+    }
+
+    /// Ids the session's last context rewrite names that no readable line
+    /// holds (a damaged journal). `context(ofSession:)` leaves them out, so
+    /// a context rebuilt from a journal with any is not the one the session
+    /// had: check this before going on with it.
+    public func missingContextMessageIDs(ofSession session: String) -> [String] {
+        let messages = messagesByID
+        var missing: [String] = []
+        for entry in entries where entry.session == session {
+            guard case .contextRewrite(let rewrite) = entry.record else { continue }
+            // A later rewrite replaces the whole context, so only the last one counts.
+            missing = rewrite.context.filter { messages[$0] == nil }
+        }
+        return missing
     }
 
     /// The messages and tools a model call sent, rebuilt from their ids.
@@ -144,9 +176,10 @@ extension JournalContents {
                 notes.append(note)
             case .modelCall(let call):
                 usage.accumulate(call.usage)
-                if call.purpose == .compaction {
+                if call.countsAsHelper {
                     helperUsage.accumulate(call.usage)
-                } else if call.response != nil {
+                }
+                if call.purpose == .turn && call.response != nil {
                     contextTokens = call.usage.total
                 }
             case .contextRewrite(let rewrite) where rewrite.reason != .toolResultsCleared:

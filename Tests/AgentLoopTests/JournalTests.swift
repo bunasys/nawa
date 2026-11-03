@@ -62,9 +62,12 @@ struct JournalTests {
         let model = ScriptedModel(responses: [
             toolCallResponse(echoCall("c1", "a"), usage: Usage(inputTokens: 10)),
             toolCallResponse(echoCall("c2", "b"), usage: Usage(inputTokens: 10)),
-            // Big enough to trigger the compaction before the next turn.
+            // Big enough to trigger a compaction, but the clearing before
+            // the next turn changes the context first, so it waits a turn
+            // for a size measured after the clearing.
             toolCallResponse(echoCall("c3", "c"), usage: Usage(inputTokens: 600)),
-            ModelResponse(message: Message(role: .assistant, text: "Summary: echoed a, b, c."), finishReason: .endTurn),
+            toolCallResponse(echoCall("c4", "d"), usage: Usage(inputTokens: 600)),
+            ModelResponse(message: Message(role: .assistant, text: "Summary: echoed a, b, c, d."), finishReason: .endTurn),
             ModelResponse(message: Message(role: .assistant, text: "Done."), finishReason: .endTurn),
         ])
         let journal = MemoryJournal()
@@ -80,7 +83,7 @@ struct JournalTests {
 
         let contents = journal.contents
         let calls = contents.modelCalls
-        #expect(calls.map(\.purpose) == [.turn, .turn, .turn, .compaction, .turn])
+        #expect(calls.map(\.purpose) == [.turn, .turn, .turn, .turn, .compaction, .turn])
         #expect(calls.count == model.requests.count)
         for (call, sent) in zip(calls, model.requests) {
             let rebuilt = try #require(contents.request(of: call))

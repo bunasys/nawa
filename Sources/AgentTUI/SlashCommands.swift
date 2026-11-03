@@ -12,9 +12,15 @@ public enum SlashCommand: Sendable, Hashable {
     case tools
     /// `/config`, with the words after it (`set compact_at 200k`).
     case config([String])
+    /// `/effort`, `/effort high`, `/effort default`: a shortcut for the
+    /// `effort` setting.
+    case effort([String])
     case exit
     /// `/name` that isn't a command.
     case unknown(String)
+    /// A command other than `/config` with words after it (`/clear all`):
+    /// warned about rather than run or sent, so neither happens by surprise.
+    case unexpectedWords(String)
 
     /// Names and one-line summaries, in `/help` order.
     static let all: [(command: SlashCommand, name: String, summary: String)] = [
@@ -23,22 +29,35 @@ public enum SlashCommand: Sendable, Hashable {
         (.cost, "/cost", "tokens and cost so far"),
         (.tools, "/tools", "the tools the agent can use"),
         (.config([]), "/config", "list settings; /config set <key> <value>, /config unset <key>"),
+        (.effort([]), "/effort", "how hard the model thinks: /effort high, /effort default"),
         (.exit, "/exit", "quit (also ctrl-d)"),
     ]
 
-    /// The command `text` asks for, or nil when it is a prompt. Words after
-    /// the command name are ignored, except `/config`'s.
+    /// The command `text` asks for, or nil when it is a prompt. Only a
+    /// single line can be a command: several lines are a prompt, even when
+    /// the first starts with `/`.
     public init?(_ text: String) {
-        let trimmed = text.drop { $0.isWhitespace }
-        guard trimmed.first == "/" else { return nil }
+        let trimmed = text.trimmingTrailingWhitespace.drop { $0.isWhitespace }
+        guard trimmed.first == "/", !trimmed.contains(where: \.isNewline) else { return nil }
         let words = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
         let name = words[0]
         guard name.dropFirst().contains("/") == false, name.count > 1 else { return nil }
-        if name.lowercased() == "/config" {
-            self = .config(Array(words.dropFirst()))
+        let arguments = Array(words.dropFirst())
+        switch name.lowercased() {
+        case "/config":
+            self = .config(arguments)
+            return
+        case "/effort":
+            self = .effort(arguments)
+            return
+        default:
+            break
+        }
+        guard let known = Self.all.first(where: { $0.name == name.lowercased() }) else {
+            self = .unknown(name)
             return
         }
-        self = Self.all.first { $0.name == name.lowercased() }?.command ?? .unknown(name)
+        self = arguments.isEmpty ? known.command : .unexpectedWords(known.name)
     }
 
     /// What running a command changes besides the committed blocks.
@@ -75,11 +94,27 @@ public enum SlashCommand: Sendable, Hashable {
                 return ([.warning("this session has no settings to change")], .none)
             }
             return (configure(arguments).map(Block.note), .none)
+        case .effort(let arguments):
+            guard let configure = session.configure else {
+                return ([.warning("this session has no settings to change")], .none)
+            }
+            return (configure(Self.effortConfigArguments(arguments)).map(Block.note), .none)
         case .exit:
             return ([], .quit)
         case .unknown(let name):
             return ([.warning("unknown command \(name); /help lists them")], .none)
+        case .unexpectedWords(let name):
+            return ([.warning("\(name) takes nothing after it; nothing was run or sent")], .none)
         }
+    }
+
+    /// The `/config` words `/effort` stands for. `default` (or `unset`)
+    /// goes back to the provider's effort.
+    static func effortConfigArguments(_ arguments: [String]) -> [String] {
+        guard let level = arguments.first else { return ["get", "effort"] }
+        let backToDefault = arguments.count == 1 && ["default", "unset"].contains(level.lowercased())
+        if backToDefault { return ["unset", "effort"] }
+        return ["set", "effort"] + arguments
     }
 
     /// `12.4k tokens: 2.1k input, 9.8k cached, 500 output · $0.012 · context 9%`.

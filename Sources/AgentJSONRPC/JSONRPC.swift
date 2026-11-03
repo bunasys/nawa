@@ -183,16 +183,16 @@ public extension JSONRPCMessage {
             if let result = r.result { obj["result"] = result }
             return .object(obj)
         case .errorResponse(let r):
-            var obj: [String: JSON] = [
+            var error: [String: JSON] = [
+                "code": .int(r.error.code),
+                "message": .string(r.error.message),
+            ]
+            if let data = r.error.data { error["data"] = data }
+            return .object([
                 "jsonrpc": .string("2.0"),
                 "id": r.id?.json ?? .null,
-                "error": .object([
-                    "code": .int(r.error.code),
-                    "message": .string(r.error.message),
-                ]),
-            ]
-            if let data = r.error.data { obj["error"] = .object(["code": .int(r.error.code), "message": .string(r.error.message), "data": data]) }
-            return .object(obj)
+                "error": .object(error),
+            ])
         }
     }
 
@@ -201,26 +201,42 @@ public extension JSONRPCMessage {
 }
 
 /// Parse a newline-delimited JSON-RPC line.
+///
+/// Throws `JSONRPCParseError` for JSON that is not a valid message; answer
+/// those with `JSONRPCMessage.parseFailure`.
 public func parseJSONRPCLine(_ line: String) throws -> JSONRPCMessage {
-    let data = Data(line.utf8)
-    let json = try JSONDecoder().decode(JSON.self, from: data)
+    let json = try JSONDecoder().decode(JSON.self, from: Data(line.utf8))
     guard let object = json.objectValue else { throw JSONRPCParseError.notAnObject }
-    if let method = object["method"]?.stringValue {
-        if let id = JSONRPCID(json: object["id"]) {
-            return .request(JSONRPCRequest(method: method, id: id, params: object["params"]))
-        } else {
-            return .notification(JSONRPCMethod(method: method, params: object["params"]))
-        }
-    } else if object["error"] != nil {
-        let code = object["error"]?.objectValue?["code"]?.intValue ?? -32603
-        let message = object["error"]?.objectValue?["message"]?.stringValue ?? "unknown error"
-        return .errorResponse(JSONRPCError(id: JSONRPCID(json: object["id"]), error: .init(code: code, message: message, data: object["error"]?.objectValue?["data"])))
-    } else {
-        // A success response that names no request cannot be correlated;
-        // inventing an id would resolve the wrong pending call.
-        guard let id = JSONRPCID(json: object["id"]) else { throw JSONRPCParseError.missingID }
-        return .successResponse(JSONRPCSuccess(id: id, result: object["result"]))
+    let methodField = object["method"]
+    let idField = object["id"]
+    let id = JSONRPCID(json: idField)
+    let params = object["params"]
+    // `"error": null` next to a result is not an error; only an error object is.
+    let errorObject = object["error"]?.objectValue
+    let hasResult = object["result"] != nil
+
+    if let methodField {
+        guard let method = methodField.stringValue else { throw JSONRPCParseError.methodNotAString }
+        // The `id` key, not its value, makes a request: a request with an
+        // unusable id (1.5, null) still waits for an answer, so it must get
+        // an invalid-request error instead of being dropped as a notification.
+        guard idField != nil else { return .notification(JSONRPCMethod(method: method, params: params)) }
+        guard let id else { throw JSONRPCParseError.invalidID }
+        return .request(JSONRPCRequest(method: method, id: id, params: params))
     }
+
+    if let errorObject {
+        let code = errorObject["code"]?.intValue ?? JSONRPCErrorCode.internalError.rawValue
+        let message = errorObject["message"]?.stringValue ?? "unknown error"
+        // An error response may carry `"id": null` (the server could not read the request's id).
+        return .errorResponse(JSONRPCError(id: id, error: .init(code: code, message: message, data: errorObject["data"])))
+    }
+
+    guard hasResult else { throw JSONRPCParseError.missingResultOrError }
+    // A success response that names no request cannot be correlated;
+    // inventing an id would resolve the wrong pending call.
+    guard let id else { throw JSONRPCParseError.missingID }
+    return .successResponse(JSONRPCSuccess(id: id, result: object["result"]))
 }
 
 public extension JSONRPCMessage {
@@ -239,4 +255,10 @@ public enum JSONRPCParseError: Error, Sendable {
     case notAnObject
     /// A response without a usable `id`.
     case missingID
+    /// A `method` that is not a string.
+    case methodNotAString
+    /// A request whose `id` is present but neither an integer nor a string.
+    case invalidID
+    /// A response with neither `result` nor `error`.
+    case missingResultOrError
 }

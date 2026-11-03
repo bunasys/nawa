@@ -30,6 +30,10 @@ public struct Gateway: LanguageModel, Sendable {
     /// A new `Gateway` starts with no cooldowns: keep one for as long as the
     /// process (or the session) runs, rather than one per request.
     let failover: GatewayFailover
+    /// Discovered model ids by provider name, shared by copies like
+    /// `failover`: one `GET /models` per provider, and a session that
+    /// doesn't switch models when the provider's list changes order.
+    let discoveredModels: DiscoveredModels
 
     public init(
         providers: [ProviderConfig] = [],
@@ -44,6 +48,7 @@ public struct Gateway: LanguageModel, Sendable {
         self.apiKeyOverrides = apiKeyOverrides
         self.session = session
         self.failover = GatewayFailover()
+        self.discoveredModels = DiscoveredModels()
     }
 
     /// The provider the gateway routes to by default.
@@ -57,17 +62,24 @@ public struct Gateway: LanguageModel, Sendable {
     public func client(for providerName: String? = nil) throws -> any LanguageModel {
         let provider = providerName.flatMap { name in providers.first { $0.name == name } } ?? activeProvider
         guard let provider else { throw GatewayError.noProvider }
-        return client(for: provider)
+        return try client(for: provider)
     }
 
-    private func client(for provider: ProviderConfig) -> any LanguageModel {
+    private func client(for provider: ProviderConfig) throws -> any LanguageModel {
         let apiKey = apiKeyOverrides[provider.name] ?? provider.resolvedAPIKey
+        // Without this, the request goes out with no credentials and the
+        // provider's 401 says nothing about the variable.
+        let mayUseFederation = provider.api == .anthropic && provider.workloadIdentity != nil
+        if apiKey == nil, !mayUseFederation, let variable = provider.unsetAPIKeyVariable {
+            throw GatewayError.configuration("provider \"\(provider.name)\": environment variable \(variable) is not set")
+        }
         switch provider.api ?? .openAI {
         case .openAI:
             return OpenAICompatibleClient(
                 providerName: provider.name, baseURL: provider.baseURL, apiKey: apiKey,
                 requestTimeout: provider.requestTimeout ?? OpenAICompatibleClient.defaultRequestTimeout,
                 reasoningEffort: provider.reasoningEffort,
+                headers: provider.headers ?? [:],
                 session: session
             )
         case .anthropic:
@@ -84,6 +96,7 @@ public struct Gateway: LanguageModel, Sendable {
                 serverFallbacks: provider.usesServerFallbacks,
                 requestTimeout: provider.requestTimeout ?? AnthropicClient.defaultRequestTimeout,
                 reasoningEffort: provider.reasoningEffort,
+                headers: provider.headers ?? [:],
                 session: session
             )
         }
@@ -95,11 +108,8 @@ public struct Gateway: LanguageModel, Sendable {
 
     public func complete(_ request: ModelRequest) async throws -> ModelResponse {
         try await withFailover(request) { provider, preferred, attempt, failedBefore in
-            var response = try await client(for: provider).complete(attempt)
-            response.providerName = provider.name
-            response.replacedProvider = provider.name == preferred.name ? nil : preferred.name
-            response.failedAttempts = failedBefore
-            return response
+            let response = try await client(for: provider).complete(attempt)
+            return Self.stamped(response, provider: provider, preferred: preferred, failedBefore: failedBefore)
         }
     }
 
@@ -111,16 +121,14 @@ public struct Gateway: LanguageModel, Sendable {
                 do {
                     var hasYielded = false
                     try await self.withFailover(request, mayFailOver: { !hasYielded }) { provider, preferred, attempt, failedBefore in
-                        for try await chunk in self.client(for: provider).stream(attempt) {
+                        for try await chunk in try self.client(for: provider).stream(attempt) {
                             hasYielded = true
-                            guard case .finished(var response) = chunk else {
+                            guard case .finished(let response) = chunk else {
                                 continuation.yield(chunk)
                                 continue
                             }
-                            response.providerName = provider.name
-                            response.replacedProvider = provider.name == preferred.name ? nil : preferred.name
-                            response.failedAttempts = failedBefore
-                            continuation.yield(.finished(response))
+                            let stamped = Self.stamped(response, provider: provider, preferred: preferred, failedBefore: failedBefore)
+                            continuation.yield(.finished(stamped))
                         }
                     }
                     continuation.finish()
@@ -130,6 +138,20 @@ public struct Gateway: LanguageModel, Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// `response` with who answered it and who failed before.
+    private static func stamped(
+        _ response: ModelResponse,
+        provider: ProviderConfig,
+        preferred: ProviderConfig,
+        failedBefore: [FailedAttempt]
+    ) -> ModelResponse {
+        var stamped = response
+        stamped.providerName = provider.name
+        stamped.replacedProvider = provider.name == preferred.name ? nil : preferred.name
+        stamped.failedAttempts = failedBefore
+        return stamped
     }
 
     /// Runs `call` on each provider in the chain until one succeeds. It moves
@@ -154,25 +176,28 @@ public struct Gateway: LanguageModel, Sendable {
                 // Model ids are per provider: the requested one is for the preferred provider only.
                 let isPreferred = provider.name == preferred.name
                 var attempt = request
-                attempt.model = try await model(for: provider, client: client(for: provider), requested: isPreferred ? request.model : nil)
+                attempt.model = try await model(for: provider, client: try client(for: provider), requested: isPreferred ? request.model : nil)
                 return try await call(provider, preferred, attempt, failedAttempts)
             } catch {
                 // A cancelled call may surface as a network error; it says nothing about the provider.
                 let isUnavailable = !Task.isCancelled && GatewayFailover.isProviderUnavailable(error)
                 // Only a request that could fail over starts a cooldown: one
                 // that stays on its provider doesn't reroute the others.
-                if isUnavailable && hasFallbacks && GatewayFailover.startsCooldown(error) {
-                    failover.markFailed(provider.name)
-                }
-                let isLast = provider.name == chain.last?.name
+                let takesProviderOut = isUnavailable && hasFallbacks && GatewayFailover.startsCooldown(error)
+                if takesProviderOut { failover.markFailed(provider.name) }
+
+                // A cancellation, a bad request or a stream cut off mid-reply
+                // keeps its own type.
                 let mayMoveOn = isUnavailable && mayFailOver()
-                guard mayMoveOn && !isLast else {
-                    // Summed up only when the chain ran out. A cancellation, a
-                    // bad request or a stream cut off mid-reply keeps its own type.
-                    let isWholeChainDown = !failures.isEmpty && mayMoveOn
-                    throw isWholeChainDown ? GatewayError.providersFailed(failures + [GatewayFailover.failureLine(provider.name, error)]) : error
-                }
+                guard mayMoveOn else { throw error }
+
                 failures.append(GatewayFailover.failureLine(provider.name, error))
+                let isLast = provider.name == chain.last?.name
+                guard !isLast else {
+                    // Summed up only when more than one provider failed.
+                    let wholeChainFailed = failures.count > 1
+                    throw wholeChainFailed ? GatewayError.providersFailed(failures) : error
+                }
                 failedAttempts.append(FailedAttempt(provider: provider.name, error: "\(error)", durationMS: millisecondsSince(startedAt)))
             }
         }
@@ -240,13 +265,46 @@ public struct Gateway: LanguageModel, Sendable {
     ) async throws -> String {
         if let requested { return requested }
         if !ignoringConfigured, let configured = provider?.model { return configured }
+        guard let provider else { return try await discoverModel(client: client, whitelist: nil) }
+        if let discovered = discoveredModels[provider.name] { return discovered }
+        let discovered = try await discoverModel(client: client, whitelist: provider.modelWhitelist)
+        // Two calls may discover at once: both keep the first one stored.
+        return discoveredModels.store(discovered, for: provider.name)
+    }
+
+    /// The first advertised model, on the whitelist when there is one.
+    private func discoverModel(client: any LanguageModel, whitelist: [String]?) async throws -> String {
         let models = try await client.listModels()
-        let whitelist = provider?.modelWhitelist
-        let candidates = models.filter { whitelist == nil || whitelist!.contains($0.id) }
-        guard let first = candidates.first ?? models.first else {
-            throw GatewayError.modelNotFound("no models advertised by \(client.providerName)")
+        guard let whitelist, !whitelist.isEmpty else {
+            guard let first = models.first else {
+                throw GatewayError.modelNotFound("no models advertised by \(client.providerName)")
+            }
+            return first.id
         }
-        return first.id
+        guard let allowed = models.first(where: { whitelist.contains($0.id) }) else {
+            throw GatewayError.modelNotFound(
+                "\(client.providerName) advertises none of the whitelisted models (\(whitelist.joined(separator: ", ")))"
+            )
+        }
+        return allowed.id
+    }
+}
+
+/// Model ids found by auto discovery, by provider name.
+final class DiscoveredModels: Sendable {
+    private let ids = Mutex<[String: String]>([:])
+
+    subscript(providerName: String) -> String? {
+        ids.withLock { $0[providerName] }
+    }
+
+    /// Stores `id` unless one is already there, and returns the stored one.
+    func store(_ id: String, for providerName: String) -> String {
+        ids.withLock { ids in
+            if let existing = ids[providerName] { return existing }
+            ids[providerName] = id
+            return id
+        }
     }
 }
 
@@ -300,12 +358,14 @@ final class GatewayFailover: Sendable {
             // (or no longer has) is one it can't serve, even when the caller
             // named it. The fallback uses its own model, and the switch is
             // reported (`ModelResponse.providerName`), so the mistake shows.
+            // Anthropic answers an exhausted prepaid balance with a 400
+            // ("Your credit balance is too low…"), not a 402.
             let isOutOfCredit = status == 400 && body.contains("credit balance")
             let isUnavailable = [401, 402, 403, 404, 408, 429].contains(status) || status >= 500
             return isUnavailable || isOutOfCredit
         case .network, .invalidResponse, .workloadIdentity, .incompleteStream:
             return true
-        case .noProvider, .providerNotFound, .modelNotFound, .providersFailed:
+        case .noProvider, .providerNotFound, .modelNotFound, .providersFailed, .configuration:
             return false
         }
     }

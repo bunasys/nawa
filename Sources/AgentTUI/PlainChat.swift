@@ -11,13 +11,25 @@ public struct PlainChat {
     /// Whether to print the user's prompt as a `› prompt` block. Off when a
     /// terminal already echoed what was typed.
     public var echoPrompts: Bool
+    /// Calls its argument on each Ctrl-C until the closure it returns is
+    /// called. Set while a run is going, so Ctrl-C interrupts the run
+    /// instead of ending nawa; nil leaves Ctrl-C alone.
+    public typealias InterruptCatcher = @Sendable (@escaping @Sendable () -> Void) -> @Sendable () -> Void
+    private let catchInterrupts: InterruptCatcher?
     private let write: (String) -> Void
 
     /// - Parameter write: receives whole lines, each ending in `\n`.
-    public init(session: ChatSession, layout: Layout, echoPrompts: Bool, write: @escaping (String) -> Void) {
+    public init(
+        session: ChatSession,
+        layout: Layout,
+        echoPrompts: Bool,
+        catchInterrupts: InterruptCatcher? = nil,
+        write: @escaping (String) -> Void
+    ) {
         self.session = session
         self.layout = layout
         self.echoPrompts = echoPrompts
+        self.catchInterrupts = catchInterrupts
         self.write = write
     }
 
@@ -42,8 +54,21 @@ public struct PlainChat {
             if echoPrompts { emit(promptBlocks) }
 
             var refusal: RefusalNotice?
+            // The run's events go through a task of their own so Ctrl-C can
+            // cancel it: that ends the run's stream, which cancels the loop.
+            let (events, relay) = AsyncThrowingStream<AgentEvent, any Error>.makeStream()
+            let run = session.send(prompt)
+            let pump = Task {
+                do {
+                    for try await event in run { relay.yield(event) }
+                    relay.finish()
+                } catch {
+                    relay.finish(throwing: error)
+                }
+            }
+            let stopCatching = catchInterrupts?({ pump.cancel() })
             do {
-                for try await event in session.send(prompt) {
+                for try await event in events {
                     emit(transcript.reduce(event))
                     if case .result(let result) = event { refusal = result.refusal }
                 }
@@ -52,6 +77,7 @@ public struct PlainChat {
             } catch {
                 emit(transcript.fail("\(error)"))
             }
+            stopCatching?()
             if transcript.stats.usage.total > 0 {
                 emit([layout.footer(transcript.stats, contextLimit: session.contextLimit)])
             }

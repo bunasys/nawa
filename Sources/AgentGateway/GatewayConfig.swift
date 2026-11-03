@@ -27,7 +27,6 @@ public struct GatewayConfig: Codable, Sendable, Equatable {
         self.fallbackProviders = fallbackProviders
     }
 
-    /// Build the runnable gateway from the typed config.
     /// Every provider with its environment defaults applied (see
     /// `ProviderConfig.withEnvironmentDefaults`).
     public func withEnvironmentDefaults(
@@ -38,6 +37,7 @@ public struct GatewayConfig: Codable, Sendable, Equatable {
         return resolved
     }
 
+    /// Build the runnable gateway from the typed config.
     public func makeGateway(apiKeyOverrides: [String: String] = [:]) -> Gateway {
         Gateway(
             providers: providers,
@@ -54,16 +54,18 @@ public struct GatewayConfig: Codable, Sendable, Equatable {
     }
 
     /// Load from the `NAWA_GATEWAY_CONFIG` env var if present, else from a
-    /// `Gateways.json` next to the current file, else an empty default.
+    /// `Gateways.json` in `directory` (the process's current directory by
+    /// default), else an empty default.
     public static func loadFromEnvironmentOrFile(
         envKey configEnv: String = "NAWA_GATEWAY_CONFIG",
-        fileName: String = "Gateways.json"
+        fileName: String = "Gateways.json",
+        directory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> GatewayConfig {
-        if let path = ProcessInfo.processInfo.environment[configEnv] {
+        if let path = environment[configEnv] {
             return try load(fromFile: path)
         }
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let candidate = cwd.appendingPathComponent(fileName)
+        let candidate = directory.appendingPathComponent(fileName)
         if FileManager.default.fileExists(atPath: candidate.path) {
             return try load(fromFile: candidate.path)
         }

@@ -57,6 +57,9 @@ public struct ModelRequest: Sendable {
     /// send them to the same prompt cache. Sent as `x-session-id` to
     /// OpenAI-compatible providers (RunInfra uses it; others ignore it).
     public var sessionID: String?
+    /// How hard the model thinks, in place of the provider's
+    /// `reasoningEffort` for this request. Nil = the provider's.
+    public var reasoningEffort: String?
 
     public init(
         providerName: String? = nil,
@@ -66,7 +69,8 @@ public struct ModelRequest: Sendable {
         maxOutputTokens: Int? = nil,
         temperature: Double? = nil,
         mayFailOver: Bool = true,
-        sessionID: String? = nil
+        sessionID: String? = nil,
+        reasoningEffort: String? = nil
     ) {
         self.providerName = providerName
         self.model = model
@@ -76,6 +80,7 @@ public struct ModelRequest: Sendable {
         self.temperature = temperature
         self.mayFailOver = mayFailOver
         self.sessionID = sessionID
+        self.reasoningEffort = reasoningEffort
     }
 
     /// The model id a wire client must send. `Gateway` fills in the default
@@ -197,6 +202,10 @@ public enum GatewayError: Error, Sendable {
     case workloadIdentity(String)
     /// A streamed reply ended without its final chunk.
     case incompleteStream
+    /// The configuration can't work as written (e.g. an `env:NAME` API key
+    /// whose variable is not set). Fixing it is up to the user, so it never
+    /// fails over.
+    case configuration(String)
     /// Every provider the gateway tried failed: one line per provider, in
     /// the order tried.
     case providersFailed([String])
@@ -221,6 +230,8 @@ extension GatewayError: CustomStringConvertible, LocalizedError {
             return "workload identity federation: \(detail)"
         case .incompleteStream:
             return "the model provider's reply ended before it was complete"
+        case .configuration(let detail):
+            return "configuration error: \(detail)"
         case .providersFailed(let failures):
             return "every model provider failed: " + failures.joined(separator: "; ")
         }

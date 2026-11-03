@@ -82,6 +82,44 @@ struct RefusalTests {
         #expect(model.requests.count == 2)
     }
 
+    /// Two models recommending each other must not loop: one retry per run.
+    @Test
+    func recommendationsDontPingPong() async throws {
+        let model = ScriptedModel(responses: [
+            refusal(by: "big", recommending: "other"),
+            refusal(by: "other", recommending: "big"),
+            answer("never asked", by: "big"),
+        ])
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry())
+        loop.model = "big"
+        let (refusals, result) = try await run(loop, "hi")
+        #expect(refusals.map(\.answeredBy) == ["other", nil])
+        #expect(result?.kind == .refused)
+        #expect(model.requests.count == 2)
+    }
+
+    /// A compaction in the same run moves the prompt; removal still finds it.
+    @Test
+    func theDeclinedPromptIsFoundAfterACompactionMovedIt() async throws {
+        let model = ScriptedModel(responses: [
+            answer("Hello.", by: "big"),
+            ModelResponse(message: Message(role: .assistant, content: [.toolCall(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("x")])))]), finishReason: .toolUse, usage: Usage(inputTokens: 600), model: "big"),
+            answer("SUMMARY", by: "big"),
+            refusal(by: "big"),
+            answer("Fallback answer.", by: "small"),
+        ])
+        let options = LoopOptions(compaction: Compaction(atContextTokens: 500, keepRecentMessages: 3), fallbackModel: "small")
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+        loop.model = "big"
+        _ = try await run(loop, "hi")
+        _ = try await run(loop, "scan my server")
+        let summary = try #require(loop.session.messages.first { $0.text.contains("SUMMARY") })
+
+        #expect(loop.removeDeclinedRequest())
+        #expect(loop.session.messages.filter { $0.role != .system } == [summary])
+        #expect(loop.model == "big")
+    }
+
     @Test
     func reasoningExtractionIsNotRetried() async throws {
         let model = ScriptedModel(responses: [refusal(by: "big", category: "reasoning_extraction"), answer("no", by: "small")])

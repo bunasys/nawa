@@ -309,12 +309,10 @@ struct DeferredToolsTests {
 /// `FileWalk` stands in for ripgrep, so it must give ripgrep's answers.
 /// These tests run both and compare; they need rg installed.
 struct FileWalkParityTests {
-    static let hasRipgrep = (try? CapturedOutput.run(["rg", "--version"], in: URL(fileURLWithPath: "/")))?.status == 0
+    static let hasRipgrep = AgentTools.ripgrep != nil
 
-    func ripgrep(_ arguments: [String], in directory: URL) throws -> [String] {
-        let run = try CapturedOutput.run(["rg"] + arguments, in: directory)
-        try? FileManager.default.removeItem(at: run.logFile)
-        return run.output.split(separator: "\n").map(String.init)
+    func ripgrep(_ arguments: [String], in directory: URL) async throws -> [String] {
+        try await runRipgrep(arguments, in: directory)?.lines ?? []
     }
 
     /// A small repository exercising each ignore rule.
@@ -325,6 +323,7 @@ struct FileWalkParityTests {
             "build/out.txt": "alpha\n", "sub/keep.log": "alpha\n", "sub/deep/x.log": "alpha\n",
             "sub/deep/y.swift": "let alpha = 1\n", "docs/notes.md": "alpha\n", "docs/private/s.md": "alpha\n",
             "binary.bin": "alpha\u{0}\n", "only-ignore.tmp": "alpha\n", "re[1].txt": "alpha\n",
+            "crlf.txt": "alpha\r\nbeta alpha\r\n", "late-nul.dat": String(repeating: "alpha\n", count: 2_000) + "\u{0}\n",
         ]
         for (path, text) in files {
             let url = root.appendingPathComponent(path)
@@ -340,7 +339,7 @@ struct FileWalkParityTests {
     }
 
     @Test(.enabled(if: hasRipgrep))
-    func listingMatchesRipgrep() throws {
+    func listingMatchesRipgrep() async throws {
         let root = try makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let walk = FileWalk(workingDirectory: root)
@@ -349,17 +348,17 @@ struct FileWalkParityTests {
             ("sub", nil), ("sub/deep", nil), ("docs", "*.md"), ("a.txt", nil),
         ]
         for (path, glob) in cases {
-            let expected = try ripgrep(["--files", "--sort=path"] + (glob.map { ["--glob", $0] } ?? []) + [path], in: root)
+            let expected = try await ripgrep(["--files", "--sort=path"] + (glob.map { ["--glob", $0] } ?? []) + [path], in: root)
             let actual = try walk.files(under: path, glob: glob).map(\.display)
             #expect(actual == expected, "path \(path), glob \(glob ?? "none")")
         }
     }
 
     @Test(.enabled(if: hasRipgrep))
-    func searchMatchesRipgrep() throws {
+    func searchMatchesRipgrep() async throws {
         let root = try makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        let expected = try ripgrep(["--line-number", "--with-filename", "--no-heading", "--sort=path", "--regexp", "alph?a", "."], in: root)
+        let expected = try await ripgrep(["--line-number", "--with-filename", "--no-heading", "--sort=path", "--regexp", "alph?a", "."], in: root)
         let actual = try FileWalk(workingDirectory: root).search(pattern: "alph?a", under: ".", glob: nil)
         #expect(actual == expected)
         #expect(!actual.contains { $0.contains("binary.bin") })
@@ -367,9 +366,9 @@ struct FileWalkParityTests {
 
     /// A real tree with a real .gitignore: this package.
     @Test(.enabled(if: hasRipgrep))
-    func listingThisRepositoryMatchesRipgrep() throws {
+    func listingThisRepositoryMatchesRipgrep() async throws {
         let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let expected = try ripgrep(["--files", "--sort=path", "."], in: repository)
+        let expected = try await ripgrep(["--files", "--sort=path", "."], in: repository)
         let actual = try FileWalk(workingDirectory: repository).files(under: ".", glob: nil).map(\.display)
         #expect(actual == expected)
     }

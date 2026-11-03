@@ -1,9 +1,6 @@
 import AgentCore
-import AgentGateway
 import AgentJSONRPC
 import AgentLoop
-import AgentMCP
-import AgentTools
 import Foundation
 
 /// A single ACP session: one conversation between a client and the agent.
@@ -19,7 +16,10 @@ public actor ACPSession {
     private let loop: AgentLoop
     private let sink: ACPMessageSink
     private var promptTask: Task<Void, Never>?
-    private var isRunning = false
+    /// Turns asked for and not yet answered: the running one and the one
+    /// queued behind it. A count, not a flag, so the turn that ends can't
+    /// mark the session idle while the next one waits.
+    private var pendingTurns = 0
     private var lastActive = ContinuousClock.now
 
     /// Builds a session for a prompt turn.
@@ -40,19 +40,30 @@ public actor ACPSession {
     /// to the sink, then delivers the `session/prompt` response (correlated by
     /// `requestID`) when the loop finishes.
     ///
-    /// If a prompt is already running it is cancelled first.
+    /// If a prompt is already running it is cancelled first, and this one
+    /// starts once it has answered.
     public func prompt(requestID: JSONRPCID, content: [ACPContentBlock]) {
-        promptTask?.cancel()
-        let text = content.compactMap { block -> String? in
-            if case .text(let t) = block { return t }
-            return nil
-        }.joined(separator: "\n")
-        let firstPrompt = loop.session.messages.allSatisfy { $0.role != .user }
+        let text = content.compactMap(\.promptText).joined(separator: "\n")
+        let previous = promptTask
+        previous?.cancel()
         lastActive = .now
-        promptTask = Task { [weak self] in
-            await self?.runTurn(requestID: requestID, prompt: text, continuing: !firstPrompt)
+        pendingTurns += 1
+        // Holds the session strongly: every request must get its answer,
+        // even when the connection has already let the session go.
+        promptTask = Task {
+            await previous?.value
+            await self.runTurn(requestID: requestID, prompt: text)
+            self.turnEnded()
         }
     }
+
+    private func turnEnded() {
+        pendingTurns -= 1
+        lastActive = .now
+    }
+
+    /// Whether a prompt turn is running or waiting to run.
+    var isRunning: Bool { pendingTurns > 0 }
 
     /// Use `modelID` for this session's next turns.
     public func setModel(_ modelID: String) {
@@ -94,20 +105,15 @@ public actor ACPSession {
                 }
             case .tool:
                 for case .toolResult(let result) in message.content {
-                    let status: ACPToolCallStatus = result.isError ? .failed : .completed
-                    await emitUpdate(ACPSessionUpdate.toolCallUpdate(callID: result.callID, status: status, content: .text(result.content)))
+                    await emitUpdate(Self.toolResultUpdate(result))
                 }
             }
         }
     }
 
-    private func runTurn(requestID: JSONRPCID, prompt: String, continuing: Bool) async {
-        isRunning = true
-        defer {
-            isRunning = false
-            lastActive = .now
-        }
+    private func runTurn(requestID: JSONRPCID, prompt: String) async {
         let messageID = "msg_\(UUID().uuidString.prefix(8))"
+        let continuing = loop.session.messages.contains { $0.role == .user }
         var finalResult: AgentResult?
         var textStreamed = false
         do {
@@ -117,6 +123,8 @@ public actor ACPSession {
                 if case .result(let result) = event { finalResult = result }
                 await sendUpdate(for: event, messageID: messageID, textStreamed: &textStreamed)
             }
+            // Cancelling ends the loop's stream quietly, without throwing.
+            if Task.isCancelled { throw CancellationError() }
             // A failed turn is a JSON-RPC error, not a stop reason: clients
             // (Waku included) show an error's message to the user, whereas
             // the closest stop reason, `refusal`, reads as "the model declined".
@@ -172,29 +180,19 @@ public actor ACPSession {
             // Usage after every model call, not only at the end, so a client
             // sees an expensive turn while it is still running. `used` is
             // what this call read and wrote: how full the context is now.
-            let usagePayload = ACPSessionUpdate.usageUpdate(
-                used: update.usage.total,
-                size: update.usage.total,
-                costUSDCenticents: update.sessionCost
-            )
-            await emitUpdate(usagePayload)
-        case .toolResult(let result):
-            let status: ACPToolCallStatus = result.isError ? .failed : .completed
-            let payload = ACPSessionUpdate.toolCallUpdate(
-                callID: result.callID,
-                status: status,
-                content: .text(result.content)
-            )
-            await emitUpdate(payload)
+            // `size` is the compaction point, as in the repl's footer; without
+            // one there is no size to report, so nothing is sent.
+            if let compactAt = loop.options.compaction?.atContextTokens {
+                let usagePayload = ACPSessionUpdate.usageUpdate(
+                    used: update.usage.total,
+                    size: compactAt,
+                    costUSD: update.sessionCost
+                )
+                await emitUpdate(usagePayload)
+            }
         case .toolResults(let results):
             for result in results {
-                let status: ACPToolCallStatus = result.isError ? .failed : .completed
-                let payload = ACPSessionUpdate.toolCallUpdate(
-                    callID: result.callID,
-                    status: status,
-                    content: .text(result.content)
-                )
-                await emitUpdate(payload)
+                await emitUpdate(Self.toolResultUpdate(result))
             }
         case .stream(let update):
             switch update {
@@ -235,6 +233,12 @@ public actor ACPSession {
         case .subAgent(let update):
             if let payload = Self.subAgentProgress(update) { await emitUpdate(payload) }
         }
+    }
+
+    /// A finished tool run as the `tool_call_update` that closes its call.
+    static func toolResultUpdate(_ result: ToolCallResult) -> JSON {
+        let status: ACPToolCallStatus = result.isError ? .failed : .completed
+        return ACPSessionUpdate.toolCallUpdate(callID: result.callID, status: status, content: .text(result.content))
     }
 
     /// `[claude-opus-5-5 declined this request (cyber). claude-opus-4-8 answers instead.]`

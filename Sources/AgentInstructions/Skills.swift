@@ -105,13 +105,7 @@ public struct SkillCatalog: Sendable {
 
     private static func readSkill(named name: String, in root: URL) -> Skill? {
         let file = root.appendingPathComponent(name).appendingPathComponent("SKILL.md")
-        // `attributesOfItem` doesn't follow symlinks, and shared skills are
-        // usually symlinked folders, so ask for the size of the resolved file.
-        let resolved = file.resolvingSymlinksInPath()
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: resolved.path),
-              let size = attributes[.size] as? Int, size <= maxSkillFileBytes,
-              let text = try? String(contentsOf: resolved, encoding: .utf8)
-        else { return nil }
+        guard let text = readTextFile(file, maxBytes: maxSkillFileBytes) else { return nil }
 
         let description = frontmatter(of: text)["description"] ?? ""
         return Skill(name: name, description: String(collapsingWhitespace(description).prefix(maxDescriptionLength)), root: root)
@@ -256,7 +250,7 @@ public struct SkillSearchTool: Tool {
     }
 }
 
-// MARK: Shared with SystemPrompt
+// MARK: Shared with SystemPrompt and ProjectInstructions
 
 /// `directory` and its parents up to the git root, nearest first. Outside a
 /// git repository, just `directory`: walking up to `/` from a random folder
@@ -276,6 +270,20 @@ func projectDirectories(from directory: URL) -> [URL] {
         current = current.deletingLastPathComponent().standardizedFileURL
     }
     return [start]
+}
+
+/// The text of `file` when it is a regular file (after following symlinks)
+/// of at most `maxBytes`, in UTF-8. Nil otherwise: reading a FIFO would hang,
+/// and a directory or a huge file is not a prompt section.
+func readTextFile(_ file: URL, maxBytes: Int) -> String? {
+    // `attributesOfItem` doesn't follow symlinks, and shared skills are
+    // usually symlinked folders, so ask about the resolved file.
+    let resolved = file.resolvingSymlinksInPath()
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: resolved.path) else { return nil }
+    let isRegularFile = attributes[.type] as? FileAttributeType == .typeRegular
+    let size = attributes[.size] as? Int ?? Int.max
+    guard isRegularFile, size <= maxBytes else { return nil }
+    return try? String(contentsOf: resolved, encoding: .utf8)
 }
 
 /// `$XDG_CONFIG_HOME/nawa`, else `~/.config/nawa`, as `nawa config` uses.

@@ -33,7 +33,7 @@ let package = Package(
         .target(name: "AgentJSONRPC", dependencies: ["AgentCore"]),
 
         // AI Gateway: language model protocol, OpenAI-compatible provider, model discovery.
-        .target(name: "AgentGateway", dependencies: ["AgentCore", "AgentJSONRPC"]),
+        .target(name: "AgentGateway", dependencies: ["AgentCore"]),
 
         // Tool protocol, registry, and built-in tools.
         .target(name: "AgentTools", dependencies: ["AgentCore"]),
@@ -46,16 +46,15 @@ let package = Package(
 
         // The agent loop: the Runner/Event loop that drives a session to completion.
         .target(name: "AgentLoop", dependencies: [
-            "AgentCore", "AgentGateway", "AgentTools", "AgentInstructions",
+            "AgentCore", "AgentGateway", "AgentInstructions",
         ]),
 
         // MCP (Model Context Protocol) client: connects external tool servers.
-        .target(name: "AgentMCP", dependencies: ["AgentCore", "AgentJSONRPC", "AgentTools"]),
+        .target(name: "AgentMCP", dependencies: ["AgentCore", "AgentJSONRPC"]),
 
         // ACP (Agent Client Protocol) server: streamable HTTP + WebSocket transports.
         .target(name: "AgentACP", dependencies: [
-            "AgentCore", "AgentJSONRPC", "AgentGateway", "AgentTools",
-            "AgentInstructions", "AgentLoop", "AgentMCP",
+            "AgentCore", "AgentJSONRPC", "AgentLoop", "AgentMCP",
             .product(name: "Hummingbird", package: "hummingbird"),
             .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
         ]),
@@ -75,8 +74,10 @@ let package = Package(
         .testTarget(name: "AgentJournalTests", dependencies: ["AgentCore", "AgentJournal"]),
         .testTarget(name: "AgentToolsTests", dependencies: ["AgentCore", "AgentTools"]),
         .testTarget(name: "AgentInstructionsTests", dependencies: ["AgentInstructions", "AgentCore"]),
-        .testTarget(name: "AgentMCPTests", dependencies: ["AgentMCP"]),
-        .testTarget(name: "AgentACPTests", dependencies: ["AgentACP"]),
+        .testTarget(name: "AgentMCPTests", dependencies: ["AgentCore", "AgentMCP"]),
+        .testTarget(name: "AgentACPTests", dependencies: [
+            "AgentACP", "AgentCore", "AgentGateway", "AgentJSONRPC", "AgentLoop", "AgentMCP", "AgentTools",
+        ]),
         .testTarget(name: "AgentTUITests", dependencies: ["AgentCore", "AgentTUI"]),
         .testTarget(name: "nawaTests", dependencies: [
             "nawa", "AgentCore", "AgentGateway", "AgentJSONRPC", "AgentJournal", "AgentLoop", "AgentACP",

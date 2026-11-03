@@ -37,7 +37,7 @@ struct AgentACPTests {
     func stopReasonFromResultKind() {
         #expect(ACPStopReason(resultKind: .success) == .endTurn)
         #expect(ACPStopReason(resultKind: .errorMaxTurns) == .maxTurnRequests)
-        #expect(ACPStopReason(resultKind: .errorDuringExecution) == .refusal)
+        #expect(ACPStopReason(resultKind: .errorDuringExecution) == .endTurn)
         #expect(ACPStopReason(resultKind: .refused) == .refusal)
         let notice = RefusalNotice(declinedBy: "big", category: "cyber", answeredBy: "small")
         #expect(ACPSession.refusalText(notice) == "\n\n[big declined this request (cyber). small answers instead.]\n\n")
@@ -218,14 +218,14 @@ struct JSONRPCIDTests {
         #expect(reply?.json.objectValue?["id"] == .string("6f1c-uuid"))
     }
 
-    /// When stdin closes, the stdio transport finishes the stream and still
+    /// When stdin closes, the stdio transport closes the connection and still
     /// writes the replies already queued (piped input used to lose them).
     @Test
     func finishingOutboundKeepsWhatIsQueuedThenEnds() async throws {
         let connection = ACPConnection(connectionID: "test", factory: RecorderFactory(model: ModelRecorder()), routing: .singleStream)
         await connection.handle(.request(JSONRPCRequest(method: "initialize", id: 0, params: .object([:]))))
         await connection.handle(text: "not json")
-        await connection.finishOutbound()
+        await connection.close()
         var replies: [JSONRPCMessage] = []
         for await message in await connection.outbound { replies.append(message) }
         #expect(replies.count == 2)

@@ -38,12 +38,19 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   providers tried in order when one can't serve (`fallbackProviderNames`,
   `GatewayFailover` cooldowns; `ModelRequest.mayFailOver` opts out;
   `ModelResponse.providerName`/`replacedProvider` say who answered) and auto
-  model discovery (`GET /v1/models`), `ProviderConfig` (its
+  model discovery (`GET /v1/models`, cached per provider for the
+  Gateway's life; a whitelist nothing on the server matches is an error),
+  `ProviderConfig` (its `headers` go with every request, the client's own
+  winning; an `env:NAME` key whose variable is unset fails with
+  `GatewayError.configuration` before the call and never fails over; its
   `requestTimeout`, 600 s by default, is how long a call waits before it
   fails over; its `reasoningEffort` is sent as given, as `reasoning_effort`
   on OpenAI-compatible APIs and `output_config.effort` on Anthropic's,
   and nil sends nothing, the provider's default, which is the maximum on
-  some),
+  some; `ModelRequest.reasoningEffort`, from the `effort` setting, wins
+  over it). An OpenAI stream that ends without `[DONE]` or a
+  `finish_reason` is `incompleteStream`. Tool arguments that aren't JSON
+  (cut off at `max_tokens`) reach the loop as `JSON.string(raw)`, never `{}`.
   `AgentConfigStore` (the per-directory config file written by `nawa config`).
 - `Sources/AgentJSONRPC` — JSON-RPC 2.0 envelope shared by MCP and ACP.
 - `Sources/AgentTools` — built-in tools: `ShellTool`, `ReadFileTool`,
@@ -59,11 +66,23 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `search` stops at 100 matches or 12K characters, names the files
   holding the rest, and pages on with `offset`. `list_files` without a glob shows a directory of more than 200 files as
   an overview (two levels, deeper folders with file counts). Long output
-  is cut to head + tail with the full text saved to a temp file
-  (`CapturedOutput`).
+  is cut to head + tail with the full text saved to a private temp file
+  (`CapturedOutput`: 0600 in `$TMPDIR/nawa-<uid>/`, 0700; output over
+  256 KB is read at its ends only). `shell` takes `timeout_seconds`
+  (default 600); on timeout or cancellation (Esc) the command's process
+  group gets SIGTERM, then SIGKILL after 2 s; a signal death reads `killed
+  by signal N`. Lines split on `\n` and `\r\n`. `search` skips files over
+  10 MB (rg `--max-filesize`, the same in `FileWalk`) and keeps its matches
+  when rg reports errors (exit 2). `read_file` cuts lines at 500
+  characters and names the command for the rest. `edit_file` writes
+  through symlinks and keeps file modes. Paths expand `~`; rg is found on
+  `PATH` (the parity tests run only where a real `rg` binary is).
 - `Sources/AgentInstructions` — the system prompt (proposal 0006).
-  `ProjectInstructions` loads the AGENTS.md chain (a folder without one
-  uses its CLAUDE.md), root-first / nearest-last so the closest file wins.
+  `ProjectInstructions` loads the AGENTS.md chain from the cwd up to the
+  git root (outside git, the cwd only; a folder without one uses its
+  CLAUDE.md), root-first / nearest-last so the closest file wins. Files
+  that aren't regular UTF-8 files of at most 256 KB (AGENTS.md, SOUL.md,
+  SKILL.md) are skipped.
   `SystemPrompt.firstPrinciples` (working style, accuracy, safety)
   starts every session's system message: `AgentLoop` puts it there and
   adds its caller's `systemPrompt` after it (`SystemPrompt.composed`).
@@ -90,11 +109,18 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `SessionJournal`) are in `AgentCore`; `JournalFormat` is the line
   format (snake_case, nils left out; change both sides together and keep
   `modelCallUsesTheDocumentedFieldNames` passing), `JournalFile` the
-  writer (0600, one line per record, never fails a run), `JournalReader`
+  writer (0600 file in a 0700 directory, one line per record, never fails
+  a run; one writer per file, held with `flock`: `init(continuing:)` locks
+  up front and throws `JournalFileError.inUse`), `JournalReader`
   the reader (skips cut-off lines, rebuilds requests and contexts;
   `replay()` gives the `SessionState` that `AgentLoop(restoring:)` goes
-  on from). `SessionStore` is the CLI's sessions directory: file names,
-  lookup by listing (never by joining an id into a path), pruning.
+  on from; `missingContextMessageIDs` names messages a context rewrite
+  needs that the file lacks). `model_call` records carry `helper`
+  (whether the helper model answered); replay counts helper usage from
+  it, and from the purpose for older journals. `SessionStore` is the CLI's
+  sessions directory: file names, lookup by listing (never by joining an
+  id into a path), pruning (`pruneJournals` keeps journals a running nawa
+  holds), `defaultDirectory(environment:)` (reads no `NAWA_*` variables).
   `AgentLoop(journal:)` writes it; nil records nothing. A message's id
   must always mean the same content: rewriting a message gives it a new id.
 - `Sources/AgentLoop` — `AgentLoop`: the Runner/Event loop. Drives a session
@@ -102,7 +128,13 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   caps, usage accounting, and cost estimates. There is no turn cap by
   default: from turn 50 (`loopCheckAfterTurns`) `LoopDetector` stops a run
   whose last 10 turns repeat the same tool calls with the same results 3
-  times. `steer(_:)` hands a running loop a message ("wrap up now"): it
+  times. Runs never overlap: a new run cancels the one in progress and
+  waits for it to end; a cancelled turn keeps the results of tools that
+  finished. `maxBudgetUSD` is checked before each model call: a reply that
+  crosses it is kept when it is the answer, and its tool calls don't run.
+  Tool calls cut off at `max_tokens` or with non-object arguments get an
+  error result instead of running. `onEvent` gets exactly what the stream
+  yields. `steer(_:)` hands a running loop a message ("wrap up now"): it
   arrives as a user message after the current turn's tool results, and keeps
   a run going that would otherwise have ended (that call counts as a turn).
   A steer pending at `maxTurns` gets one more model call, once per run: a
@@ -145,23 +177,52 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   UI: `InlineChat` on a terminal, `PlainChat` otherwise (or `--plain`).
   `InlineChat` is one main-actor loop over keys, run events, ticks and
   resizes; Enter during a run queues, Esc / Ctrl-C interrupt (ending the
-  run's stream cancels it). `InlineScreen` draws each frame as one string
+  run's stream cancels it); an interrupt puts the queued prompts back in
+  the editor instead of running them. `InlineScreen` draws each frame as one string
   of relative moves (no alternate screen); `LiveRegion.swift` lays out the
   status line and the prompt box. `SlashCommand` (`/help`, `/clear`,
-  `/cost`, `/tools`, `/exit`) runs the same in both UIs; `/clear` calls
+  `/cost`, `/tools`, `/config`, `/effort`, `/exit`; only a single line is
+  a command, and extra words after one other than `/config` / `/effort`
+  get a warning) runs the same in both UIs; `/effort high` is `/config set
+  effort high`, `/effort default` unsets it; `/clear` calls
   `ChatSession.reset`. After a refusal both UIs ask whether to keep the
   declined prompt (`DeclinedRequest.swift`). `Terminal` is the only file touching
-  termios, ioctl and signals. Tests replay frames on `VirtualTerminal`.
+  termios, ioctl and signals. It restores the terminal on exit,
+  SIGTERM/SIGHUP and crash signals (async-signal-safe handlers that then
+  defer to the previous handler); a resume after Ctrl-Z re-enters raw mode
+  and bracketed paste. `PlainChat` catches Ctrl-C during a run to
+  interrupt it. `Terminal.readHiddenLine` reads secrets for `nawa config`
+  (getpass truncates at 128 characters on macOS). Without bracketed paste,
+  a CR with more bytes behind it in the same read is a newline; a paste
+  whose end marker never comes is taken after ~2 s of silence. Tests replay frames on `VirtualTerminal`.
   `PlainChat` is line mode
   (pipes, `TERM=dumb`); it turns Shift-Enter
   sequences (`ESC[27;2;13~`, `ESC[13;2u`) typed in cooked mode back into
   newlines.
-- `Sources/AgentMCP` — `MCPClient`: spawns MCP servers, speaks JSON-RPC 2.0,
-  exposes their tools.
+- `Sources/AgentMCP` — `MCPClient`: spawns MCP servers (a bare `command`
+  is looked up on `PATH`; `MCPServerConfig.workingDirectory`, which the CLI
+  sets to the session's cwd), speaks JSON-RPC 2.0 (`parseJSONRPCLine`, ids
+  matched by `JSONRPCID`), exposes their tools. Server errors, server exit
+  (stdout EOF), timeouts (60 s for initialize/list, 600 s for tool calls)
+  and task cancellation fail the call with `MCPClientError`. Server
+  requests are answered: `ping` with `{}`, others with method-not-found.
 - `Sources/AgentACP` — `ACPServer`: ACP over streamable HTTP and WebSocket on
   a single `/acp` endpoint (Hummingbird), `ACPStdioTransport` (ACP over
-  stdin/stdout), plus the JSON-RPC frames. `ACPConnection` owns dispatch;
-  each transport picks its `ACPOutboundRouting` (`.perSession` SSE streams
+  stdin/stdout), plus the JSON-RPC frames. `ACPConnection` owns dispatch and its sessions; `close()` ends
+  it (DELETE, WebSocket close, stdin EOF): prompts cancelled, sessions and
+  their MCP servers released, streams finished. Sessions reach their
+  connection through a weak `ConnectionSink`. Every route refuses requests
+  from web pages and foreign hosts (`ACPServerConfiguration.admits`: Host
+  must be loopback or the bound address; any `Origin` must be in
+  `allowedOrigins`, empty by default) with 403 (Hummingbird answers a
+  refused WebSocket handshake with 400). Each SSE stream has one reader
+  (`attachStream`; a second GET gets 409, an unknown session 404). A new
+  `session/prompt` cancels the running one and starts after it answers; a
+  cancelled turn stops with `cancelled`; `session/load` of a session
+  mid-turn is an error, and loads of one unloaded session share one
+  restore. Prompts accept `resource` (as `<file uri>` text) and
+  `resource_link` blocks; `usage_update.size` is the compaction point.
+  Each transport picks its `ACPOutboundRouting` (`.perSession` SSE streams
   for HTTP, `.singleStream` for stdio/WebSocket) and feeds raw frames to
   `handle(text:)`, which also answers unparseable ones. With
   `ACPCapabilities.loadSession`, `session/load` rebuilds a session through
@@ -175,6 +236,11 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `prompt [dir]` (prints the system prompt a session there would get). `WakuCompatibility.swift` implements the Kimi Code
   CLI commands Waku calls, so Nawa can stand in for Kimi Code inside Waku.
   In `acp` mode stdout carries the protocol: never `print` there.
+  Usage errors go to stderr with exit status 2 (`UsageError`), other
+  failures exit 1. SIGPIPE is ignored (a dead MCP server must not kill
+  nawa). A failing MCP server is reported on stderr and stopped; MCP tool
+  names are cleaned to `[A-Za-z0-9_-]` (server part at most 20
+  characters, the whole name at most 64).
   `repl` builds a `ChatSession` from an `AgentLoop` (a fresh one on
   `/clear`) and hands it to `AgentTUI`.
 - `Tests/` — Swift Testing suites, one per module.
@@ -265,7 +331,12 @@ honoured). Several providers can be saved per directory; `nawa config list`,
 `nawa config use <name>`, and `nawa config remove <name>` manage them.
 `serve` / `acp` / `repl` read that file for the current directory (ACP: the
 session's `cwd`) unless `NAWA_GATEWAY_URL` is set (`NAWA_GATEWAY_API=anthropic`
-selects the Anthropic wire API for that override).
+selects the Anthropic wire API for that override; without a URL it means
+`https://api.anthropic.com` with `ANTHROPIC_API_KEY`). `Gateways.json` is
+read from the session's directory. `serve` / `acp` keep one `Gateway` per
+directory for the process (`GatewayCache`), so sessions share failover
+cooldowns and discovered models; it is rebuilt when the directory's
+config changes.
 
 Providers can also be configured in code through `ProviderConfig` + `Gateway`:
 multiple OpenAI-compatible endpoints (OpenAI, Azure, Ollama, vLLM, LiteLLM,
@@ -289,7 +360,7 @@ another model:
   model's tool calls and thinking before it are dropped). Set
   `ProviderConfig.serverFallbacks` to change the default; a 400 naming
   the field gets one retry without it.
-- Otherwise the loop retries once on the `fallback_model` setting
+- Otherwise the loop retries once per run on the `fallback_model` setting
   (`LoopOptions.fallbackModel`), or on the provider's
   `recommended_model`, and the conversation stays on that model.
   `reasoning_extraction` refusals are not retried: the prompt needs rewording.
@@ -308,8 +379,12 @@ named `<started-at>-<id>.jsonl`, in the `sessions_dir` setting, else
 `sessions off` turns recording off (and with it resuming and
 `session/load`); both are read from the directory nawa starts in. Journals hold everything the model saw, secrets in tool
 output included, so they are `0600` in a `0700` directory.
-- `nawa repl --resume [id]` goes on with a session (no id: this
-  directory's newest repl session), showing its last prompts.
+- `nawa repl --resume [id]` goes on with a session (no id: the repl
+  session in this directory written to most recently), showing its last
+  prompts. A session open in another nawa can't be resumed or loaded
+  ("session <id> is open in another nawa"), and prune keeps it. A journal
+  whose context names lost messages is refused; unreadable lines are
+  reported on stderr.
 - ACP advertises `loadSession`; `serve` unloads a session after
   `session_idle_minutes` (default 30) without a prompt.
 - `nawa sessions list [--all]`, `show <id>`, `path <id>` (for `jq` or
@@ -340,8 +415,10 @@ Settings are typed. Two layers:
 - **`LoopSettings`** (`AgentCore`): the agent loop's settings as a
   published contract. Codable, fixed snake_case keys (`compact_at`,
   `helper_model`, `price` as `{input_per_million, output_per_million}`,
-  `helper_price`, `max_budget_usd`, `fallback_model`, `stream`), every
-  field optional.
+  `helper_price`, `max_budget_usd`, `fallback_model`, `stream`,
+    `effort`), every field optional. `effort` is sent with each turn of
+    the session's model in place of the provider's `reasoningEffort`
+    (summaries and helper sub-agents keep the provider's).
   - `LoopOptions.applying(_:)` (`AgentLoop`) puts them over options built
     in code, which is how a library user (Hafez) takes settings a server
     sends.
@@ -353,13 +430,18 @@ Settings are typed. Two layers:
   nested.
 
 The CLI side (`Sources/nawa/Settings.swift`):
-- **Changing settings:** `/config` in the repl and `nawa config
-  settings|set|unset`.
+- **Changing settings:** `/config` in the repl (and `/effort` for the
+  `effort` setting) and `nawa config settings|get|set|unset`. Every write
+  goes through `AgentConfigStore.modify(at:)`, which locks
+  `config.json.lock`; `save` writes a 0600 temp file and renames it. A
+  relative `sessions_dir` is saved absolute.
 - **What a person types:** each `Setting` maps the typed text (`200k`,
   `3,15`, `on`) to one `DirectorySettings` field through a key path, and
   shows it back.
 - **The environment:** each setting also reads its `NAWA_*` variable,
-  which wins over the saved value. `Settings.resolved(for:)` gives the
+  which wins over the saved value; variables that don't parse are
+  reported once at startup (`Settings.environmentProblems`), and
+  resolving settings is silent. `Settings.resolved(for:)` gives the
   result. The libraries read no `NAWA_*` variables for these: callers
   pass typed values (`SystemPrompt.load(skills:projectSkills:)`).
 - **Per session:** `repl`, `acp` and `serve` build each session's loop

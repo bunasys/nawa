@@ -1,5 +1,6 @@
 import AgentCore
 import AgentGateway
+import AgentJournal
 @testable import AgentLoop
 import Foundation
 import Testing
@@ -111,6 +112,29 @@ struct RepeatedOutputTests {
         let deduped = ContextShrinking.dedupingRepeatedResults([short, failed, afterClearing], against: context)
 
         #expect(deduped == [short, failed, afterClearing])
+    }
+
+    /// After a compaction folded the original into the summary, a kept
+    /// pointer to it would point at nothing.
+    @Test
+    func aPointerWhoseOriginalWasSummarizedAwayBecomesAnElidedNote() throws {
+        let original = exchange("c1", output: file)
+        let again = ContextShrinking.dedupingRepeatedResults([ToolCallResult(callID: "c2", name: "read_file", content: file)], against: original)
+        let pointerExchange = [
+            Message(role: .assistant, content: [.toolCall(ToolCall(id: "c2", name: "read_file", arguments: .object(["path": .string("a.py")])))]),
+            again[0].asMessage,
+        ]
+        #expect(ContextShrinking.pointedCallID(again[0].content) == "c1")
+
+        let stillThere = ContextShrinking.redirectingOrphanedPointers(original + pointerExchange)
+        #expect(stillThere == original + pointerExchange)
+
+        let orphaned = ContextShrinking.redirectingOrphanedPointers(pointerExchange)
+        let note = try #require(resultContents(orphaned).first)
+        #expect(ContextShrinking.isElided(note))
+        #expect(note.contains(#"read_file {"path":"a.py"}"#))
+        #expect(note.contains("summarized away"))
+        #expect(orphaned[1].id != pointerExchange[1].id)
     }
 
     @Test
@@ -244,5 +268,36 @@ struct HelperModelFallbackTests {
         #expect(model.requestedModels == ["main", "main", "typo-model", "main", "main"])
         #expect(notes.first?.hasPrefix("The helper model typo-model couldn't summarize") == true)
         #expect(loop.session.messages.contains { $0.text.contains("SUMMARY") })
+    }
+
+    /// The summary the session's model made is priced as the session's
+    /// model, live and after a restore from the journal alike.
+    @Test
+    func aFallenBackSummaryIsCountedAsTheSessionsModelInTheJournalToo() async throws {
+        let script = ScriptedModel(responses: [
+            toolCallResponse(ToolCall(id: "c1", name: "echo", arguments: .object(["text": .string("x")])), usage: Usage(inputTokens: 50)),
+            toolCallResponse(ToolCall(id: "c2", name: "echo", arguments: .object(["text": .string("y")])), usage: Usage(inputTokens: 500)),
+            ModelResponse(message: Message(role: .assistant, text: "SUMMARY"), usage: Usage(inputTokens: 1000)),
+            ModelResponse(message: Message(role: .assistant, text: "done")),
+        ])
+        let model = RejectsOneModel(rejecting: "typo-model", script: script)
+        let options = LoopOptions(
+            pricing: Pricing(inputPer1K: 1),
+            compaction: Compaction(atContextTokens: 400, keepRecentMessages: 2),
+            helperModel: "typo-model",
+            helperPricing: Pricing(inputPer1K: 0.1)
+        )
+        let journal = MemoryJournal()
+        let loop = AgentLoop(gateway: model, tools: ToolRegistry([EchoTool()]), options: options, journal: journal)
+        loop.model = "main"
+        _ = try await finalResult(loop.run(prompt: "go"))
+
+        let summaryCall = try #require(journal.contents.modelCalls.last { $0.purpose == .compaction && $0.response != nil })
+        #expect(summaryCall.helper == false)
+        #expect(abs((summaryCall.costUSD ?? 0) - 1.0) < 1e-9)
+        let state = try #require(journal.contents.replay())
+        let restored = AgentLoop(restoring: state, gateway: model, tools: ToolRegistry([EchoTool()]), options: options)
+        #expect(restored.totalCost == loop.totalCost)
+        #expect(abs((loop.totalCost ?? 0) - 1.55) < 1e-9)
     }
 }

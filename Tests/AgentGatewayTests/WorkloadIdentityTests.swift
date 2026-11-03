@@ -14,12 +14,17 @@ final class TokenEndpointStub: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var lastBody: JSON?
     nonisolated(unsafe) static var failWithStatus: Int?
     nonisolated(unsafe) static var expiresIn = 600
+    nonisolated(unsafe) static var lastTimeout: TimeInterval?
+    /// Runs while the exchange is in flight (e.g. to move a test clock).
+    nonisolated(unsafe) static var duringExchange: (() -> Void)?
 
     static func reset() {
         exchanges = 0
         lastBody = nil
         failWithStatus = nil
         expiresIn = 600
+        lastTimeout = nil
+        duringExchange = nil
     }
 
     static func session() -> URLSession {
@@ -34,6 +39,8 @@ final class TokenEndpointStub: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         Self.exchanges += 1
+        Self.lastTimeout = request.timeoutInterval
+        Self.duringExchange?()
         // Apple's URLProtocol sees the body as a stream; Linux's keeps `httpBody`.
         if let data = request.httpBody {
             Self.lastBody = try? JSONDecoder().decode(JSON.self, from: data)
@@ -159,6 +166,22 @@ struct WorkloadIdentityTests {
 
         clock.advance(by: 80)  // 20 s left: past the mandatory 30 s margin
         await #expect(throws: GatewayError.self) { try await source.accessToken() }
+    }
+
+    /// The cached token is judged by the time after the failed exchange,
+    /// not before: a slow exchange may have used up its last safe seconds.
+    @Test
+    func aSlowFailedExchangeDoesNotServeATokenPastItsMargin() async throws {
+        let clock = TestClock()
+        let source = makeSource(clock: clock)
+
+        _ = try await source.accessToken()
+        TokenEndpointStub.failWithStatus = 503
+        clock.advance(by: 600 - 100)  // 100 s left: inside the advisory window, still safe
+        TokenEndpointStub.duringExchange = { clock.advance(by: 80) }  // 20 s left once it fails
+
+        await #expect(throws: GatewayError.self) { try await source.accessToken() }
+        #expect(TokenEndpointStub.lastTimeout == WorkloadIdentityTokenSource.exchangeTimeout)
     }
 
     @Test

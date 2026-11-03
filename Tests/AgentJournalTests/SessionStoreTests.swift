@@ -46,6 +46,14 @@ struct SessionStoreTests {
         #expect(SessionStore.fromEnvironment([:])?.directory.path == home + "/.local/state/nawa/sessions")
     }
 
+    /// The CLI reads `NAWA_SESSIONS*` as settings; the default reads none.
+    @Test
+    func theDefaultDirectoryReadsOnlyTheStateAndHomeVariables() {
+        let ignored = ["NAWA_SESSIONS": "off", "NAWA_SESSIONS_DIR": "/x"]
+        #expect(SessionStore.defaultDirectory(environment: ignored.merging(["XDG_STATE_HOME": "/state"]) { $1 }).path == "/state/nawa/sessions")
+        #expect(SessionStore.defaultDirectory(environment: ignored.merging(["HOME": "/home/a"]) { $1 }).path == "/home/a/.local/state/nawa/sessions")
+    }
+
     @Test
     func filesAreNamedByStartTimeAndID() throws {
         let store = SessionStore(directory: URL(fileURLWithPath: "/s"))
@@ -77,9 +85,12 @@ struct SessionStoreTests {
     func theNewestSessionOfADirectoryIsTheOneToResume() throws {
         let store = SessionStore(directory: try temporaryDirectory())
         let now = Date()
-        _ = writeSession(store, id: UUID().uuidString, cwd: "/work", startedAt: now.addingTimeInterval(-60))
-        let newest = writeSession(store, id: UUID().uuidString, cwd: "/work", startedAt: now)
+        // Started first but written to last (resumed): that is the newest.
+        let newest = writeSession(store, id: UUID().uuidString, cwd: "/work", startedAt: now.addingTimeInterval(-60))
+        let startedLater = writeSession(store, id: UUID().uuidString, cwd: "/work", startedAt: now)
         _ = writeSession(store, id: UUID().uuidString, cwd: "/elsewhere", startedAt: now.addingTimeInterval(60))
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-30)], ofItemAtPath: startedLater.path)
+        try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: newest.path)
         #expect(store.newestSession(inDirectory: "/work") == newest)
         #expect(store.newestSession(inDirectory: "/nowhere") == nil)
         #expect(store.newestSession(inDirectory: "/work", mode: "repl") == newest)
@@ -97,6 +108,25 @@ struct SessionStoreTests {
         let removed = try store.prune(lastWrittenBefore: Date().addingTimeInterval(-30 * 24 * 3600))
         #expect(removed == [old])
         #expect(store.journalURLs() == [recent])
+    }
+
+    @Test
+    func pruneKeepsJournalsARunningNawaHasOpen() throws {
+        let store = SessionStore(directory: try temporaryDirectory())
+        let open = writeSession(store, id: UUID().uuidString, cwd: "/work")
+        let closed = writeSession(store, id: UUID().uuidString, cwd: "/work")
+        let longAgo = Date().addingTimeInterval(-40 * 24 * 3600)
+        for url in [open, closed] {
+            try FileManager.default.setAttributes([.modificationDate: longAgo], ofItemAtPath: url.path)
+        }
+        let writer = try JournalFile(continuing: open, origin: JournalOrigin(mode: "repl"))
+        defer { writer.close() }
+
+        let result = store.pruneJournals(lastWrittenBefore: Date().addingTimeInterval(-30 * 24 * 3600))
+        #expect(result.removed == [closed])
+        #expect(result.inUse == [open])
+        #expect(result.failed.isEmpty)
+        #expect(store.journalURLs() == [open])
     }
 
     @Test

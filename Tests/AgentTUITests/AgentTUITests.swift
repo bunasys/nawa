@@ -87,6 +87,34 @@ import AgentCore
     @Test func c1ControlsAreNotText() {
         #expect(keys("a\u{9B}b") == [.text("ab")])
     }
+
+    @Test func aPauseInsideAPasteKeepsAnEndMarkerSplitAcrossReads() {
+        var decoder = KeyDecoder()
+        #expect(decoder.decode(Array("\u{1B}[200~abc\u{1B}[2".utf8)) == [])
+        #expect(decoder.hasPending)
+        // The reader flushes after 50 ms of silence; the paste must survive it.
+        #expect(decoder.flush() == [])
+        #expect(decoder.decode(Array("01~\r".utf8)) == [.paste("abc"), .enter])
+        #expect(!decoder.hasPending)
+    }
+
+    @Test func aPasteWhoseEndMarkerNeverComesIsTakenAfterAPause() {
+        var decoder = KeyDecoder()
+        #expect(decoder.decode(Array("\u{1B}[200~abc".utf8)) == [])
+        for _ in 1..<KeyDecoder.pasteGiveUpFlushes { #expect(decoder.flush() == []) }
+        #expect(decoder.flush() == [.paste("abc")])
+        #expect(!decoder.hasPending)
+        #expect(decoder.decode(Array("\r".utf8)) == [.enter])
+    }
+
+    @Test func keysAPasteAndKeysInOneRead() {
+        #expect(keys("a\u{1B}[200~b\u{1B}[201~c\u{1B}[200~d\u{1B}[201~\u{1B}[A") == [.text("a"), .paste("b"), .text("c"), .paste("d"), .up])
+    }
+
+    @Test func aCarriageReturnWithMoreBytesBehindItIsAPastedNewline() {
+        #expect(keys("one\rtwo\r\nthree\r") == [.text("one"), .newline, .text("two"), .newline, .text("three"), .enter])
+        #expect(keys("\r") == [.enter])
+    }
 }
 
 @Suite struct LineEditorTests {
@@ -188,6 +216,12 @@ import AgentCore
         #expect(TextWidth.of("❤️") == 2)
         #expect(TextWidth.of("e\u{301}") == 1)
         #expect(TextWidth.of("한글") == 4)
+        #expect(TextWidth.of("1️⃣#️⃣") == 4)  // keycaps start with ASCII
+    }
+
+    @Test func sanitizeReplacesBidiControls() {
+        let reordered = "rm -rf \u{202E}txt.exe\u{202C} \u{2066}x\u{2069}"
+        #expect(Layout.sanitize(reordered) == "rm -rf \u{FFFD}txt.exe\u{FFFD} \u{FFFD}x\u{FFFD}")
     }
 
     @Test func wrapsAtSpacesWithinWidth() {
@@ -267,6 +301,11 @@ import AgentCore
     @Test func shellSummaryWithExitCode() {
         let result = ToolCallResult(callID: "1", name: "shell", content: "exit code: 1\nerror: a\nerror: b\n", isError: true)
         #expect(ResultSummary(result) == ResultSummary(text: "exit 1 · 2 lines", isError: true))
+
+        let killed = ToolCallResult(callID: "2", name: "shell", content: "killed by signal 9\npartial\n")
+        let timedOut = ToolCallResult(callID: "3", name: "shell", content: "timed out after 600 seconds; the command and the processes it started were stopped\n(no output)")
+        #expect(ResultSummary(killed).text == "killed by signal 9 · 1 line")
+        #expect(ResultSummary(timedOut).text == "timed out after 600s · no output")
     }
 
     @Test func summaryCountsOmittedLinesAndShowsTheLog() {
@@ -336,6 +375,15 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         #expect(transcript.live.phase == .idle)
     }
 
+    @Test func aRunStaysBusyAfterATextOnlyTurnUntilItsResult() {
+        var transcript = Transcript()
+        _ = transcript.submit("go")
+        _ = transcript.reduce(turn("Done."))
+        #expect(transcript.live.isBusy)
+        #expect(transcript.interrupt() == [.warning("interrupted")])
+        #expect(!transcript.live.isBusy)
+    }
+
     @Test func subAgentStepsAttachToTheirTaskCall() {
         var transcript = Transcript()
         _ = transcript.submit("go")
@@ -396,7 +444,6 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         var transcript = Transcript()
         _ = transcript.submit("go")
         #expect(transcript.reduce(.informational("Compacted 40 older messages into a summary.")) == [.note("Compacted 40 older messages into a summary.")])
-        #expect(transcript.reduce(.toolResult(ToolCallResult(callID: "a", name: "shell", content: ""))) == [])
     }
 
     @Test func streamedRepliesAreLiveUntilTheTurnCommitsThem() {
@@ -525,6 +572,14 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         #expect(row.text.hasSuffix("…"))
     }
 
+    @Test func aToolNameWithANewlineStaysOnOneRow() {
+        let layout = Layout(columns: 40)
+        let withDetail = layout.callRow(ToolLabel(name: "evil\nname", detail: "x"), indent: 2)
+        let alone = layout.callRow(ToolLabel(name: "evil\r\nname", detail: ""), indent: 2)
+        #expect(withDetail.text == "  ⏺ evil name  x")
+        #expect(alone.text == "  ⏺ evil name")
+    }
+
     @Test func headerAndFooter() {
         let facts = SessionHeader(provider: "anthropic", model: "claude-sonnet-4-5", directory: "~/src/nawa", instructionsFile: "AGENTS.md")
         #expect(Layout(columns: 80).header(facts).text == " nawa · anthropic · claude-sonnet-4-5 · ~/src/nawa · AGENTS.md")
@@ -604,6 +659,34 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         #expect(failed.hasSuffix("› go\n⚠ connection reset\n"))
     }
 
+    @Test func ctrlCDuringARunInterruptsItAndTheSessionGoesOn() async {
+        final class Sink: @unchecked Sendable { var text = "" }
+        let (ended, endedContinuation) = AsyncStream<Void>.makeStream()
+        let session = ChatSession(header: SessionHeader(directory: "~/p")) { prompt in
+            AsyncThrowingStream { continuation in
+                guard prompt == "hang" else {
+                    continuation.yield(turn("re \(prompt)"))
+                    continuation.yield(.result(result()))
+                    continuation.finish()
+                    return
+                }
+                continuation.onTermination = { _ in endedContinuation.yield() }
+            }
+        }
+        // Ctrl-C arrives as soon as the run starts.
+        let pressCtrlC: PlainChat.InterruptCatcher = { interrupt in
+            interrupt()
+            return {}
+        }
+        let sink = Sink()
+        var lines = ["hang", "next"][...]
+        let chat = PlainChat(session: session, layout: Layout(columns: 80), echoPrompts: true, catchInterrupts: pressCtrlC) { sink.text += $0 }
+        await chat.run { lines.popFirst() }
+        var iterator = ended.makeAsyncIterator()
+        await iterator.next()
+        #expect(sink.text.hasSuffix("› hang\n⚠ interrupted\n\n› next\n● re next\n"))
+    }
+
     @Test func shiftEnterFromModifyOtherKeysBecomesNewline() {
         let line = "last session returned this error:\u{1B}[27;2;13~1. Inline."
         #expect(PlainChat.modifiedEnterAsNewline(line) == "last session returned this error:\n1. Inline.")
@@ -624,10 +707,22 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
 }
 
 @Suite struct SlashCommandTests {
+    /// `/effort` is `/config` words for the `effort` setting.
+    @Test func effortStandsForConfigWords() {
+        #expect(SlashCommand.effortConfigArguments([]) == ["get", "effort"])
+        #expect(SlashCommand.effortConfigArguments(["high"]) == ["set", "effort", "high"])
+        #expect(SlashCommand.effortConfigArguments(["Default"]) == ["unset", "effort"])
+    }
+
     @Test func parsesCommandsAndLeavesPromptsAlone() {
         #expect(SlashCommand("/help") == .help)
         #expect(SlashCommand("  /CLEAR  ") == .clear)
-        #expect(SlashCommand("/cost please") == .cost)
+        #expect(SlashCommand("/cost please") == .unexpectedWords("/cost"))
+        #expect(SlashCommand("/config set stream off") == .config(["set", "stream", "off"]))
+        #expect(SlashCommand("/effort") == .effort([]))
+        #expect(SlashCommand("/Effort high") == .effort(["high"]))
+        #expect(SlashCommand("/help\n") == .help)
+        #expect(SlashCommand("/clear\nthen explain the parser") == nil)
         #expect(SlashCommand("/frobnicate") == .unknown("/frobnicate"))
         #expect(SlashCommand("fix /help") == nil)
         #expect(SlashCommand("/usr/bin/env is missing") == nil)
@@ -743,7 +838,7 @@ func result(_ kind: AgentResultKind = .success, turns: Int = 1, tokens: Int = 0,
         #expect(SlashCommand("/config") == .config([]))
         #expect(SlashCommand("/config set compact_at 200k") == .config(["set", "compact_at", "200k"]))
         #expect(SlashCommand("/CONFIG  unset   stream") == .config(["unset", "stream"]))
-        #expect(SlashCommand("/cost extra words") == .cost)
+        #expect(SlashCommand("/cost extra words") == .unexpectedWords("/cost"))
     }
 
     @Test func configRunsTheSessionsHookAndShowsItsLines() {

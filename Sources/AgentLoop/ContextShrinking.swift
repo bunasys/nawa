@@ -110,10 +110,58 @@ enum ContextShrinking {
                 return result
             }
             var pointer = result
-            pointer.content = "[same output as the earlier \(original.name) call \(original.callID): refer to that result. "
+            pointer.content = "\(pointerPrefix)\(original.name) call \(original.callID)\(pointerMiddle)"
                 + "If it has been elided since, run the tool again.]"
             return pointer
         }
+    }
+
+    private static let pointerPrefix = "[same output as the earlier "
+    private static let pointerMiddle = ": refer to that result. "
+
+    /// The call id a pointer from `dedupingRepeatedResults` refers to; nil
+    /// for any other content.
+    static func pointedCallID(_ content: String) -> String? {
+        guard content.hasPrefix(pointerPrefix), let middle = content.range(of: pointerMiddle) else { return nil }
+        let nameAndCall = content[content.index(content.startIndex, offsetBy: pointerPrefix.count)..<middle.lowerBound]
+        guard let callWord = nameAndCall.range(of: " call ", options: .backwards) else { return nil }
+        return String(nameAndCall[callWord.upperBound...])
+    }
+
+    /// After a compaction, a pointer whose original was folded into the
+    /// summary points at nothing; the model would look for a result it no
+    /// longer has. Such pointers become an elided note, which says to run
+    /// the call again.
+    static func redirectingOrphanedPointers(_ kept: [Message]) -> [Message] {
+        var resultCallIDs = Set<String>()
+        var callsByID: [String: ToolCall] = [:]
+        for message in kept {
+            for block in message.content {
+                if case .toolResult(let result) = block { resultCallIDs.insert(result.callID) }
+                if case .toolCall(let call) = block { callsByID[call.id] = call }
+            }
+        }
+        var redirected = kept
+        for (messageIndex, message) in kept.enumerated() {
+            var changed = false
+            for (blockIndex, block) in message.content.enumerated() {
+                guard case .toolResult(var result) = block, let original = pointedCallID(result.content) else { continue }
+                guard !resultCallIDs.contains(original) else { continue }
+                result.content = summarizedAwayNote(for: result, call: callsByID[result.callID])
+                redirected[messageIndex].content[blockIndex] = .toolResult(result)
+                changed = true
+            }
+            // A changed message is a new message: the journal refers to it by id.
+            if changed { redirected[messageIndex].id = UUID().uuidString }
+        }
+        return redirected
+    }
+
+    private static func summarizedAwayNote(for result: ToolCallResult, call: ToolCall?) -> String {
+        var arguments = call?.arguments.description ?? ""
+        if arguments.count > 160 { arguments = String(arguments.prefix(159)) + "…" }
+        let invocation = arguments.isEmpty ? result.name : "\(result.name) \(arguments)"
+        return "\(elidedPrefix) \(invocation) returned the same output as an earlier call, which was summarized away; run it again if you need it]"
     }
 
     private static func isWorthDeduping(_ result: ToolCallResult) -> Bool {
