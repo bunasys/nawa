@@ -227,7 +227,8 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `HummingbirdWSClient` (NIOSSL for wss); it reads stdin with the same
   `standardInputLines()` as `ACPStdioTransport`. When stdin ends it
   closes once every request it forwarded has its answer, so a script can
-  pipe requests in and read the replies. Each SSE stream has one reader
+  pipe requests in and read the replies. A server that closes
+  first, or a stdin read that fails, ends it with an error (exit 1). Each SSE stream has one reader
   (`attachStream`; a second GET gets 409, an unknown session 404). A new
   `session/prompt` cancels the running one and starts after it answers; a
   cancelled turn stops with `cancelled`; `session/load` of a session

@@ -293,6 +293,22 @@ struct ACPRemoteBridgeTests {
         }
     }
 
+    /// A broken stdin ends the bridge with its error, not a quiet wait
+    /// for the server to hang up.
+    @Test
+    func anInputFailureEndsTheBridge() async throws {
+        struct ReadFailed: Error {}
+        try await withACPServer(configuration: configuration) { port in
+            let bridge = try #require(ACPRemoteBridge(address: "http://127.0.0.1:\(port)", token: "s3cret"))
+            let input = AsyncThrowingStream<String, any Error> { typing in
+                typing.finish(throwing: ReadFailed())
+            }
+            await #expect(throws: ACPRemoteBridgeError.failed(bridge.url, "\(ReadFailed())")) {
+                try await bridge.run(input: input) { _ in }
+            }
+        }
+    }
+
     @Test
     func aWrongTokenIsRefused() async throws {
         try await withACPServer(configuration: configuration) { port in

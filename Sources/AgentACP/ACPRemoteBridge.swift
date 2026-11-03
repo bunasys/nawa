@@ -40,9 +40,9 @@ public struct ACPRemoteBridge: Sendable {
 
     /// Sends each `input` line to the server and hands each message it
     /// sends to `output`. Returns when `input` has ended and every request
-    /// sent has its answer (then the socket is closed), or the server
-    /// closes normally; throws when the server can't
-    /// be reached, refuses the connection, or closes it abnormally.
+    /// sent has its answer (then the socket is closed); throws when the
+    /// server can't be reached, refuses the connection, or closes it first,
+    /// and when reading `input` or sending to the server fails.
     public func run<Input: AsyncSequence<String, any Error> & Sendable>(
         input: Input,
         output: @escaping @Sendable (String) -> Void
@@ -64,12 +64,20 @@ public struct ACPRemoteBridge: Sendable {
                 // Not awaited: stdin may never end once the server has closed,
                 // and a stdin read can't always be cancelled.
                 let sender = Task {
-                    for try await line in input {
-                        if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
-                        if case .request(let request)? = try? parseJSONRPCLine(line) {
-                            requests.sent(request.id)
+                    do {
+                        for try await line in input {
+                            if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+                            if case .request(let request)? = try? parseJSONRPCLine(line) {
+                                requests.sent(request.id)
+                            }
+                            try await outbound.write(.text(line))
                         }
-                        try await outbound.write(.text(line))
+                    } catch {
+                        // Closing ends the inbound loop below, which then
+                        // reports this error instead of waiting on the server.
+                        requests.senderFailed("\(error)")
+                        try? await outbound.close(.goingAway, reason: nil)
+                        return
                     }
                     // A client that writes its requests and then closes stdin
                     // (a script) still wants the answers: close only once
@@ -99,11 +107,14 @@ public struct ACPRemoteBridge: Sendable {
             throw ACPRemoteBridgeError.failed(url, "\(error)")
         }
 
-        if requests.hasInputEnded { return }
-        let closedNormally = closeFrame?.closeCode == .normalClosure
-        guard closedNormally else {
-            throw ACPRemoteBridgeError.closedByServer(url, closeFrame.map { "\($0.closeCode)" } ?? "without a close frame")
+        if let senderError = requests.senderError {
+            throw ACPRemoteBridgeError.failed(url, senderError)
         }
+        // Success only when the bridge itself closed: input over and every
+        // answer in. A server that closes first, however politely, leaves
+        // the client without its agent.
+        if requests.isFinished { return }
+        throw ACPRemoteBridgeError.closedByServer(url, closeFrame.map { "\($0.closeCode)" } ?? "without a close frame")
     }
 }
 
@@ -115,6 +126,7 @@ private final class UnansweredRequests: Sendable {
     private struct State {
         var pending: Set<JSONRPCID> = []
         var inputEnded = false
+        var senderError: String?
     }
     private let state = Mutex(State())
 
@@ -139,7 +151,14 @@ private final class UnansweredRequests: Sendable {
         }
     }
 
-    var hasInputEnded: Bool { state.withLock { $0.inputEnded } }
+    func senderFailed(_ error: String) {
+        state.withLock { $0.senderError = error }
+    }
+
+    var senderError: String? { state.withLock { $0.senderError } }
+
+    /// Input has ended and every request has its answer.
+    var isFinished: Bool { state.withLock { $0.inputEnded && $0.pending.isEmpty } }
 }
 
 public enum ACPRemoteBridgeError: Error, Equatable, LocalizedError, CustomStringConvertible {
