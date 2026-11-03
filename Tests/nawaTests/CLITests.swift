@@ -107,7 +107,11 @@ import Testing
             "PATH": "/usr/bin:/bin",
         ]
 
-        for arguments in [["bogus"], ["config", "use"], ["config", "set", "stream", "maybe"], ["provider"]] {
+        let mistakes = [
+            ["bogus"], ["config", "use"], ["config", "set", "stream", "maybe"], ["provider"],
+            ["serve", "--token", "s3cret"], ["serve", "--port", "http"], ["connect"], ["connect", "devbox:7878"],
+        ]
+        for arguments in mistakes {
             let run = try runNawa(arguments, in: directory, environment: environment)
             #expect(run.status == 2, "nawa \(arguments.joined(separator: " "))")
             #expect(run.stdout.isEmpty, "nawa \(arguments.joined(separator: " "))")

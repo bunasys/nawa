@@ -192,9 +192,13 @@ struct AgentCLI {
     }
 
     static let usage = """
-        Usage: nawa [serve|acp|repl|config|sessions|prompt|provider list]
-          serve  — start the ACP server (streamable HTTP + WebSocket) on :7878
+        Usage: nawa [serve|acp|connect|repl|config|sessions|prompt|provider list]
+          serve [--host <addr>] [--port <n>] [--token env:NAME|file:<path>]
+                 — start the ACP server (streamable HTTP + WebSocket) on 127.0.0.1:7878. A non-loopback
+                 --host needs a bearer token: without --token, one is created in ~/.local/state/nawa/serve-token
           acp    — speak ACP over stdio (for editors and Waku that launch the agent)
+          connect <url> [--token env:NAME|file:<path>] — ACP over stdio, bridged to a remote nawa serve
+                 (ws://, wss://, http://, https://; the token defaults to $NAWA_SERVE_TOKEN)
           repl [--plain] [--resume [id]] — chat with the agent in the terminal (--plain: line mode;
                  --resume: go on with a recorded session, by default this directory's newest; /help inside lists commands)
           sessions list|show|path|prune — the recorded sessions (nawa config set sessions off turns recording off)
@@ -243,14 +247,37 @@ struct AgentCLI {
         case "--version", "version":
             print("nawa \(ACPServerInfo.nawa.version)")
         case "serve":
+            let environment = ProcessInfo.processInfo.environment
+            let options = try RemoteAccess.serveOptions(
+                arguments: Array(args.dropFirst()),
+                environment: environment,
+                stateDirectory: SessionStore.stateDirectory(environment: environment)
+            )
+            if let warning = RemoteAccess.warning(for: options) {
+                FileHandle.standardError.write(Data((warning + "\n").utf8))
+            }
             let configuration = ACPServerConfiguration(
+                hostname: options.host,
+                port: options.port,
                 capabilities: capabilities,
-                idleSessionTimeout: sessions == nil ? nil : idleSessionTimeout(minutes: startSettings.sessionIdleMinutes)
+                idleSessionTimeout: sessions == nil ? nil : idleSessionTimeout(minutes: startSettings.sessionIdleMinutes),
+                bearerToken: options.token
             )
             let server = ACPServer(configuration: configuration, factory: sessionFactory(mode: "serve"))
-            let app = server.buildApplication()
-            print("ACP server listening on http://127.0.0.1:7878/acp")
+            // Said once bound, so the port is the real one (`--port 0` picks a free one).
+            let app = server.buildApplication { channel in
+                let port = channel.localAddress?.port ?? options.port
+                var lines = "ACP server listening on http://\(RemoteAccess.authority(host: options.host, port: port))/acp\n"
+                if let source = options.tokenSource {
+                    lines += "Clients need the bearer token in \(source)\n"
+                }
+                // Unbuffered: a process supervisor or a pipe sees it at once.
+                FileHandle.standardOutput.write(Data(lines.utf8))
+            }
             try await app.runService()
+        case "connect":
+            let bridge = try RemoteAccess.connectBridge(arguments: Array(args.dropFirst()), environment: ProcessInfo.processInfo.environment)
+            try await bridge.runOnStandardIO()
         case "acp":
             try await ACPStdioTransport(factory: sessionFactory(mode: "acp"), capabilities: capabilities).run()
         case "provider":

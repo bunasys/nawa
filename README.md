@@ -121,6 +121,8 @@ swift test
 swift run nawa config  # pick a provider + model for this directory (see below)
 swift run nawa serve   # ACP over streamable HTTP + WebSocket on :7878/acp
 swift run nawa acp     # ACP over stdio (for clients that launch the agent)
+swift run nawa serve --host 0.0.0.0   # reachable from other machines, with a bearer token (no TLS: use a proxy)
+swift run nawa connect wss://host/acp # ACP over stdio, bridged to a remote nawa serve (token: $NAWA_SERVE_TOKEN)
 swift run nawa repl    # chat in the terminal (Esc interrupts; --plain for line mode)
 ```
 
