@@ -30,6 +30,11 @@ public struct ACPServerConfiguration: Sendable {
     /// always do on a WebSocket, and a page that can reach the server can
     /// start MCP servers, that is, run commands.
     public var allowedOrigins: Set<String>
+    /// When set, every request must carry `Authorization: Bearer <token>`,
+    /// and any `Host` is accepted: a remote client names the machine its
+    /// own way, and the token, not the name, keeps strangers out. Nil
+    /// (the default) admits only local names, for a server on loopback.
+    public var bearerToken: String?
 
     public init(
         hostname: String = "127.0.0.1",
@@ -37,7 +42,8 @@ public struct ACPServerConfiguration: Sendable {
         info: ACPServerInfo = .nawa,
         capabilities: ACPCapabilities = .init(),
         idleSessionTimeout: Duration? = nil,
-        allowedOrigins: Set<String> = []
+        allowedOrigins: Set<String> = [],
+        bearerToken: String? = nil
     ) {
         self.hostname = hostname
         self.port = port
@@ -45,20 +51,64 @@ public struct ACPServerConfiguration: Sendable {
         self.capabilities = capabilities
         self.idleSessionTimeout = idleSessionTimeout
         self.allowedOrigins = allowedOrigins
+        self.bearerToken = bearerToken
     }
 
-    /// Whether a request with this `Host` (`authority`) and `Origin` may
-    /// reach the agent. The `Host` check stops DNS rebinding (a page whose
-    /// own domain resolves to 127.0.0.1); the `Origin` check stops any web
-    /// page opening a WebSocket to localhost, which browsers allow.
-    public func admits(authority: String?, origin: String?) -> Bool {
-        if let origin, !allowedOrigins.contains(origin) { return false }
-        guard let authority else { return false }
+    /// Whether a request with this `Host` (`authority`), `Origin` and
+    /// `Authorization` may reach the agent.
+    /// - The `Origin` check stops any web page opening a WebSocket to the
+    ///   server, which browsers allow.
+    /// - With a `bearerToken`, the token must match.
+    /// - Without one, the `Host` check stops DNS rebinding (a page whose own
+    ///   domain resolves to 127.0.0.1).
+    public func admission(authority: String?, origin: String?, authorization: String?) -> ACPAdmission {
+        if let origin {
+            // Browsers send the page's origin (http, https or "null"). A ws://
+            // or wss:// one comes from a native WebSocket client, never a page:
+            // swift-websocket's client (`nawa connect`) always sends one.
+            let scheme = origin.lowercased()
+            let fromNativeClient = scheme.hasPrefix("ws://") || scheme.hasPrefix("wss://")
+            let isAllowedPage = allowedOrigins.contains(origin)
+            if !fromNativeClient && !isAllowedPage { return .forbidden }
+        }
+
+        if let bearerToken {
+            let presented = Self.token(inAuthorization: authorization)
+            guard let presented, Self.constantTimeEquals(presented, bearerToken) else { return .unauthorized }
+            return .admitted
+        }
+
+        guard let authority else { return .forbidden }
         let host = Self.hostName(ofAuthority: authority.lowercased())
         let loopbackNames: Set<String> = ["127.0.0.1", "localhost", "[::1]"]
         let isIPv6Address = hostname.contains(":")
         let boundName = isIPv6Address ? "[\(hostname.lowercased())]" : hostname.lowercased()
-        return loopbackNames.contains(host) || host == boundName
+        let isLocalName = loopbackNames.contains(host) || host == boundName
+        return isLocalName ? .admitted : .forbidden
+    }
+
+    /// `Bearer abc` → `abc`. Nil for any other scheme or an empty token, so
+    /// an empty configured token admits no one.
+    private static func token(inAuthorization authorization: String?) -> String? {
+        guard let authorization else { return nil }
+        let parts = authorization.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2, parts[0].lowercased() == "bearer" else { return nil }
+        let token = parts[1].trimmingCharacters(in: .whitespaces)
+        return token.isEmpty ? nil : token
+    }
+
+    /// Compares every byte whatever the first difference, so the time a
+    /// wrong guess takes says nothing about how much of it was right.
+    static func constantTimeEquals(_ presented: String, _ expected: String) -> Bool {
+        let presentedBytes = Array(presented.utf8)
+        let expectedBytes = Array(expected.utf8)
+        var difference: UInt8 = presentedBytes.count == expectedBytes.count ? 0 : 1
+        for index in 0..<max(presentedBytes.count, expectedBytes.count) {
+            let left = index < presentedBytes.count ? presentedBytes[index] : 0
+            let right = index < expectedBytes.count ? expectedBytes[index] : 0
+            difference |= left ^ right
+        }
+        return difference == 0
     }
 
     /// `localhost:7878` → `localhost`, `[::1]:7878` → `[::1]`.
@@ -70,16 +120,35 @@ public struct ACPServerConfiguration: Sendable {
     }
 }
 
-/// Answers 403 to a request `ACPServerConfiguration.admits` turns away.
-/// On both routers. On the WebSocket router it refuses the handshake, which
-/// Hummingbird always answers with its own 400.
+/// What `ACPServerConfiguration.admission` decides about a request.
+public enum ACPAdmission: Sendable, Equatable {
+    case admitted
+    /// A web page or a foreign `Host`: 403.
+    case forbidden
+    /// A missing or wrong bearer token: 401.
+    case unauthorized
+}
+
+/// Answers 403 or 401 to a request `ACPServerConfiguration.admission`
+/// turns away. On both routers. On the WebSocket router it refuses the
+/// handshake, which Hummingbird always answers with its own 400.
 struct ACPAdmissionMiddleware<Context: RequestContext>: RouterMiddleware {
     let configuration: ACPServerConfiguration
 
     func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
-        let admitted = configuration.admits(authority: request.head.authority, origin: request.headers[.origin])
-        guard admitted else { return Response(status: .forbidden) }
-        return try await next(request, context)
+        let admission = configuration.admission(
+            authority: request.head.authority,
+            origin: request.headers[.origin],
+            authorization: request.headers[.authorization]
+        )
+        switch admission {
+        case .admitted:
+            return try await next(request, context)
+        case .forbidden:
+            return Response(status: .forbidden)
+        case .unauthorized:
+            return Response(status: .unauthorized, headers: [.wwwAuthenticate: "Bearer"])
+        }
     }
 }
 
@@ -113,8 +182,10 @@ struct ACPWebSocketRequestContext: RequestContext, WebSocketRequestContext {
 /// - `GET /acp` with `Upgrade: websocket`: full-duplex WebSocket.
 /// - `DELETE /acp`: terminate the connection (202).
 ///
-/// Every route refuses (403) requests from web pages and foreign hosts
-/// (see `ACPServerConfiguration.admits`).
+/// Every route refuses requests from web pages and foreign hosts (403),
+/// and, when the configuration has a `bearerToken`, requests without it
+/// (401; a refused WebSocket handshake is Hummingbird's 400). See
+/// `ACPServerConfiguration.admission`.
 public struct ACPServer: Sendable {
     public let configuration: ACPServerConfiguration
     public let factory: any ACPSessionFactory
@@ -131,8 +202,9 @@ public struct ACPServer: Sendable {
         buildApplication(onServerRunning: { _ in })
     }
 
-    /// `onServerRunning` gets the listening channel, so tests can learn the port.
-    func buildApplication(onServerRunning: @escaping @Sendable (any Channel) async -> Void) -> some ApplicationProtocol {
+    /// `onServerRunning` gets the listening channel, whose `localAddress`
+    /// is the port actually bound (port 0 picks a free one).
+    public func buildApplication(onServerRunning: @escaping @Sendable (any Channel) async -> Void) -> some ApplicationProtocol {
         let router = Router(context: BasicRequestContext.self)
         router.add(middleware: ACPAdmissionMiddleware(configuration: configuration))
         router.post("acp") { request, context -> Response in

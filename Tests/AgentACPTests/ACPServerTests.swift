@@ -77,10 +77,11 @@ private func writeToSocket(_ fd: Int32, _ pointer: UnsafeRawPointer?, _ count: I
 
 /// Runs an ACP server on a free port for the length of `body`.
 func withACPServer(
+    configuration: ACPServerConfiguration = ACPServerConfiguration(port: 0),
     factory: any ACPSessionFactory = HangingFactory(),
     _ body: @Sendable (Int) async throws -> Void
 ) async throws {
-    let server = ACPServer(configuration: ACPServerConfiguration(port: 0), factory: factory)
+    let server = ACPServer(configuration: configuration, factory: factory)
     let (ports, portContinuation) = AsyncStream<Int>.makeStream()
     let app = server.buildApplication { channel in
         if let port = channel.localAddress?.port { portContinuation.yield(port) }
@@ -117,23 +118,49 @@ struct ACPServerAdmissionTests {
     @Test
     func localNamesAndTheBoundAddressAreAdmitted() {
         let local = ACPServerConfiguration()
-        #expect(local.admits(authority: "127.0.0.1:7878", origin: nil))
-        #expect(local.admits(authority: "localhost", origin: nil))
-        #expect(local.admits(authority: "[::1]:7878", origin: nil))
-        #expect(!local.admits(authority: "evil.example:7878", origin: nil))
-        #expect(!local.admits(authority: "localhost.evil.example", origin: nil))
-        #expect(!local.admits(authority: nil, origin: nil))
+        #expect(local.admission(authority: "127.0.0.1:7878", origin: nil, authorization: nil) == .admitted)
+        #expect(local.admission(authority: "localhost", origin: nil, authorization: nil) == .admitted)
+        #expect(local.admission(authority: "[::1]:7878", origin: nil, authorization: nil) == .admitted)
+        #expect(local.admission(authority: "evil.example:7878", origin: nil, authorization: nil) == .forbidden)
+        #expect(local.admission(authority: "localhost.evil.example", origin: nil, authorization: nil) == .forbidden)
+        #expect(local.admission(authority: nil, origin: nil, authorization: nil) == .forbidden)
 
         let lan = ACPServerConfiguration(hostname: "192.168.1.5")
-        #expect(lan.admits(authority: "192.168.1.5:7878", origin: nil))
+        #expect(lan.admission(authority: "192.168.1.5:7878", origin: nil, authorization: nil) == .admitted)
     }
 
     @Test
     func webOriginsAreRefusedUnlessAllowed() {
-        #expect(!ACPServerConfiguration().admits(authority: "127.0.0.1:7878", origin: "https://evil.example"))
+        let local = ACPServerConfiguration()
+        #expect(local.admission(authority: "127.0.0.1:7878", origin: "https://evil.example", authorization: nil) == .forbidden)
+        #expect(local.admission(authority: "127.0.0.1:7878", origin: "null", authorization: nil) == .forbidden)
+        // What swift-websocket's client (`nawa connect`) sends; no page has it.
+        #expect(local.admission(authority: "127.0.0.1:7878", origin: "ws://127.0.0.1", authorization: nil) == .admitted)
         let allowing = ACPServerConfiguration(allowedOrigins: ["https://app.example"])
-        #expect(allowing.admits(authority: "127.0.0.1:7878", origin: "https://app.example"))
-        #expect(!allowing.admits(authority: "127.0.0.1:7878", origin: "https://evil.example"))
+        #expect(allowing.admission(authority: "127.0.0.1:7878", origin: "https://app.example", authorization: nil) == .admitted)
+        #expect(allowing.admission(authority: "127.0.0.1:7878", origin: "https://evil.example", authorization: nil) == .forbidden)
+    }
+
+    @Test
+    func aTokenIsRequiredAndThenAnyHostWillDo() {
+        let remote = ACPServerConfiguration(hostname: "0.0.0.0", bearerToken: "s3cret")
+        #expect(remote.admission(authority: "devbox.lan:7878", origin: nil, authorization: "Bearer s3cret") == .admitted)
+        #expect(remote.admission(authority: "devbox.lan:7878", origin: nil, authorization: "bearer s3cret") == .admitted)
+        #expect(remote.admission(authority: "127.0.0.1:7878", origin: nil, authorization: nil) == .unauthorized)
+        #expect(remote.admission(authority: "devbox.lan:7878", origin: nil, authorization: "Bearer s3cre") == .unauthorized)
+        #expect(remote.admission(authority: "devbox.lan:7878", origin: nil, authorization: "Basic s3cret") == .unauthorized)
+        #expect(remote.admission(authority: "devbox.lan:7878", origin: "https://evil.example", authorization: "Bearer s3cret") == .forbidden)
+
+        let empty = ACPServerConfiguration(bearerToken: "")
+        #expect(empty.admission(authority: "127.0.0.1:7878", origin: nil, authorization: "Bearer ") == .unauthorized)
+    }
+
+    @Test
+    func tokensCompareByContent() {
+        #expect(ACPServerConfiguration.constantTimeEquals("abc", "abc"))
+        #expect(!ACPServerConfiguration.constantTimeEquals("abc", "abd"))
+        #expect(!ACPServerConfiguration.constantTimeEquals("abc", "abcd"))
+        #expect(!ACPServerConfiguration.constantTimeEquals("", "a"))
     }
 
     @Test
@@ -172,6 +199,125 @@ struct ACPServerAdmissionTests {
         try await withACPServer { port in
             let response = try await RawHTTPConnection(port: port).request("POST", host: "evil.example:\(port)", body: initializeBody)
             #expect(statusLine(response).hasPrefix("HTTP/1.1 403"))
+        }
+    }
+}
+
+@Suite(.timeLimit(.minutes(1)))
+struct ACPServerTokenTests {
+    private let configuration = ACPServerConfiguration(port: 0, bearerToken: "s3cret")
+
+    @Test
+    func aRequestNeedsTheToken() async throws {
+        try await withACPServer(configuration: configuration) { port in
+            let without = try await RawHTTPConnection(port: port).request("POST", host: "devbox.lan:\(port)", body: initializeBody)
+            #expect(statusLine(without).hasPrefix("HTTP/1.1 401"))
+            #expect(header("WWW-Authenticate", in: without) == "Bearer")
+
+            let wrong = try await RawHTTPConnection(port: port).request(
+                "POST", host: "devbox.lan:\(port)", headers: ["Authorization": "Bearer guess"], body: initializeBody
+            )
+            #expect(statusLine(wrong).hasPrefix("HTTP/1.1 401"))
+
+            let with = try await RawHTTPConnection(port: port).request(
+                "POST", host: "devbox.lan:\(port)", headers: ["Authorization": "Bearer s3cret"], body: initializeBody
+            )
+            #expect(statusLine(with) == "HTTP/1.1 200 OK")
+        }
+    }
+
+    @Test
+    func aWebSocketNeedsTheToken() async throws {
+        try await withACPServer(configuration: configuration) { port in
+            // Hummingbird answers every refused handshake with 400.
+            let without = try await RawHTTPConnection(port: port).request("GET", host: "devbox.lan:\(port)", headers: webSocketUpgrade)
+            #expect(statusLine(without).hasPrefix("HTTP/1.1 400"))
+
+            var withToken = webSocketUpgrade
+            withToken["Authorization"] = "Bearer s3cret"
+            let with = try await RawHTTPConnection(port: port).request("GET", host: "devbox.lan:\(port)", headers: withToken)
+            #expect(statusLine(with).hasPrefix("HTTP/1.1 101"))
+        }
+    }
+}
+
+@Suite(.timeLimit(.minutes(1)))
+struct ACPRemoteBridgeTests {
+    private let configuration = ACPServerConfiguration(port: 0, bearerToken: "s3cret")
+
+    @Test
+    func addressesBecomeWebSocketURLs() {
+        #expect(ACPRemoteBridge(address: "http://devbox:7878", token: nil)?.url == "ws://devbox:7878/acp")
+        #expect(ACPRemoteBridge(address: "https://devbox.example/", token: nil)?.url == "wss://devbox.example/acp")
+        #expect(ACPRemoteBridge(address: "wss://devbox.example/nawa/acp", token: nil)?.url == "wss://devbox.example/nawa/acp")
+        #expect(ACPRemoteBridge(address: "ftp://devbox", token: nil) == nil)
+        #expect(ACPRemoteBridge(address: "devbox:7878", token: nil) == nil)
+    }
+
+    @Test
+    func linesTravelBothWays() async throws {
+        try await withACPServer(configuration: configuration) { port in
+            let bridge = try #require(ACPRemoteBridge(address: "http://127.0.0.1:\(port)", token: "s3cret"))
+            let (input, typing) = AsyncThrowingStream<String, any Error>.makeStream()
+            let (output, printing) = AsyncStream<String>.makeStream()
+            let running = Task { try await bridge.run(input: input) { printing.yield($0) } }
+
+            typing.yield(initializeBody)
+            var lines = output.makeAsyncIterator()
+            let reply = try #require(await lines.next())
+            #expect(reply.contains(#""protocolVersion":1"#))
+            #expect(reply.contains(#""id":0"#))
+
+            typing.finish()
+            try await running.value
+        }
+    }
+
+    /// A script writes its requests and closes stdin at once: the bridge
+    /// still waits for their answers before it closes.
+    @Test
+    func answersArriveAfterInputEnds() async throws {
+        try await withACPServer(configuration: configuration) { port in
+            let bridge = try #require(ACPRemoteBridge(address: "http://127.0.0.1:\(port)", token: "s3cret"))
+            let input = AsyncThrowingStream<String, any Error> { typing in
+                typing.yield(initializeBody)
+                typing.finish()
+            }
+            let received = Mutex<[String]>([])
+
+            try await bridge.run(input: input) { line in received.withLock { $0.append(line) } }
+
+            let replies = received.withLock { $0 }
+            #expect(replies.count == 1)
+            #expect(replies.first?.contains(#""protocolVersion":1"#) == true)
+        }
+    }
+
+    /// A broken stdin ends the bridge with its error, not a quiet wait
+    /// for the server to hang up.
+    @Test
+    func anInputFailureEndsTheBridge() async throws {
+        struct ReadFailed: Error {}
+        try await withACPServer(configuration: configuration) { port in
+            let bridge = try #require(ACPRemoteBridge(address: "http://127.0.0.1:\(port)", token: "s3cret"))
+            let input = AsyncThrowingStream<String, any Error> { typing in
+                typing.finish(throwing: ReadFailed())
+            }
+            await #expect(throws: ACPRemoteBridgeError.failed(bridge.url, "\(ReadFailed())")) {
+                try await bridge.run(input: input) { _ in }
+            }
+        }
+    }
+
+    @Test
+    func aWrongTokenIsRefused() async throws {
+        try await withACPServer(configuration: configuration) { port in
+            let bridge = try #require(ACPRemoteBridge(address: "ws://127.0.0.1:\(port)/acp", token: "guess"))
+            let (input, typing) = AsyncThrowingStream<String, any Error>.makeStream()
+            defer { typing.finish() }
+            await #expect(throws: ACPRemoteBridgeError.refused(bridge.url)) {
+                try await bridge.run(input: input) { _ in }
+            }
         }
     }
 }

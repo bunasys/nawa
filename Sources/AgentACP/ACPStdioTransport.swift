@@ -42,7 +42,7 @@ public struct ACPStdioTransport: Sendable {
         }
 
         do {
-            for try await line in Self.inputLines() {
+            for try await line in standardInputLines() {
                 if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
                 // Handled in arrival order: `session/new` must finish before the
                 // `session/prompt` that names its session. A prompt only starts
@@ -58,16 +58,16 @@ public struct ACPStdioTransport: Sendable {
         await connection.close()
         await writer.value
     }
+}
 
-    /// stdin, line by line. Apple's Foundation has `FileHandle.bytes`;
-    /// Linux Foundation does not, so there `InputLines` reads it.
-    private static func inputLines() -> some AsyncSequence<String, any Error> {
-        #if canImport(Darwin)
-        FileHandle.standardInput.bytes.lines
-        #else
-        InputLines(FileHandle.standardInput)
-        #endif
-    }
+/// stdin, line by line. Apple's Foundation has `FileHandle.bytes`; Linux
+/// Foundation does not, so there `InputLines` reads it.
+func standardInputLines() -> some AsyncSequence<String, any Error> & Sendable {
+    #if canImport(Darwin)
+    FileHandle.standardInput.bytes.lines
+    #else
+    InputLines(FileHandle.standardInput)
+    #endif
 }
 
 /// The lines read from a file handle, without their `\n` / `\r\n`, ending

@@ -57,6 +57,7 @@ let package = Package(
             "AgentCore", "AgentJSONRPC", "AgentLoop", "AgentMCP",
             .product(name: "Hummingbird", package: "hummingbird"),
             .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
+            .product(name: "HummingbirdWSClient", package: "hummingbird-websocket"),
         ]),
 
         // Terminal UI for the REPL: key decoding, line editing, layout, inline rendering.

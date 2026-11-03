@@ -32,6 +32,12 @@ public struct SessionStore: Sendable {
     /// `$XDG_STATE_HOME/nawa/sessions`, else `~/.local/state/nawa/sessions`.
     /// Reads only `XDG_STATE_HOME` and `HOME`.
     public static func defaultDirectory(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+        stateDirectory(environment: environment).appendingPathComponent("sessions")
+    }
+
+    /// Nawa's state directory: `$XDG_STATE_HOME/nawa`, else
+    /// `~/.local/state/nawa`. Sessions and `serve`'s token file live in it.
+    public static func stateDirectory(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
         let stateHome: URL
         if let xdg = environment["XDG_STATE_HOME"], !xdg.isEmpty {
             stateHome = URL(fileURLWithPath: xdg)
@@ -39,7 +45,7 @@ public struct SessionStore: Sendable {
             let home = environment["HOME"] ?? NSHomeDirectory()
             stateHome = URL(fileURLWithPath: home).appendingPathComponent(".local/state")
         }
-        return stateHome.appendingPathComponent("nawa/sessions")
+        return stateHome.appendingPathComponent("nawa")
     }
 
     // MARK: Names

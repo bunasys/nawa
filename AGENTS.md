@@ -211,11 +211,24 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   stdin/stdout), plus the JSON-RPC frames. `ACPConnection` owns dispatch and its sessions; `close()` ends
   it (DELETE, WebSocket close, stdin EOF): prompts cancelled, sessions and
   their MCP servers released, streams finished. Sessions reach their
-  connection through a weak `ConnectionSink`. Every route refuses requests
-  from web pages and foreign hosts (`ACPServerConfiguration.admits`: Host
-  must be loopback or the bound address; any `Origin` must be in
-  `allowedOrigins`, empty by default) with 403 (Hummingbird answers a
-  refused WebSocket handshake with 400). Each SSE stream has one reader
+  connection through a weak `ConnectionSink`. Every route checks each
+  request in one place, `ACPServerConfiguration.admission`:
+  - any `Origin` must be in `allowedOrigins` (empty by default), else 403;
+    a `ws://`/`wss://` Origin is a native WebSocket client, not a page
+    (swift-websocket's client always sends one), and passes;
+  - with `bearerToken` set, `Authorization: Bearer <token>` must match
+    (compared in constant time), else 401, and any Host is accepted;
+  - without one, Host must be loopback or the bound address (DNS
+    rebinding), else 403.
+
+  Hummingbird answers any refused WebSocket handshake with 400.
+  `ACPRemoteBridge` (`nawa connect`) is the client side: stdin lines to
+  WebSocket text frames and frames to stdout lines, over
+  `HummingbirdWSClient` (NIOSSL for wss); it reads stdin with the same
+  `standardInputLines()` as `ACPStdioTransport`. When stdin ends it
+  closes once every request it forwarded has its answer, so a script can
+  pipe requests in and read the replies. A server that closes
+  first, or a stdin read that fails, ends it with an error (exit 1). Each SSE stream has one reader
   (`attachStream`; a second GET gets 409, an unknown session 404). A new
   `session/prompt` cancels the running one and starts after it answers; a
   cancelled turn stops with `cancelled`; `session/load` of a session
@@ -231,6 +244,7 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   `ACPServerConfiguration.idleSessionTimeout`, rebuilding them on their
   next request.
 - `Sources/nawa` — executable: `serve` (ACP server), `acp` (ACP over stdio),
+  `connect <url>` (ACP over stdio bridged to a remote `serve`),
   `repl` (interactive), `config` (interactive per-directory provider setup,
   `ConfigCommand.swift`), `sessions` (`SessionsCommand.swift`), and
   `prompt [dir]` (prints the system prompt a session there would get). `WakuCompatibility.swift` implements the Kimi Code
@@ -242,7 +256,13 @@ thing well), Predictable, Idiomatic, Domain-Based, plus Locality of Behavior.
   names are cleaned to `[A-Za-z0-9_-]` (server part at most 20
   characters, the whole name at most 64).
   `repl` builds a `ChatSession` from an `AgentLoop` (a fresh one on
-  `/clear`) and hands it to `AgentTUI`.
+  `/clear`) and hands it to `AgentTUI`. `RemoteAccess.swift` parses
+  `serve --host/--port/--token` and `connect`: a token is `env:NAME` or
+  `file:<path>`, never the value (it would show in `ps`); a non-loopback
+  `--host` without `--token` uses `<state dir>/serve-token`
+  (`SessionStore.stateDirectory`), made once with 32 random bytes (hex,
+  0600, `O_EXCL`) and refused if not ours and 0600. `connect` defaults to
+  `$NAWA_SERVE_TOKEN` (a secret like an API key, not a setting).
 - `Tests/` — Swift Testing suites, one per module.
 - `proposals/` — design proposals for larger changes (`NNNN-title.md`; format
   and index in `proposals/README.md`). Read the relevant one before building
@@ -312,8 +332,23 @@ SDK's `.sig` against swift.org's keys before taking its checksum).
 ## Running
 
 ```
-# start the ACP server (streamable HTTP + WebSocket on :7878/acp)
+# start the ACP server (streamable HTTP + WebSocket on 127.0.0.1:7878/acp)
 swift run nawa serve
+
+# reachable from other machines: needs a bearer token (here the generated
+# ~/.local/state/nawa/serve-token). No TLS: put a TLS proxy in front, or
+# keep it on a trusted network or VPN.
+nawa serve --host 0.0.0.0 --port 7878
+# or: NAWA_TOKEN=... nawa serve --host 0.0.0.0 --token env:NAWA_TOKEN
+
+# on the other machine: an ACP client that launches a stdio command uses
+# `nawa connect` (stdin/stdout ⇄ WebSocket), e.g. Zed's settings.json:
+#   "agent_servers": {
+#     "Nawa (devbox)": {
+#       "command": "nawa",
+#       "args": ["connect", "wss://devbox.example/acp", "--token", "file:/Users/me/.nawa-devbox-token"]
+#     }
+#   }
 
 # interactive REPL against an OpenAI-compatible gateway
 NAWA_GATEWAY_URL=https://api.openai.com/v1 \
