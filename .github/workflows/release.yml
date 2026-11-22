@@ -65,6 +65,9 @@ jobs:
           name: macos-arm64
           path: dist/*
           if-no-files-found: error
+          # Only handed to the publish job (or inspected after a dry run);
+          # the release assets live on the GitHub release.
+          retention-days: 7
 
   linux:
     name: Test and build Linux (amd64, static)
@@ -120,6 +123,9 @@ jobs:
           name: linux-amd64
           path: dist/*
           if-no-files-found: error
+          # Only handed to the publish job (or inspected after a dry run);
+          # the release assets live on the GitHub release.
+          retention-days: 7
 
   publish:
     name: Publish the release
